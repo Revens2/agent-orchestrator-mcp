@@ -1,0 +1,48 @@
+[Unit]
+Description=Agent orchestrator MCP upstream + broker SQLite (orch) -- compte dedie, isole
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orch-app
+Group=orch-app
+WorkingDirectory=/srv/orch
+EnvironmentFile=/srv/orch/secrets/orch.env
+Environment=PYTHONPATH=/srv/orch/src
+ExecStart=/srv/orch/venv/bin/python -m orch_mcp.server
+Restart=always
+RestartSec=3
+
+# --- Isolation (calque sur tasks-mcp.service) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Boucle locale uniquement : orch-gateway (/mcp) et nginx NetBird (/runner/v1) sont les seuls clients.
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Seules la base SQLite (etat des jobs) et l'etat OAuth sont en ecriture.
+ReadWritePaths=/srv/orch/data
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+[Unit]
+Description=Agent orchestrator auth gateway (OAuth colocalise + proxy upstream orch-mcp)
+After=network-online.target orch-mcp.service
+Wants=network-online.target
+Requires=orch-mcp.service
+
+[Service]
+User=orch-app
+Group=orch-app
+WorkingDirectory=/srv/orch
+EnvironmentFile=/srv/orch/secrets/orch.env
+Environment=PYTHONPATH=/srv/orch/src
+ExecStart=/srv/orch/venv/bin/python -m orch_gateway.server
+Restart=always
+RestartSec=3
+
+# --- Isolation (calque sur tasks-gateway.service) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Boucle locale : nginx (vhost mymcps) est le seul client ; upstream orch-mcp en 127.0.0.1:8802.
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Seul l'etat OAuth (clients, jetons, consentements) est ecrit.
+ReadWritePaths=/srv/orch/data
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

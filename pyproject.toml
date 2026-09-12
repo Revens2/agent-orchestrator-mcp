@@ -1,0 +1,27 @@
+[project]
+name = "agent-orchestrator-mcp"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+server = ["mcp==2.2.0", "uvicorn", "starlette", "httpx", "anyio", "pydantic"]
+runner = ["httpx"]
+dev = ["pytest", "ruff"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+src = ["src"]
+
+[tool.ruff.lint]
+# Choix assumés : attrapes larges documentées (collecte/reaper ne doivent jamais mourir),
+# subprocess.run sans check (code retour lu explicitement), attributs de classe constants.
+ignore = ["B008", "LOG015", "PLW1510", "RUF012", "C408", "RUF059"]
+
+[tool.ruff.lint.per-file-ignores]
+# copie du modele tasks_gateway (prod) : garder le diff minimal avec l'original
+"src/orch_gateway/*" = ["SIM115", "RUF100", "ISC004"]
