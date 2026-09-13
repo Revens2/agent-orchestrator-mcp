@@ -167,11 +167,27 @@ def build_routes(store: Store, auth: RunnerAuth) -> list[Route]:
             )
         )
 
+    async def question(runner_id: str, data: dict, _: Request) -> dict:
+        q, created = await anyio.to_thread.run_sync(
+            lambda: store.record_runner_question(
+                runner_id,
+                int(data.get("epoch", -1)),
+                str(data.get("job_id")),
+                int(data.get("fencing", -1)),
+                str(data.get("runtime", "")),
+                str(data.get("title", "")),
+                str(data.get("question", "")),
+                list(data.get("options") or []) if isinstance(data.get("options"), list) else None,
+            )
+        )
+        return {"question": q, "created": created}
+
     base = "/runner/v1"
     return [
         Route(f"{base}/hello", handler(hello), methods=["POST"]),
         Route(f"{base}/heartbeat", handler(heartbeat), methods=["POST"]),
         Route(f"{base}/claim", handler(claim), methods=["POST"]),
         Route(f"{base}/event", handler(event), methods=["POST"]),
+        Route(f"{base}/question", handler(question), methods=["POST"]),
         Route(f"{base}/transition", handler(transition), methods=["POST"]),
     ]

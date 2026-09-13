@@ -250,6 +250,8 @@ class OpenCode(Adapter):
         super().__init__(exe, extra, policy)
         self._tail: list[str] = []  # dernières lignes vues (détection corruption)
         self._prompt_title = "session opencode"
+        self._qbuf = ""  # accumulation bornée pour le bloc [[QUESTION]]
+        self.pending_question: tuple[str, list[str]] | None = None
 
     @property
     def modes(self):  # type: ignore[override]
@@ -293,6 +295,17 @@ class OpenCode(Adapter):
         return info
 
     def on_line(self, line):
+        # Convention explicite waiting_for_user (jamais devinée sur `?`) :
+        # l'agent émet [[QUESTION]]...[[/QUESTION]] (+ [[OPTIONS]]...).
+        if self.pending_question is None and (
+            P.QUESTION_OPEN_TAG in line
+            or (self._qbuf and (P.QUESTION_CLOSE_TAG in line or P.QUESTION_OPTIONS_CLOSE in line))
+        ):
+            self._qbuf = (self._qbuf + line)[-4000:]
+            parsed = P.parse_question_block(self._qbuf)
+            if parsed is not None:
+                self.pending_question = parsed
+                self._qbuf = ""
         data = _json(line)
         if data is None:
             self._tail.append(line[-500:])

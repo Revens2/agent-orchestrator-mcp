@@ -323,10 +323,64 @@ def register(mcp, store: Store) -> None:
         alert = await anyio.to_thread.run_sync(store.get_alert, alert_id)
         return alert if alert is not None else {"error": "unknown_alert", "alert_id": alert_id}
 
+    @mcp.tool(
+        name="agent_question_list",
+        description=(
+            "Questions en attente de l'utilisateur (waiting_for_user explicite, jamais "
+            "un `?` deviné) : titre de la conversation, runtime/session d'origine, question "
+            "bornée, choix proposés, état, notification. Inbox corrélée : la réponse donnée "
+            "via agent_question_answer (ou iMessage/Photon) est routée à LA session émettrice. "
+            "Lecture seule."
+        ),
+    )
+    async def agent_question_list(
+        status: Annotated[str | None, Field(description="Filtre : open | answered | expired.")] = None,
+        origin: Annotated[str | None, Field(description="Filtre : agent | chatgpt-web | mission.")] = None,
+        limit: Annotated[int, Field(description="1..100, défaut 20.")] = 20,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(lambda: store.list_questions(status, origin, limit))
+        except BrokerError as exc:
+            return _err(exc)
+
+    @mcp.tool(
+        name="agent_question_get",
+        description=(
+            "Détail d'une question en attente + réponse éventuelle (answer, answer_from, "
+            "answered_at). Lecture seule."
+        ),
+    )
+    async def agent_question_get(
+        question_id: Annotated[str, Field(description="Correlation_id court (voir agent_question_list).")],
+    ) -> dict:
+        q = await anyio.to_thread.run_sync(store.get_question, question_id)
+        return q if q is not None else {"error": "unknown_question", "question_id": question_id}
+
+    @mcp.tool(
+        name="agent_question_answer",
+        description=(
+            "Répond à UNE question en attente (single-use : replay refusé, expirée refusée). "
+            "Réponse = choix proposé ou texte court (≤500 car.), jamais une commande shell : "
+            "elle est stockée et routée à la session émettrice (session_ref), qui la lira "
+            "à sa prochaine activité. Pour ChatGPT Web : c'est l'inbox corrélée (pas "
+            "d'injection dans la conversation Web, techniquement non supportée)."
+        ),
+    )
+    async def agent_question_answer(
+        question_id: Annotated[str, Field(description="Correlation_id court (voir agent_question_list).")],
+        answer: Annotated[str, Field(description="Choix (ex. '2') ou texte court (≤500 car.).")] = "",
+        answer_from: Annotated[str, Field(description="Expéditeur (ex. 'chatgpt-web', 'imessage').")] = "chatgpt-web",
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(lambda: store.answer_question(question_id, answer, answer_from))
+        except BrokerError as exc:
+            return _err(exc)
+
 
 TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_get", "agent_job_output", "agent_job_list",
                         "agent_job_events", "agent_runner_inspect", "agent_job_wait", "agent_mission_get",
-                        "infra_alert_list", "infra_alert_get"})
+                        "infra_alert_list", "infra_alert_get", "agent_question_list", "agent_question_get"})
 TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel",
-                         "agent_mission_create", "agent_mission_retry", "agent_mission_validate"})
+                         "agent_mission_create", "agent_mission_retry", "agent_mission_validate",
+                         "agent_question_answer"})
 _ = P

@@ -8,8 +8,8 @@
 # Les doublons intra-fenêtre sont absorbés par la déduplication du broker.
 set -euo pipefail
 
-NEXUS_SSH="${NEXUS_SSH:-ia_admin@10.200.61.52}"
-NEXUS_KEY="${NEXUS_KEY:-$HOME/.ssh/nexus_pull}"
+NEXUS_SSH="${NEXUS_SSH:-ubuntu@10.200.61.52}"
+NEXUS_KEY="${NEXUS_KEY:-/srv/orch/secrets/nexus_pull}"
 SPOOL="/var/log/nexus-alerts.jsonl"
 STATE_DIR="/srv/orch/data"
 CURSOR_FILE="$STATE_DIR/nexus_alerts.cursor"

@@ -177,6 +177,62 @@ def match_corruption(text: object) -> str | None:
 # en boucle), sans migration (calculé à la lecture, identités/source_hash
 # ConvIA intacts). Runtimes sans mécanisme natif (claude/codex/agy en
 # headless) : seul ce display_title broker existe (fallback documenté).
+# --- questions en attente (Photon/iMessage : débat explicite, pas de `?`) --
+# waiting_for_user est un ÉTAT (table pending_questions), jamais un regex sur
+# `?`. Notification après QUESTION_NOTIFY_AFTER_S sans réponse (défaut 300 s,
+# configurable pour E2E accélérée) ; UN message corrélé et dédupliqué ;
+# réponse single-use routée à la session émettrice via correlation_id court.
+QUESTION_NOTIFY_AFTER_S = 300
+QUESTION_EXPIRY_S = 3_600
+MAX_QUESTION_CHARS = 2_000
+MAX_QUESTION_OPTIONS = 6
+MAX_QUESTION_OPTION_CHARS = 200
+MAX_ANSWER_CHARS = 500
+Q_OPEN, Q_ANSWERED, Q_EXPIRED = "open", "answered", "expired"
+QUESTION_STATES = (Q_OPEN, Q_ANSWERED, Q_EXPIRED)
+Q_NOTIFY_PENDING, Q_NOTIFY_SENT, Q_NOTIFY_DEFERRED, Q_NOTIFY_FAILED = (
+    "pending", "sent", "deferred", "failed",
+)
+QUESTION_NOTIFY_STATES = (Q_NOTIFY_PENDING, Q_NOTIFY_SENT, Q_NOTIFY_DEFERRED, Q_NOTIFY_FAILED)
+# Convention explicite émise par l'agent dans sa sortie (parsée par le runner) :
+# [[QUESTION]]texte[[/QUESTION]] [[OPTIONS]]choix1|choix2[[/OPTIONS]]
+QUESTION_OPEN_TAG = "[[QUESTION]]"
+QUESTION_CLOSE_TAG = "[[/QUESTION]]"
+QUESTION_OPTIONS_TAG = "[[OPTIONS]]"
+QUESTION_OPTIONS_CLOSE = "[[/OPTIONS]]"
+
+
+def parse_question_block(text: object) -> tuple[str, list[str]] | None:
+    """Extrait le premier bloc explicite [[QUESTION]]...[[/QUESTION]] (+
+    [[OPTIONS]]a|b[[/OPTIONS]] optionnel). Retourne (question, options) ou
+    None. Borné (4000 car. max scannés) ; aucun regex fragile, aucun match sur
+    un simple `?`."""
+    if not isinstance(text, str):
+        return None
+    buf = text[-4000:]
+    start = buf.find(QUESTION_OPEN_TAG)
+    if start < 0:
+        return None
+    end = buf.find(QUESTION_CLOSE_TAG, start)
+    if end < 0:
+        return None
+    question = buf[start + len(QUESTION_OPEN_TAG):end].strip()
+    if not question:
+        return None
+    options: list[str] = []
+    rest = buf[end + len(QUESTION_CLOSE_TAG):end + len(QUESTION_CLOSE_TAG) + 600]
+    ostart = rest.find(QUESTION_OPTIONS_TAG)
+    if ostart >= 0:
+        oend = rest.find(QUESTION_OPTIONS_CLOSE, ostart)
+        if oend >= 0:
+            for part in rest[ostart + len(QUESTION_OPTIONS_TAG):oend].split("|"):
+                part = part.strip()
+                if part:
+                    options.append(part[:MAX_QUESTION_OPTION_CHARS])
+                if len(options) >= MAX_QUESTION_OPTIONS:
+                    break
+    return question[:MAX_QUESTION_CHARS], options
+
 # --- titres d'affichage (conversations lisibles, jamais de renommage) --------
 # display_title dérive un titre court et stable du premier objectif réel.
 # Stable par construction (fonction pure du texte source : pas de renommage

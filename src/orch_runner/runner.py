@@ -121,6 +121,7 @@ class JobWorker(threading.Thread):
         self._stderr_tail = ""
         self.session_id: str | None = None
         self.done = threading.Event()
+        self._question_sent = False
 
     # ------------------------------------------------------------- broker I/O
     def _call(self, path: str, body: dict[str, Any], deadline_s: float = 600) -> dict[str, Any] | None:
@@ -156,6 +157,26 @@ class JobWorker(threading.Thread):
         log.info("job_state job_id=%s %s->%s", self.job_id, self.state, dst)
         self.state = dst
         return True
+
+    def _send_question(self, adapter: Adapter) -> None:
+        """Remonte UNE question explicite [[QUESTION]] vers le broker (idempotent
+        côté broker par fingerprint : un seul enregistrement, un seul message)."""
+        pending = getattr(adapter, "pending_question", None)
+        if not pending or self._question_sent:
+            return
+        self._question_sent = True
+        question, options = pending
+        res = self._call(
+            "question",
+            {
+                "runtime": self.job.get("runtime", ""),
+                "title": P.display_title(self.job.get("prompt"), fallback=f"job {self.job_id[:8]}"),
+                "question": question,
+                "options": options,
+            },
+            deadline_s=60,
+        )
+        log.info("job_question job_id=%s sent=%s", self.job_id, bool(res and res.get("question")))
 
     def _flush(self, final: bool = False) -> None:
         with self._out_lock:
@@ -296,6 +317,7 @@ class JobWorker(threading.Thread):
                 self.proc.kill_tree(1)
             if time.monotonic() - last_flush >= 1.0:
                 self._flush()
+                self._send_question(adapter)
                 last_flush = time.monotonic()
             time.sleep(0.2)
         exit_code = self.proc.proc.returncode
