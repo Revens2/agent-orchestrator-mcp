@@ -151,6 +151,26 @@ Format Telegram canonique (même vue que le MCP) :
 plafond 5 000 lignes. Rollback : table additive ignorée par l'ancien `src/`
 (sauvegarde `/root/orch-src-bak-*` avant chaque déploiement).
 
+### Pull Nexus (automatisé, toutes les 5 min)
+
+Le spool `/var/log/nexus-alerts.jsonl` du VPS Nexus est aspiré par
+`deploy/nexus_alert_pull.sh` (cron `orch-app`, curseur = dernier `ts` traité,
+résistant à la rotation ; doublons absorbés par déduplication broker).
+Transport SSH : clé dédiée `/srv/orch/secrets/nexus_pull` (600 orch-app,
+sans passphrase) → `ubuntu@10.200.61.52` (NetBird), restreinte côté Nexus par
+`command="tail -n 200 ..."` + `no-pty,...` dans `~ubuntu/.ssh/authorized_keys`,
+et `AllowUsers ... ubuntu@10.200.114.203` dans `sshd_config` (backup
+`/root/sshd_config.bak-*`, `sshd -t` + `reload`, jamais de restart aveugle).
+Host key Nexus épinglée dans `/srv/orch/.ssh/known_hosts` (vérifiée contre une
+connexion de confiance avant ajout). Rotation : régénérer la clé, remplacer la
+ligne `nexus-pull` sur Nexus, tester `sudo -u orch-app
+/srv/orch/deploy/nexus_alert_pull.sh` (attend `RECORDED: n`).
+Côté Nexus, les scripts installés (`nexus_alert_spool.sh` 700,
+`nexus_fim_alert.sh` 750, `nexus_nightly_sec.sh` 700, backups
+`/root/nexus-alerts-bak-*`) correspondent à la branche NEXUS
+`feat/alerts-unified-spool` (non mergée : le merge déclenche le full deploy
+prod CI → relecture utilisateur requise avant merge).
+
 ## Titres de conversations
 
 `display_title` stable (fonction pure du premier objectif, jamais renommé) :
@@ -170,6 +190,34 @@ abandonné + prochaine action, jamais le transcript).
 Anti-boucle : 2 corruptions consécutives sur la même mission ⇒ `retry` refuse
 (`session_corruption_loop`, cause config/plugin/auth à corriger) ; `max_attempts` borne le reste.
 Journal : `agent_job_events` (`session_corrupted`, `session_recreated`).
+
+## Questions en attente (Photon/iMessage + inbox ChatGPT)
+
+État explicite `waiting_for_user` (table `pending_questions`), jamais deviné
+sur `?` : l'agent émet `[[QUESTION]]...[[/QUESTION]]` (+ `[[OPTIONS]]a|b...`)
+— parsé par le runner opencode → route runner `/runner/v1/question`
+(authentifiée, fencing) — ou enregistrement direct (`question_cli record`,
+`origin=mission|chatgpt-web`).
+
+```bash
+sudo -u orch-app env PYTHONPATH=/srv/orch/src /srv/orch/venv/bin/python \
+  -m orch_mcp.question_cli --db /srv/orch/data/orch.db \
+  record --origin mission --session-ref <job_id> --runtime opencode \
+  --title "..." --question "..." [--option "1: ..." --option "2: ..."] [--notify-after-s 300]
+.../question_cli due | .../question_cli list --status open
+.../question_cli answer --id <qid> --answer "2" --from imessage
+```
+
+Après `notify_after_s` (défaut 300 s) sans réponse, `deploy/photon_dispatch.sh`
+envoie UN message corrélé dédupliqué (titre, runtime/session, question bornée,
+choix numérotés, correlation_id). Senders : `none` (défaut honnête → deferred),
+`file` (spool E2E), `hermes`/`photon` (à brancher : deferred en attendant —
+jamais de promesse d'envoi ; pas d'injection ChatGPT Web, techniquement non
+supportée : l'inbox MCP `agent_question_list/get/answer` est le fallback vrai,
+`agent_question_answer` étant single-use + expiration + `answer_from` audité).
+Aucune réponse ne devient une commande shell (texte ≤500 car. stocké, relu à
+la prochaine activité de LA session émettrice). Allowlist Photon vérifiée à la
+réception par Hermes/Photon ; purge 7 j des réponses.
 
 ## Logs
 
