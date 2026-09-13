@@ -137,6 +137,45 @@ MAX_CRITERION_CHARS = 500
 WAIT_DEFAULT_S = 25
 WAIT_MAX_S = 60
 
+# --- titres d'affichage (conversations lisibles, jamais de renommage) --------
+# display_title dérive un titre court et stable du premier objectif réel.
+# Stable par construction (fonction pure du texte source : pas de renommage
+# en boucle), sans migration (calculé à la lecture, identités/source_hash
+# ConvIA intacts). Runtimes sans mécanisme natif (claude/codex/agy en
+# headless) : seul ce display_title broker existe (fallback documenté).
+MAX_TITLE_WORDS = 10
+MAX_TITLE_CHARS = 90
+
+
+def display_title(text: object, fallback: str = "session sans titre") -> str:
+    """Titre court (5-10 mots, ≤90 car.) depuis la première ligne utile.
+
+    - première ligne non vide (marqueurs `>`, `-`, `*`, `#` initiaux retirés) ;
+    - mots coupés à MAX_TITLE_WORDS, fin bornée à MAX_TITLE_CHARS ;
+    - si le texte porte un secret apparent (redact le modifierait) ou est
+      vide/absent : fallback (jamais de secret ni d'ID bruyant dans un titre).
+    """
+    if not isinstance(text, str):
+        return fallback
+    first = ""
+    for line in text.splitlines():
+        line = " ".join(line.split())
+        line = line.lstrip(">#-*• \t")
+        if line:
+            first = line
+            break
+    if not first:
+        return fallback
+    from orch_protocol.redact import redact  # import local : évite un cycle
+
+    if redact(first) != first:
+        return fallback
+    words = first.split()
+    short = " ".join(words[:MAX_TITLE_WORDS])
+    if len(short) > MAX_TITLE_CHARS:
+        short = short[: MAX_TITLE_CHARS - 1].rstrip() + "…"
+    return short or fallback
+
 # --- alertes infra (observabilité Telegram unifiée : [ETUDE]/[NEXUS]) --------
 # Persistance normalisée des alertes sortantes (jamais l'historique Telegram
 # comme source de vérité). Écriture réservée aux ingesteurs locaux du VPS

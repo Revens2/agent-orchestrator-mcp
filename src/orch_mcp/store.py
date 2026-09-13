@@ -747,6 +747,7 @@ class Store:
         return [
             {
                 "job_id": r["id"],
+                "display_title": P.display_title(r["prompt"], fallback=f"job {r['id'][:8]}"),
                 "state": r["state"],
                 "runtime": r["runtime"],
                 "workspace_id": r["workspace_id"],
@@ -941,6 +942,7 @@ class Store:
                     job_summary = {"job_id": row["current_job_id"], "state": j["state"], "exit_code": j["exit_code"]}
             return {
                 "mission_id": row["id"],
+                "display_title": P.display_title(row["objective"], fallback=f"mission {row['id'][:8]}"),
                 "objective": row["objective"],
                 "acceptance_criteria": json.loads(row["acceptance_json"]),
                 "max_attempts": row["max_attempts"],
@@ -1205,6 +1207,7 @@ class Store:
         children = None if children is None else int(children)
         view = {
             "job_id": row["id"],
+            "display_title": P.display_title(row["prompt"], fallback=f"job {row['id'][:8]}"),
             "runner_id": row["runner_id"],
             "runtime": row["runtime"],
             "workspace_id": row["workspace_id"],

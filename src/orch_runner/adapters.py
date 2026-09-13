@@ -257,8 +257,11 @@ class OpenCode(Adapter):
     def build(self, prompt, mode, cwd, tmpdir):
         if mode not in self.MODE[self.policy]:
             raise ValueError(f"opencode : mode {mode} non supporté en politique {self.policy}")
+        # --title natif (tronque le prompt sinon) : titre stable dérivé du
+        # premier objectif réel, jamais renommé ensuite.
+        title = P.display_title(prompt, fallback="session opencode")
         return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
-                       "--dir", cwd, "--", prompt], None)
+                       "--title", title, "--dir", cwd, "--", prompt], None)
 
     def probe(self):
         """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
