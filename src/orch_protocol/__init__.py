@@ -109,10 +109,15 @@ EV_CANCEL_REQUESTED = "cancel_requested"
 EV_TIMEOUT_MARKED = "timeout_marked"
 EV_SUSPECTED_STALL = "suspected_stall"
 EV_STALLED = "stalled"
+# Reprise sur session corrompue : session abandonnée (jamais réutilisée),
+# nouvelle session propre via mission_retry, handoff minimal (pas de transcript).
+EV_SESSION_CORRUPTED = "session_corrupted"
+EV_SESSION_RECREATED = "session_recreated"
 EVENT_KINDS = frozenset({
     EV_JOB_CLAIMED, EV_RUNTIME_SPAWNED, EV_PROCESS_RUNNING, EV_OUTPUT_PROGRESS,
     EV_ACTIVITY, EV_PROCESS_EXIT, EV_RUNNER_DISCONNECT, EV_LEASE_EXPIRED,
     EV_REQUEUED, EV_CANCEL_REQUESTED, EV_TIMEOUT_MARKED, EV_SUSPECTED_STALL, EV_STALLED,
+    EV_SESSION_CORRUPTED, EV_SESSION_RECREATED,
 })
 MAX_EVENTS_PER_JOB = 500
 OUTPUT_PROGRESS_STEP_CHARS = 65_536
@@ -137,6 +142,41 @@ MAX_CRITERION_CHARS = 500
 WAIT_DEFAULT_S = 25
 WAIT_MAX_S = 60
 
+# --- session corrompue (reprise OpenCode : nouvelle session + handoff) -------
+# Signatures EXACTES (sous-chaînes littérales, jamais un simple mot "error").
+# `failed to load plugin` est observé en production (opencode.log) ; les autres
+# sont les formes exactes connues des corruptions session/config/DB. Tout texte
+# ne contenant aucune de ces formes n'est PAS une corruption.
+SESSION_CORRUPTION_SIGNS = (
+    "failed to load plugin",
+    "failed to load session",
+    "database disk image is malformed",
+    "SQLITE_CORRUPT",
+    "Unexpected token",
+    "Unexpected end of JSON input",
+    "bad decrypt",
+    "wrong final block length",
+    "Failed to decrypt",
+)
+SESSION_CORRUPTED_PREFIX = "session_corrupted:"
+# Anti-boucle : au-delà de N corruptions consécutives sur la même mission,
+# mission_retry refuse (intervention humaine requise).
+MAX_CONSECUTIVE_CORRUPTIONS = 2
+
+
+def match_corruption(text: object) -> str | None:
+    """Première signature exacte trouvée, sinon None (jamais de match naïf)."""
+    if not isinstance(text, str):
+        return None
+    for sign in SESSION_CORRUPTION_SIGNS:
+        if sign in text:
+            return sign
+    return None
+# display_title dérive un titre court et stable du premier objectif réel.
+# Stable par construction (fonction pure du texte source : pas de renommage
+# en boucle), sans migration (calculé à la lecture, identités/source_hash
+# ConvIA intacts). Runtimes sans mécanisme natif (claude/codex/agy en
+# headless) : seul ce display_title broker existe (fallback documenté).
 # --- titres d'affichage (conversations lisibles, jamais de renommage) --------
 # display_title dérive un titre court et stable du premier objectif réel.
 # Stable par construction (fonction pure du texte source : pas de renommage
@@ -145,7 +185,6 @@ WAIT_MAX_S = 60
 # headless) : seul ce display_title broker existe (fallback documenté).
 MAX_TITLE_WORDS = 10
 MAX_TITLE_CHARS = 90
-
 
 def display_title(text: object, fallback: str = "session sans titre") -> str:
     """Titre court (5-10 mots, ≤90 car.) depuis la première ligne utile.

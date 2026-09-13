@@ -616,6 +616,11 @@ class Store:
                 self._emit(db, job_id, P.EV_PROCESS_RUNNING, "processus agent repris")
             elif terminal:
                 self._emit(db, job_id, P.EV_PROCESS_EXIT, f"from={src} exit={exit_code}")
+                if dst == P.FAILED and isinstance(error, str) and error.startswith(P.SESSION_CORRUPTED_PREFIX):
+                    # Session reconnue corrompue : événement structuré visible,
+                    # session abandonnée (jamais réutilisée : le retry crée un
+                    # nouveau job = nouvelle session + handoff, pas de transcript).
+                    self._emit(db, job_id, P.EV_SESSION_CORRUPTED, error[:500])
                 self._mission_on_job_terminal(db, job_id, dst)
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
@@ -973,8 +978,26 @@ class Store:
             if cur is None or cur["state"] not in P.TERMINAL:
                 raise BrokerError("attempt_still_active", "la tentative en cours n'est pas terminée")
             job_spec = db.execute(
-                "SELECT runner_id, runtime, workspace_id, mode, timeout_s FROM jobs WHERE id=?", (m["current_job_id"],)
+                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error FROM jobs WHERE id=?", (m["current_job_id"],)
             ).fetchone()
+            prev_corrupted = bool(job_spec and isinstance(job_spec["error"], str)
+                                  and job_spec["error"].startswith(P.SESSION_CORRUPTED_PREFIX))
+            if prev_corrupted:
+                # Anti-boucle : N corruptions consécutives sur la même mission
+                # => intervention humaine, pas une nouvelle tentative aveugle.
+                chain = db.execute(
+                    """SELECT j.error FROM mission_attempts a JOIN jobs j ON j.id = a.job_id
+                       WHERE a.mission_id=? ORDER BY a.attempt_no DESC LIMIT ?""",
+                    (mission_id, P.MAX_CONSECUTIVE_CORRUPTIONS),
+                ).fetchall()
+                if (len(chain) == P.MAX_CONSECUTIVE_CORRUPTIONS and all(
+                    isinstance(r["error"], str) and r["error"].startswith(P.SESSION_CORRUPTED_PREFIX) for r in chain
+                )):
+                    raise BrokerError(
+                        "session_corruption_loop",
+                        f"{P.MAX_CONSECUTIVE_CORRUPTIONS} sessions corrompues d'affilée : "
+                        "corriger la cause (config/plugin/auth opencode) avant tout retry",
+                    )
         job, _ = self.create_job(
             job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
             prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
@@ -991,6 +1014,16 @@ class Store:
                 "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
                 (mission_id, attempt_no, job["job_id"], now),
             )
+            if prev_corrupted:
+                # Nouvelle session propre, une seule fois par retry : handoff
+                # minimal durable (objectif + job précédent + prochaine action),
+                # jamais le transcript corrompu.
+                self._emit(
+                    db, job["job_id"], P.EV_SESSION_RECREATED,
+                    f"session corrompue abandonnée (job {m['current_job_id']}) ; "
+                    f"reprendre l'objectif « {P.display_title(m['objective'], fallback='mission')} » "
+                    "via progress et fichiers concernés",
+                )
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
     def validate_mission(self, mission_id: str, verdict: str, note: str | None = None) -> dict[str, Any]:

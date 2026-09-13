@@ -246,6 +246,11 @@ class OpenCode(Adapter):
         P.GUARDED: {"read_only": ["--agent", "plan"]},  # sans --auto, un prompt bloquerait le headless
     }
 
+    def __init__(self, exe, extra=None, policy=P.UNATTENDED):
+        super().__init__(exe, extra, policy)
+        self._tail: list[str] = []  # dernières lignes vues (détection corruption)
+        self._prompt_title = "session opencode"
+
     @property
     def modes(self):  # type: ignore[override]
         return tuple(self.MODE[self.policy])
@@ -260,6 +265,7 @@ class OpenCode(Adapter):
         # --title natif (tronque le prompt sinon) : titre stable dérivé du
         # premier objectif réel, jamais renommé ensuite.
         title = P.display_title(prompt, fallback="session opencode")
+        self._prompt_title = title
         return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
                        "--title", title, "--dir", cwd, "--", prompt], None)
 
@@ -289,11 +295,15 @@ class OpenCode(Adapter):
     def on_line(self, line):
         data = _json(line)
         if data is None:
+            self._tail.append(line[-500:])
+            del self._tail[:-30]
             return line, None
         if data.get("type") == "error":
             err = data.get("error") if isinstance(data.get("error"), dict) else {}
             msg = str((err.get("data") or {}).get("message") or err.get("name") or "error")
             self.error = msg[:500]
+            self._tail.append(msg[:500])
+            del self._tail[:-30]
             return f"[error] {msg}\n", f"error: {msg[:100]}"
         sid = data.get("sessionID") or (data.get("part") or {}).get("sessionID")
         if isinstance(sid, str):
@@ -306,6 +316,17 @@ class OpenCode(Adapter):
 
     def finish(self, exit_code, tmpdir):
         error = getattr(self, "error", None)
+        if exit_code != 0:
+            # Session reconnue corrompue : signature EXACTE uniquement (jamais
+            # un simple mot "error"). La session est abandonnée ; le retry
+            # (mission_retry) crée une NOUVELLE session + handoff, sans transcript.
+            sign = P.match_corruption("\n".join(self._tail)) or P.match_corruption(error)
+            if sign is not None:
+                handoff = (
+                    f"session abandonnée ({sign}) ; reprendre via mission_retry "
+                    f"(nouvelle session) avec l'objectif « {self._prompt_title} »"
+                )
+                return Outcome(False, handoff, f"{P.SESSION_CORRUPTED_PREFIX}{sign}")
         ok = exit_code == 0 and error is None
         return Outcome(ok, self.last_text, None if ok else (f"exit code {exit_code}" + (f", {error}" if error else "")))
 
