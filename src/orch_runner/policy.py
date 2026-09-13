@@ -67,6 +67,7 @@ class Config:
     runtimes: dict[str, RuntimeConf]
     home: Path
     offline_kill_s: int = 120
+    permission_policy: str = P.UNATTENDED
 
     @staticmethod
     def load(path: Path | None = None) -> Config:
@@ -80,6 +81,9 @@ class Config:
         if not url.startswith(("http://10.", "https://")):
             raise PolicyError("config", "broker_url doit être l'IP overlay (http://10.x) ou https://")
         home = Path(raw.get("home", str(path.parent)))
+        policy = raw.get("default_permission_policy", P.UNATTENDED)
+        if policy not in P.PERMISSION_POLICIES:
+            raise PolicyError("config", f"default_permission_policy invalide : {policy!r}")
         workspaces = {}
         for ws_id, ws in (raw.get("workspaces") or {}).items():
             if not P.valid_id(ws_id):
@@ -101,6 +105,7 @@ class Config:
             runtimes=runtimes,
             home=home,
             offline_kill_s=int(raw.get("offline_kill_s", 120)),
+            permission_policy=policy,
         )
 
 

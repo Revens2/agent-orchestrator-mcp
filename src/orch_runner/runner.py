@@ -193,7 +193,7 @@ class JobWorker(threading.Thread):
         ws = cfg.workspaces.get(job["workspace_id"])
         if ws is None:
             return self._refuse("workspace_denied", "workspace absent de l'allowlist locale")
-        adapter = ADAPTERS[job["runtime"]](rt.exe, rt.extra)
+        adapter = ADAPTERS[job["runtime"]](rt.exe, rt.extra, cfg.permission_policy)
         if job["mode"] not in ws.modes or job["mode"] not in adapter.modes:
             return self._refuse("mode_denied", "mode non autorisé pour ce workspace/runtime")
         prompt = job.get("prompt")
@@ -302,7 +302,7 @@ class Runner:
         runtimes = []
         for rt_id, rt in self.config.runtimes.items():
             if rt.enabled and rt_id in ADAPTERS:
-                runtimes.append(ADAPTERS[rt_id](rt.exe, rt.extra).probe())
+                runtimes.append(ADAPTERS[rt_id](rt.exe, rt.extra, self.config.permission_policy).probe())
         workspaces = []
         for ws in self.config.workspaces.values():
             try:

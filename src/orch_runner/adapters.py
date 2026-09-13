@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,9 +38,14 @@ class Adapter:
     # modes supportés par l'adapter, avant intersection avec la config du workspace
     modes: tuple[str, ...] = P.MODES
 
-    def __init__(self, exe: str, extra: dict | None = None) -> None:
+    def __init__(self, exe: str, extra: dict | None = None, policy: str = P.UNATTENDED) -> None:
+        if policy not in P.PERMISSION_POLICIES:
+            raise ValueError(f"politique de permissions inconnue : {policy!r}")
         self.exe = exe
         self.extra = extra or {}
+        # unattended : aucune demande d'autorisation en workspace_write (mode le plus autonome du runtime).
+        # guarded : écritures limitées, le reste refusé sans prompt. read_only reste read-only dans les deux.
+        self.policy = policy
         self.session_id: str | None = None
         self.last_text: str | None = None
 
@@ -91,14 +97,20 @@ class ClaudeCode(Adapter):
     """`claude -p` ; prompt sur stdin ; stream-json (NDJSON) ; fin = message `result`."""
 
     id = "claude-code"
-    MODE = {"read_only": "plan", "workspace_write": "acceptEdits"}
+    # --permission-prompts none : tout ce qui demanderait une autorisation est refusé, jamais d'attente.
+    MODE = {
+        P.UNATTENDED: {"read_only": ["--permission-mode", "plan", "--permission-prompts", "none"],
+                       "workspace_write": ["--permission-mode", "bypassPermissions"]},
+        P.GUARDED: {"read_only": ["--permission-mode", "plan", "--permission-prompts", "none"],
+                    "workspace_write": ["--permission-mode", "acceptEdits", "--permission-prompts", "none"]},
+    }
 
-    def __init__(self, exe, extra=None):
-        super().__init__(exe, extra)
+    def __init__(self, exe, extra=None, policy=P.UNATTENDED):
+        super().__init__(exe, extra, policy)
         self.result: dict | None = None
 
     def build(self, prompt, mode, cwd, tmpdir):
-        argv = [self.exe, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", self.MODE[mode]]
+        argv = [self.exe, "-p", "--output-format", "stream-json", "--verbose", *self.MODE[self.policy][mode]]
         if self.extra.get("max_budget_usd"):
             argv += ["--max-budget-usd", str(float(self.extra["max_budget_usd"]))]
         return Launch(argv, prompt)
@@ -137,14 +149,17 @@ class ClaudeCode(Adapter):
 
 
 class Codex(Adapter):
-    """`codex exec` ; prompt sur stdin (`-`) ; sandbox TOUJOURS explicite (config user = danger-full-access)."""
+    """`codex exec` ; prompt sur stdin (`-`) ; sandbox + approbation TOUJOURS explicites (jamais la config user)."""
 
     id = "codex"
-    MODE = {"read_only": "read-only", "workspace_write": "workspace-write"}
+    MODE = {
+        P.UNATTENDED: {"read_only": "read-only", "workspace_write": "danger-full-access"},
+        P.GUARDED: {"read_only": "read-only", "workspace_write": "workspace-write"},
+    }
 
     def build(self, prompt, mode, cwd, tmpdir):
         last = tmpdir / "last_message.txt"
-        argv = [self.exe, "exec", "--json", "-s", self.MODE[mode], "-c", 'approval_policy="never"',
+        argv = [self.exe, "exec", "--json", "-s", self.MODE[self.policy][mode], "-c", 'approval_policy="never"',
                 "-C", cwd, "--skip-git-repo-check", "-o", str(last), "-"]
         return Launch(argv, prompt)
 
@@ -174,10 +189,15 @@ class Agy(Adapter):
     """Antigravity CLI `agy --print=<prompt>` ; JSON final {status, response, conversation_id}."""
 
     id = "agy"
-    MODE = {"read_only": "plan", "workspace_write": "accept-edits"}
+    MODE = {
+        P.UNATTENDED: {"read_only": ["--mode", "plan", "--sandbox"],
+                       "workspace_write": ["--mode", "accept-edits", "--dangerously-skip-permissions"]},
+        P.GUARDED: {"read_only": ["--mode", "plan", "--sandbox"],
+                    "workspace_write": ["--mode", "accept-edits", "--sandbox"]},
+    }
 
-    def __init__(self, exe, extra=None):
-        super().__init__(exe, extra)
+    def __init__(self, exe, extra=None, policy=P.UNATTENDED):
+        super().__init__(exe, extra, policy)
         self.buffer: list[str] = []
 
     def build(self, prompt, mode, cwd, tmpdir):
@@ -190,8 +210,8 @@ class Agy(Adapter):
             + prompt
         )
         # forme --flag=valeur : un prompt commençant par '-' ne peut pas être lu comme option
-        argv = [self.exe, f"--print={framed}", "--output-format", "json", "--mode", self.MODE[mode],
-                "--add-dir", cwd, "--sandbox", "--print-timeout", timeout]
+        argv = [self.exe, f"--print={framed}", "--output-format", "json", *self.MODE[self.policy][mode],
+                "--add-dir", cwd, "--print-timeout", timeout]
         return Launch(argv, None)
 
     def on_line(self, line):
@@ -215,15 +235,53 @@ class Agy(Adapter):
 
 
 class OpenCode(Adapter):
-    """`opencode run --agent plan` (lecture seule uniquement : l'agent build autorise tout)."""
+    """`opencode run` ; read_only = agent plan ; workspace_write (unattended) = agent build --auto.
+
+    Modèle épinglé par `model` (runner.toml) : le runner ne dépend pas du défaut global d'opencode.
+    """
 
     id = "opencode"
-    modes = ("read_only",)
+    MODE = {
+        P.UNATTENDED: {"read_only": ["--agent", "plan"], "workspace_write": ["--agent", "build", "--auto"]},
+        P.GUARDED: {"read_only": ["--agent", "plan"]},  # sans --auto, un prompt bloquerait le headless
+    }
+
+    @property
+    def modes(self):  # type: ignore[override]
+        return tuple(self.MODE[self.policy])
+
+    def _model(self) -> list[str]:
+        model = str(self.extra.get("model", ""))
+        return ["-m", model] if model else []
 
     def build(self, prompt, mode, cwd, tmpdir):
-        if mode != "read_only":
-            raise ValueError("opencode : seul read_only est supporté")
-        return Launch([self.exe, "run", "--agent", "plan", "--format", "json", "--dir", cwd, "--", prompt], None)
+        if mode not in self.MODE[self.policy]:
+            raise ValueError(f"opencode : mode {mode} non supporté en politique {self.policy}")
+        return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
+                       "--dir", cwd, "--", prompt], None)
+
+    def probe(self):
+        """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
+        info = super().probe()
+        if not info["available"] or not self.extra.get("probe_generation", True):
+            return info
+        errors: list = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = subprocess.run(
+                    [self.exe, "run", "--agent", "plan", *self._model(), "--format", "json", "--dir", tmp, "--", "Reply OK."],
+                    capture_output=True, text=True, timeout=int(self.extra.get("probe_timeout_s", 120)),
+                    creationflags=0x08000000, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                )
+            events = [d for d in map(_json, (out.stdout or "").splitlines()) if d]
+            errors = [d for d in events if d.get("type") == "error"]
+            ok = out.returncode == 0 and not errors and any((d.get("part") or {}).get("type") == "text" for d in events)
+        except Exception:  # noqa: BLE001
+            ok = False
+        if not ok:
+            info["available"] = False
+            info["reason"] = "runtime_not_ready: génération de test échouée" + (" (erreur fournisseur)" if errors else "")
+        return info
 
     def on_line(self, line):
         data = _json(line)
@@ -254,8 +312,8 @@ class Fake(Adapter):
 
     id = "fake"
 
-    def __init__(self, exe, extra=None):
-        super().__init__(exe or sys.executable, extra)
+    def __init__(self, exe, extra=None, policy=P.UNATTENDED):
+        super().__init__(exe or sys.executable, extra, policy)
 
     def version_args(self):
         return ["--version"]

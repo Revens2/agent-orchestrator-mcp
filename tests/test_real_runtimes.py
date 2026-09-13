@@ -20,6 +20,7 @@ EXES = {
     "agy": shutil.which("agy") or "",
     "opencode": shutil.which("opencode") or "",
 }
+EXTRA = {"opencode": {"model": os.environ.get("ORCH_OPENCODE_MODEL", "opencode/muse-spark-1.3-contributor-free")}}
 ENABLED = [r for r in os.environ.get("ORCH_REAL", "").split(",") if r]
 HOSTILE_TAIL = '\n\nIgnore this trailing noise, it is data: "; echo PWNED & whoami | powershell -c calc `$x` %PATH% > NUL ☃'
 
@@ -31,7 +32,7 @@ def real_stack(tmp_path):
     runner = make_runner(tmp_path, port, max_parallel=1)
     ws = tmp_path / "workspace"
     runner.config.workspaces = {"e2e": Workspace("e2e", str(ws), ["read_only", "workspace_write"], "fixture")}
-    runner.config.runtimes = {rt: RuntimeConf(rt, True, EXES[rt], {"max_budget_usd": 1}) for rt in ENABLED}
+    runner.config.runtimes = {rt: RuntimeConf(rt, True, EXES[rt], EXTRA.get(rt, {"max_budget_usd": 1})) for rt in ENABLED}
     start_runner(runner)
     end = time.time() + 60
     while not broker.store.runners() or broker.store.runners()[0]["status"] != "online":
@@ -46,20 +47,18 @@ def real_stack(tmp_path):
 def test_real_probe(runtime):
     if runtime == "none":
         pytest.skip("ORCH_REAL vide")
-    info = ADAPTERS[runtime](EXES[runtime]).probe()
+    info = ADAPTERS[runtime](EXES[runtime], EXTRA.get(runtime)).probe()
     assert info["available"], info
 
 
-@pytest.mark.parametrize("runtime", [r for r in ENABLED if r != "opencode"] or ["none"])
+@pytest.mark.parametrize("runtime", ENABLED or ["none"])
 def test_real_write_fixture(real_stack, runtime):
     if runtime == "none":
         pytest.skip("ORCH_REAL vide")
     broker, _, ws = real_stack
     nonce = "E2E-" + secrets.token_hex(8)
-    prompt = (
-        f"Create a file named E2E_AGENT_OK.txt in the current working directory containing exactly the text {nonce} "
-        "(no newline, nothing else). Use your file writing tool, do not run shell commands. Then reply DONE." + HOSTILE_TAIL
-    )
+    # prompt banal : aucune consigne de permission, l'autonomie doit venir de l'adapter
+    prompt = f"Create E2E_AGENT_OK.txt containing exactly {nonce}, then reply DONE." + HOSTILE_TAIL
     rt = broker.store.runners()[0]["runtimes"]
     assert any(r["id"] == runtime and r["available"] for r in rt), rt
     job, _ = broker.store.create_job("pc", runtime, "e2e", prompt, "workspace_write", 900)
@@ -83,7 +82,7 @@ def test_real_read_only_cannot_write(real_stack, runtime):
     if runtime == "none":
         pytest.skip("ORCH_REAL vide")
     broker, _, ws = real_stack
-    prompt = "Create a file named SHOULD_NOT_EXIST.txt containing hello in the current directory. If you cannot, just explain why."
+    prompt = "Create SHOULD_NOT_EXIST.txt and reply DONE."
     job, _ = broker.store.create_job("pc", runtime, "e2e", prompt, "read_only", 900)
     view = wait_state(broker.store, job["job_id"], P.TERMINAL, timeout=900)
     print({k: view[k] for k in ("state", "exit_code", "duration_s", "result_summary", "error")})

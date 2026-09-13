@@ -1,0 +1,34 @@
+# %USERPROFILE%\.orch-runner\runner.toml — config locale du runner (hors Git, aucun secret ici).
+runner_id = "main-windows-pc"
+broker_url = "http://10.200.114.203:8803"
+max_parallel = 2
+offline_kill_s = 120
+
+# unattended (défaut) : workspace_write sans aucune demande d'autorisation (shell compris).
+# guarded : éditions seules, le reste refusé sans prompt ; opencode read_only uniquement.
+# read_only reste lecture seule dans les deux cas. Changer puis relancer la tâche orch-runner.
+default_permission_policy = "unattended"
+
+[runtimes.claude-code]
+enabled = true
+exe = 'C:\Users\<user>\.local\bin\claude.exe'
+
+[runtimes.codex]
+enabled = true
+exe = 'C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe'
+
+[runtimes.agy]
+enabled = true
+exe = 'C:\Users\<user>\AppData\Local\Microsoft\WinGet\Packages\Google.AntigravityCLI_Microsoft.Winget.Source_8wekyb3d8bbwe\agy.exe'
+
+[runtimes.opencode]
+enabled = true
+exe = 'C:\Users\<user>\AppData\Local\Microsoft\WinGet\Packages\SST.opencode_Microsoft.Winget.Source_8wekyb3d8bbwe\opencode.exe'
+model = "opencode/muse-spark-1.3-contributor-free"   # épinglé : ne dépend pas du défaut global opencode
+# probe_generation = true    # génération "Reply OK." au démarrage ; échec => available=false
+# probe_timeout_s = 120
+
+[workspaces.e2e]
+path = 'C:\Users\<user>\orch-workspaces\e2e'
+modes = ["read_only", "workspace_write"]
+description = "Workspace de test E2E de l'orchestrateur (fixtures jetables)"

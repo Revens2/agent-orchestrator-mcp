@@ -46,12 +46,36 @@ les workspaces sont annoncés au `hello`. Un chemin invalide est ignoré (log `w
   mapping des modes, parsing de fin), id ajouté à `orch_protocol.RUNTIMES` et au `Literal` de
   `orch_mcp/tools.py`, tests `ORCH_REAL=<id> pytest tests/test_real_runtimes.py`.
 
-| Runtime | Prompt | read_only | workspace_write | Limite connue |
-|---|---|---|---|---|
-| claude-code | stdin | `--permission-mode plan` | `acceptEdits` (Bash refusé en `-p`) | — |
-| codex | stdin | `-s read-only` | `-s workspace-write` | sandbox toujours explicite (config user = full access) |
-| agy | `--print=` | `--mode plan` | `--mode accept-edits` + `--sandbox` | workspace via `--add-dir` + prompt : pas de confinement strict du dossier |
-| opencode | argv après `--` | `--agent plan` | refusé (agent build autorise tout) | désactivé : fournisseur LLM sans crédit |
+## Politique de permissions (locale au runner)
+
+`default_permission_policy` dans `runner.toml` (défaut `unattended`). Jamais fournie par ChatGPT/broker :
+le contrat MCP ne transporte ni flags, ni commande, ni argv. Les barrières structurelles (allowlists
+runner/runtime/workspace/mode, cwd imposé, Job Object, leases/fencing, max_parallel, auth) restent actives.
+
+- `unattended` : en `workspace_write` chaque runtime reçoit son mode sans aucune demande d'autorisation
+  (l'agent peut exécuter du shell avec les droits de l'utilisateur Windows, y compris hors workspace).
+- `guarded` : éditions autorisées, tout ce qui demanderait une autorisation est refusé sans attente ;
+  opencode n'accepte alors que `read_only`.
+- `read_only` reste lecture seule dans les deux politiques (vérifié par les tests réels `SHOULD_NOT_EXIST.txt`).
+
+Désactiver temporairement : `default_permission_policy = "guarded"` puis relancer le runner
+(`Stop-ScheduledTask orch-runner; Start-ScheduledTask orch-runner`). Retirer `workspace_write` d'un
+workspace reste le verrou le plus fort.
+
+| Runtime | Prompt | read_only | workspace_write `unattended` | workspace_write `guarded` | Limite connue |
+|---|---|---|---|---|---|
+| claude-code | stdin | `--permission-mode plan --permission-prompts none` | `--permission-mode bypassPermissions` | `--permission-mode acceptEdits --permission-prompts none` | charge settings/hooks/MCP utilisateur |
+| codex | stdin | `-s read-only -c approval_policy="never"` | `-s danger-full-access -c approval_policy="never"` | `-s workspace-write -c approval_policy="never"` | sandbox + approbation toujours explicites (jamais `config.toml`) |
+| agy | `--print=` | `--mode plan --sandbox` | `--mode accept-edits --dangerously-skip-permissions` | `--mode accept-edits --sandbox` | workspace via `--add-dir` + prompt : pas de confinement strict du dossier |
+| opencode | argv après `--` | `--agent plan` | `--agent build --auto` | refusé | `-m` épinglé par `model` ; `--auto` n'honore que les `deny` explicites de la config opencode |
+
+### OpenCode
+
+Modèle épinglé dans `runner.toml` (`model = "opencode/muse-spark-1.3-contributor-free"`, OpenCode Zen gratuit,
+auth `auth.json` du profil) : le runner ne dépend pas du modèle par défaut global d'opencode.
+`--version` ne suffit pas : au démarrage (et à chaque relance) le probe fait une génération minimale
+`Reply OK.` en agent plan ; échec → `available=false`, `reason=runtime_not_ready…`. Résultat mis en cache
+pour la session (pas d'appel LLM par heartbeat). `probe_generation = false` pour le désactiver.
 
 ## Rotation / révocation du jeton runner
 
@@ -115,5 +139,5 @@ Les autres MCP (tasks, astra, calendar, github, vault) ne dépendent d'aucun com
 | tâche `Ready` sans processus, résultat `0x80070002` | runner installé dans AppData virtualisé | réinstaller dans `%USERPROFILE%\.orch-runner` |
 | job `failed` `workspace_denied` | chemin changé, jonction, lecteur réseau | corriger `runner.toml`, relancer |
 | job `lost` | runner tué/redémarré ou PC isolé > 60 s pendant l'exécution | vérifier l'état du workspace puis relancer volontairement |
-| `runtime_unavailable` | runtime désactivé ou `--version` en échec | `python -m orch_runner probe` |
+| `runtime_unavailable` | runtime désactivé, `--version` en échec, ou opencode `runtime_not_ready` (modèle/fournisseur) | `python -m orch_runner probe` ; changer `model` puis relancer |
 | `/orch/mcp` 401 dans ChatGPT | jeton OAuth expiré | reconnecter le connecteur |

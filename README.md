@@ -26,6 +26,10 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 - **Le runner construit l'invocation** via un adapter par runtime (argv figé, `.exe` absolu, jamais
   `cmd.exe`/PowerShell), revalide workspace/runtime/mode localement, lance le processus **suspendu**
   dans un **Job Object** (`KILL_ON_JOB_CLOSE`) puis le reprend.
+- **Agents autonomes, MCP fermé** : `default_permission_policy` (runner.toml, défaut `unattended`) donne
+  à chaque runtime son mode sans demande d'autorisation en `workspace_write` ; `read_only` reste lecture
+  seule ; `guarded` pour revenir aux éditions seules. Détail par runtime : `docs/OPERATIONS.md`.
+  L'autonomie est interne au runtime : le MCP n'expose toujours ni shell, ni flags, ni argv.
 - **Le broker est la source d'autorité** : transitions compare-and-set avec *fencing token* et epoch de
   session runner ; un job perdu après lancement devient `lost`, **jamais relancé ni déclaré `completed`**.
 - **Aucun port entrant sur le PC** : le runner se connecte en sortie au VPS via NetBird.

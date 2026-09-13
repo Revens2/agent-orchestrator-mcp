@@ -61,6 +61,9 @@ def transition_allowed(src: str, dst: str) -> bool:
 # --- runtimes / modes ----------------------------------------------------
 RUNTIMES = ("claude-code", "codex", "agy", "opencode", "fake")
 MODES = ("read_only", "workspace_write")
+# politique locale du runner (jamais fournie par le broker/MCP)
+UNATTENDED, GUARDED = "unattended", "guarded"
+PERMISSION_POLICIES = (UNATTENDED, GUARDED)
 
 # --- bornes --------------------------------------------------------------
 MAX_PROMPT_CHARS = 100_000
