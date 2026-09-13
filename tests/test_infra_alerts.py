@@ -146,3 +146,24 @@ def test_alert_tools_via_mcp(tmp_path):
         assert call(c, "infra_alert_get", {"alert_id": "ghost"})["error"] == "unknown_alert"
         bad = rpc(c, "tools/call", {"name": "infra_alert_list", "arguments": {"source": "mars"}})
         assert bad.get("error") or bad["result"].get("isError")  # rejet schéma Literal
+
+
+def test_alert_cli_record_list_get(tmp_path, capsys):
+    from orch_mcp.alert_cli import main, telegram_format
+
+    db = str(tmp_path / "cli.db")
+    assert main(["--db", db, "record", "--source", "etude", "--service", "orch-mcp",
+                 "--severity", "warning", "--title", "canari cli", "--detail", "d1"]) == 0
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["created"] and rec["alert"]["occurrences"] == 1
+    assert main(["--db", db, "record", "--source", "etude", "--service", "orch-mcp",
+                 "--severity", "warning", "--title", "canari cli"]) == 0
+    assert json.loads(capsys.readouterr().out)["alert"]["occurrences"] == 2  # dedup
+    assert main(["--db", db, "list", "--source", "etude"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 1
+    assert main(["--db", db, "get", "--id", rec["alert"]["alert_id"]]) == 0
+    assert json.loads(capsys.readouterr().out)["detail"] == "d1"
+    assert main(["--db", db, "record", "--source", "mars", "--service", "s",
+                 "--severity", "info", "--title", "t"]) == 2  # refus métier
+    msg = telegram_format("nexus", "critical", "api down", "exit 1")
+    assert msg.startswith("[NEXUS] [critical] api down")
