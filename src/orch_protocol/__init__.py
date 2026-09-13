@@ -80,6 +80,63 @@ HEARTBEAT_S = 5
 ONLINE_WINDOW_S = 30
 CLAIM_POLL_S = 25
 
+# --- supervision riche (v1, champs optionnels : protocole inchangé) ------------
+# Santé d'exécution calculée par le broker (job_get.execution_health).
+HEALTHY = "healthy"                        # activité/output récents
+IDLE = "idle"                              # en attente (queued/claimed ou démarrage récent)
+SUSPECTED_STALL = "suspected_stall"        # processus vivant mais sans activité/output depuis un seuil
+STALLED = "stalled"                        # silence prolongé, processus vivant : intervention humaine requise
+RUNNER_DISCONNECTED = "runner_disconnected"  # runner hors ligne (heartbeat trop vieux)
+PROCESS_DEAD = "process_dead"              # processus non vivant alors que le job est actif
+EXECUTION_HEALTH = frozenset({HEALTHY, IDLE, SUSPECTED_STALL, STALLED, RUNNER_DISCONNECTED, PROCESS_DEAD})
+
+# Seuils de détection de stall (processus vivant + silence d'activité/output).
+# La détection EMET un événement (notify) ; elle ne relance ni n'annule jamais seule.
+STALL_SUSPECT_S = 600
+STALL_S = 1_800
+
+# Journal d'événements structuré borné (job_events, pas de transcript).
+EV_JOB_CLAIMED = "job_claimed"
+EV_RUNTIME_SPAWNED = "runtime_spawned"
+EV_PROCESS_RUNNING = "process_running"
+EV_OUTPUT_PROGRESS = "output_progress"
+EV_ACTIVITY = "activity"
+EV_PROCESS_EXIT = "process_exit"
+EV_RUNNER_DISCONNECT = "runner_disconnect"
+EV_LEASE_EXPIRED = "lease_expired"
+EV_REQUEUED = "requeued"
+EV_CANCEL_REQUESTED = "cancel_requested"
+EV_TIMEOUT_MARKED = "timeout_marked"
+EV_SUSPECTED_STALL = "suspected_stall"
+EV_STALLED = "stalled"
+EVENT_KINDS = frozenset({
+    EV_JOB_CLAIMED, EV_RUNTIME_SPAWNED, EV_PROCESS_RUNNING, EV_OUTPUT_PROGRESS,
+    EV_ACTIVITY, EV_PROCESS_EXIT, EV_RUNNER_DISCONNECT, EV_LEASE_EXPIRED,
+    EV_REQUEUED, EV_CANCEL_REQUESTED, EV_TIMEOUT_MARKED, EV_SUSPECTED_STALL, EV_STALLED,
+})
+MAX_EVENTS_PER_JOB = 500
+OUTPUT_PROGRESS_STEP_CHARS = 65_536
+
+# Missions au-dessus des jobs : objectif + critères d'acceptation + tentatives.
+MISSION_EXECUTING = "executing"
+MISSION_NEEDS_VALIDATION = "needs_validation"
+MISSION_VALIDATED = "validated"
+MISSION_INCOMPLETE = "incomplete"
+MISSION_BLOCKED = "blocked"
+MISSION_FAILED = "failed"
+MISSION_STATES = frozenset({
+    MISSION_EXECUTING, MISSION_NEEDS_VALIDATION, MISSION_VALIDATED,
+    MISSION_INCOMPLETE, MISSION_BLOCKED, MISSION_FAILED,
+})
+MAX_MISSION_ATTEMPTS = 5
+MAX_OBJECTIVE_CHARS = 4_000
+MAX_CRITERIA = 20
+MAX_CRITERION_CHARS = 500
+
+# Attente long-poll côté MCP (agent_job_wait) : bornes sûres.
+WAIT_DEFAULT_S = 25
+WAIT_MAX_S = 60
+
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 

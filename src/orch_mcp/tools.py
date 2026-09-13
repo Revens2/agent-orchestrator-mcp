@@ -21,8 +21,10 @@ StateT = Literal["queued", "claimed", "starting", "running", "completed", "faile
 
 STATE_HELP = (
     "États : queued (attend le PC ; reste en file si le PC est offline), claimed (pris, pas lancé), "
-    "starting, running, completed (exit 0), failed, timeout, cancelled, lost (PC perdu après lancement : "
-    "issue inconnue, jamais relancé automatiquement)."
+    "starting, running, completed (processus terminé avec exit 0 — PAS une mission validée), "
+    "failed, timeout, cancelled, lost (PC perdu après lancement : "
+    "issue inconnue, jamais relancé automatiquement). "
+    "Seule une mission `validated` (agent_mission_validate) atteste un objectif atteint."
 )
 
 
@@ -102,9 +104,15 @@ def register(mcp, store: Store) -> None:
     @mcp.tool(
         name="agent_job_get",
         description=(
-            "État compact d'un job d'agent : state, timestamps, durée, exit_code, dernière activité, "
-            "fin de sortie bornée (output_tail), result_summary et erreur. Ne renvoie jamais le "
-            "transcript complet (voir agent_job_output). " + STATE_HELP
+            "État structuré d'exécution d'un job : state, timestamps, durée, exit_code, dernière "
+            "activité, fin de sortie bornée (output_tail), result_summary et erreur, PLUS supervision "
+            "riche quand observable : heartbeat runner (runner_heartbeat_age_s), processus "
+            "(process_alive, pid, child_process_count), progression (output_chars/chunks, "
+            "last_output_at/last_event_at), activité courante (current_activity/current_tool) et "
+            "execution_health (healthy | idle | suspected_stall | stalled | runner_disconnected | "
+            "process_dead) avec couches séparées broker_health/runner_health/runtime_process_health. "
+            "Champ null = non observé (jamais inventé). Ne renvoie jamais le transcript complet "
+            "(voir agent_job_output) ni secrets/commandes brutes. " + STATE_HELP
         ),
     )
     async def agent_job_get(
@@ -153,7 +161,130 @@ def register(mcp, store: Store) -> None:
         jobs = await anyio.to_thread.run_sync(lambda: store.list_jobs(state, runtime, workspace_id, None, limit))
         return {"jobs": jobs, "count": len(jobs)}
 
+    @mcp.tool(
+        name="agent_job_events",
+        description=(
+            "Journal d'événements structuré et borné d'un job (job_claimed, runtime_spawned, "
+            "output_progress, activity, process_exit, runner_disconnect, lease_expired, "
+            "cancel_requested, suspected_stall, stalled, …), ordonné et paginé. Pas de transcript."
+        ),
+    )
+    async def agent_job_events(
+        job_id: Annotated[str, Field(description="Identifiant du job.")],
+        after_seq: Annotated[int, Field(description="Ne renvoyer que seq > after_seq (-1 = depuis le début).")] = -1,
+        limit: Annotated[int, Field(description="Événements max (1..200, défaut 50).")] = 50,
+    ) -> dict:
+        page = await anyio.to_thread.run_sync(store.read_events, job_id, after_seq, limit)
+        return page if page is not None else {"error": "unknown_job", "job_id": job_id}
 
-TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_get", "agent_job_output", "agent_job_list"})
-TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel"})
+    @mcp.tool(
+        name="agent_runner_inspect",
+        description=(
+            "Snapshot compact runner/environnement : version runner, runtimes (versions/capacités), "
+            "workspaces allowlistés, état réseau/broker (last_seen), jobs actifs enrichis, et git par "
+            "workspace (branch/HEAD/dirty) si observé. Jamais de secrets ni dump d'environnement."
+        ),
+    )
+    async def agent_runner_inspect(
+        runner_id: Annotated[str, Field(description="Identifiant du runner (voir agent_runner_list).")],
+    ) -> dict:
+        snap = await anyio.to_thread.run_sync(store.runner_inspect, runner_id)
+        return snap if snap is not None else {"error": "unknown_runner", "runner_id": runner_id}
+
+    @mcp.tool(
+        name="agent_job_wait",
+        description=(
+            "Attend un changement significatif d'un job (état, sortie, événement, terminal) jusqu'au "
+            "timeout borné (≤ 60 s). Évite le polling agressif pendant un tour actif. N'est PAS un "
+            "fond de tâche : ne se réveille que pendant un tour ChatGPT actif."
+        ),
+    )
+    async def agent_job_wait(
+        job_id: Annotated[str, Field(description="Identifiant du job.")],
+        timeout_s: Annotated[float, Field(description="Attente max en secondes (0..60, défaut 25).")] = 25,
+        since_seq: Annotated[int, Field(description="Seq d'événement déjà connu (-1 = aucun).")] = -1,
+    ) -> dict:
+        res = await anyio.to_thread.run_sync(store.wait_for_change, job_id, since_seq, timeout_s)
+        return res if res is not None else {"error": "unknown_job", "job_id": job_id}
+
+    @mcp.tool(
+        name="agent_mission_create",
+        description=(
+            "Crée une MISSION (objectif + critères d'acceptation) au-dessus des jobs et démarre sa "
+            "première tentative. Rappel : `completed` (exit 0) ne valide jamais la mission : le job "
+            "terminal exit 0 passe la mission en needs_validation, sinon incomplete. Aucun retry "
+            "automatique. Validez avec agent_mission_validate."
+        ),
+    )
+    async def agent_mission_create(
+        objective: Annotated[str, Field(description="Objectif de la mission (1..4000 car.).")],
+        acceptance_criteria: Annotated[list[str], Field(description="Critères d'acceptation (1..20, non vides).")],
+        runner_id: Annotated[str, Field(description="Identifiant du runner.")],
+        runtime: Annotated[RuntimeT, Field(description="Runtime d'agent à utiliser.")],
+        workspace_id: Annotated[str, Field(description="Identifiant de workspace allowlisté.")],
+        mode: Annotated[ModeT, Field(description="read_only ou workspace_write.")] = "read_only",
+        max_attempts: Annotated[int, Field(description="Tentatives max (1..5, défaut 2).")] = 2,
+        timeout_s: Annotated[int | None, Field(description="Durée max par tentative (30..14400).")] = None,
+        prompt: Annotated[str | None, Field(description="Prompt de la 1re tentative (défaut = objectif).")] = None,
+        idempotency_key: Annotated[str | None, Field(description="Clé unique (8..128 car.).")] = None,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: store.create_mission(
+                    objective, acceptance_criteria, max_attempts, runner_id, runtime,
+                    workspace_id, mode, timeout_s, prompt, idempotency_key,
+                )
+            )
+        except BrokerError as exc:
+            return _err(exc)
+
+    @mcp.tool(
+        name="agent_mission_get",
+        description="État d'une mission : objectif, critères, tentatives, job courant, validation.",
+    )
+    async def agent_mission_get(
+        mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
+    ) -> dict:
+        m = await anyio.to_thread.run_sync(store.get_mission, mission_id)
+        return m if m is not None else {"error": "unknown_mission", "mission_id": mission_id}
+
+    @mcp.tool(
+        name="agent_mission_retry",
+        description=(
+            "Nouvelle tentative de la MÊME mission (nouveau job). Exige : mission needs_validation ou "
+            "incomplete, tentative précédente terminale, attempts < max_attempts. Décision explicite "
+            "après examen du journal — jamais de relance aveugle de mission d'écriture."
+        ),
+    )
+    async def agent_mission_retry(
+        mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
+        prompt: Annotated[str | None, Field(description="Prompt ajusté (défaut = objectif).")] = None,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(store.retry_mission, mission_id, prompt)
+        except BrokerError as exc:
+            return _err(exc)
+
+    @mcp.tool(
+        name="agent_mission_validate",
+        description=(
+            "Validation humaine d'une mission (validated | incomplete | blocked | failed). Seule elle "
+            "atteste un objectif atteint : le succès du processus (exit 0) ne suffit pas."
+        ),
+    )
+    async def agent_mission_validate(
+        mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
+        verdict: Annotated[str, Field(description="validated | incomplete | blocked | failed.")],
+        note: Annotated[str | None, Field(description="Note de validation (bornée, redactée).")] = None,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(store.validate_mission, mission_id, verdict, note)
+        except BrokerError as exc:
+            return _err(exc)
+
+
+TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_get", "agent_job_output", "agent_job_list",
+                        "agent_job_events", "agent_runner_inspect", "agent_job_wait", "agent_mission_get"})
+TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel",
+                         "agent_mission_create", "agent_mission_retry", "agent_mission_validate"})
 _ = P
