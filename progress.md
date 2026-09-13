@@ -40,14 +40,14 @@ Base : main `a4aa694` (observabilité Telegram unifiée). Repo local aligné ava
 
 ## Preuves
 
-- `pytest` (hors runtimes réels/Windows) : **111 passed, 1 skipped** ; `ruff check` propre.
+- `pytest` (hors runtimes réels/Windows) : **112 passed, 1 skipped** ; `ruff check` propre.
 - Matrice E2E locale (broker `src/` patché sur `:8802` + runner simulé HTTP) :
   `e2e/e2e_matrix_local.py` → **36/36 PASS** (`MATRIX_RESULT.json`) : 19 outils,
   race wait→`terminal`, terminal→immédiat, télémétrie non-null + `healthy`,
   cancel→arbre, mission failed→retry→validated, alertes ETUDE+NEXUS + dédup
   (`occurrences=2`), question fixture synthetic (dédup, due, sender file,
   answer single-use, replay `question_closed`).
-- BUG1/BUI2 repro-avant + preuve-après exécutés (voir scripts temporaires E2E).
+- BUG1/BUG2 repro-avant + preuve-après exécutés (voir scripts temporaires E2E).
 
 ## Déploiement prod (VPS + PC)
 
