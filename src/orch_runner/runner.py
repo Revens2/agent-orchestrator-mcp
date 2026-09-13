@@ -33,6 +33,14 @@ VERSION = "0.2.0"
 log = logging.getLogger("orch.runner")
 
 
+def _best_effort(fn):
+    """Exécute fn ; None en cas d'échec (télémétrie : absent plutôt qu'inventé)."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - télémétrie best-effort
+        return None
+
+
 def _git_snapshot(path: str) -> dict[str, Any] | None:
     """Snapshot git borné d'un workspace (branch/HEAD/dirty), ou None si non
     observable (pas un dépôt, git absent, timeout). Jamais de secret : les trois
@@ -124,6 +132,28 @@ class JobWorker(threading.Thread):
         self._question_sent = False
 
     # ------------------------------------------------------------- broker I/O
+    def _telemetry(self) -> dict[str, Any]:
+        """Snapshot best-effort joint aux transitions et events (clés absentes =
+        non observé, jamais inventé ; le broker normalise et horodate). Seules
+        les valeurs observées sont renvoyées : le broker conserve le dernier
+        connu (âge lisible via telemetry_age_s)."""
+        snap: dict[str, Any] = {}
+        if self.proc is not None:
+            alive = _best_effort(lambda: self.proc.proc.poll() is None)
+            if alive is not None:
+                snap["proc_alive"] = alive
+            pid = _best_effort(lambda: self.proc.pid)
+            if pid is not None:
+                snap["pid"] = pid
+            if self.proc_started_at is not None:
+                snap["proc_started_at"] = self.proc_started_at
+            children = _best_effort(self.proc.active_processes)
+            if children is not None:
+                snap["child_procs"] = children
+        if self._tool:
+            snap["tool"] = self._tool
+        return snap
+
     def _call(self, path: str, body: dict[str, Any], deadline_s: float = 600) -> dict[str, Any] | None:
         """Retry réseau borné. Retourne None si le job doit être abandonné."""
         end = time.monotonic() + deadline_s
@@ -151,7 +181,7 @@ class JobWorker(threading.Thread):
         return None
 
     def _transition(self, dst: str, **fields: Any) -> bool:
-        res = self._call("transition", {"from": self.state, "to": dst, "runtime_session_id": self.session_id, **fields})
+        res = self._call("transition", {"from": self.state, "to": dst, "runtime_session_id": self.session_id, **self._telemetry(), **fields})
         if res is None:
             return False
         log.info("job_state job_id=%s %s->%s", self.job_id, self.state, dst)
@@ -183,11 +213,12 @@ class JobWorker(threading.Thread):
             text = "".join(self._out)
             self._out.clear()
             activity, self._activity = self._activity, None
+        tele = self._telemetry()
         while text or activity or final:
             chunk, text = text[: P.MAX_CHUNK_CHARS], text[P.MAX_CHUNK_CHARS:]
             res = self._call(
                 "event",
-                {"event_id": uuid.uuid4().hex, "activity": activity, "output": chunk or None, "runtime_session_id": self.session_id},
+                {"event_id": uuid.uuid4().hex, "activity": activity, "output": chunk or None, "runtime_session_id": self.session_id, **tele},
                 deadline_s=60 if not final else 120,
             )
             activity, final = None, False
@@ -386,23 +417,9 @@ class Runner:
                     continue
                 entry: dict[str, Any] = {"job_id": w.job_id, "fencing": w.fencing}
                 if w.proc is not None:
-                    try:
-                        alive = w.proc.proc.poll() is None
-                    except Exception:  # noqa: BLE001 - télémétrie best-effort : inconnu plutôt qu'inventé
-                        alive = None
-                    try:
-                        children = w.proc.active_processes()
-                    except Exception:  # noqa: BLE001 - télémétrie best-effort : inconnu plutôt qu'inventé
-                        children = None
-                    entry.update(
-                        {
-                            "pid": w.proc.pid,
-                            "proc_alive": alive,
-                            "proc_started_at": w.proc_started_at,
-                            "child_procs": children,
-                            "tool": w._tool,
-                        }
-                    )
+                    # Snapshot unique (_telemetry) : seules les valeurs observées
+                    # sont envoyées (le broker conserve le dernier connu).
+                    entry.update(w._telemetry())
                 out.append(entry)
             return out
 

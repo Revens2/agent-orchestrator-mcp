@@ -48,8 +48,14 @@ def to_running(store, epoch, claimed):
 
 
 def tele(store, epoch, job_id, fencing, **kw):
-    base = {"job_id": job_id, "fencing": fencing, "pid": 1234,
-            "proc_alive": True, "proc_started_at": 1_000_000.0, "child_procs": 2}
+    base = {
+        "job_id": job_id,
+        "fencing": fencing,
+        "pid": 1234,
+        "proc_alive": True,
+        "proc_started_at": 1_000_000.0,
+        "child_procs": 2,
+    }
     base.update(kw)
     return store.heartbeat("pc", epoch, [base])
 
@@ -71,8 +77,18 @@ def test_enriched_get_null_when_unobservable(env):
     assert view["runner_health"]["status"] == "online"
     assert view["runtime_process_health"] == {"alive": None, "pid": None, "started_at": None, "child_process_count": None}
     # compat : anciennes clés intactes
-    for k in ("job_id", "state", "exit_code", "last_activity", "result_summary", "error",
-              "output_chars", "output_truncated", "attempt", "duration_s"):
+    for k in (
+        "job_id",
+        "state",
+        "exit_code",
+        "last_activity",
+        "result_summary",
+        "error",
+        "output_chars",
+        "output_truncated",
+        "attempt",
+        "duration_s",
+    ):
         assert k in view
 
 
@@ -143,8 +159,7 @@ def test_event_kinds_and_pagination(env):
     store.transition("pc", epoch, c["job_id"], c["fencing"], "running", "completed", exit_code=0)
     page = store.read_events(c["job_id"])
     kinds = [e["kind"] for e in page["events"]]
-    assert kinds == [P.EV_JOB_CLAIMED, P.EV_RUNTIME_SPAWNED, P.EV_PROCESS_RUNNING,
-                     P.EV_ACTIVITY, P.EV_PROCESS_EXIT]
+    assert kinds == [P.EV_JOB_CLAIMED, P.EV_RUNTIME_SPAWNED, P.EV_PROCESS_RUNNING, P.EV_ACTIVITY, P.EV_PROCESS_EXIT]
     assert page["last_seq"] == 4
     seqs = [e["seq"] for e in page["events"]]
     assert seqs == sorted(seqs)
@@ -218,8 +233,9 @@ def test_stall_detection_notify_only(env):
     # bails prolongés artificiellement : le runner est vivant, le process aussi, rien ne bouge
     for _ in range(30):
         clock.t += P.LEASE_S - 5
-        store.heartbeat("pc", epoch, [{"job_id": c["job_id"], "fencing": c["fencing"],
-                                       "pid": 7, "proc_alive": True, "child_procs": 1}])
+        store.heartbeat(
+            "pc", epoch, [{"job_id": c["job_id"], "fencing": c["fencing"], "pid": 7, "proc_alive": True, "child_procs": 1}]
+        )
         store.reap()
     assert store.get_job(c["job_id"])["state"] == "running"  # jamais annulé seul
     view = store.get_job(c["job_id"])
@@ -228,8 +244,9 @@ def test_stall_detection_notify_only(env):
     assert P.EV_SUSPECTED_STALL in kinds and kinds.count(P.EV_SUSPECTED_STALL) == 1  # edge-triggered
     for _ in range(60):
         clock.t += P.LEASE_S - 5
-        store.heartbeat("pc", epoch, [{"job_id": c["job_id"], "fencing": c["fencing"],
-                                       "pid": 7, "proc_alive": True, "child_procs": 1}])
+        store.heartbeat(
+            "pc", epoch, [{"job_id": c["job_id"], "fencing": c["fencing"], "pid": 7, "proc_alive": True, "child_procs": 1}]
+        )
         store.reap()
     assert store.get_job(c["job_id"])["execution_health"] == "stalled"
     assert store.get_job(c["job_id"])["state"] == "running"  # toujours pas d'action auto
@@ -346,13 +363,15 @@ def test_wait_timeout_and_wakeup(env):
     assert res["woke_by"] == "timeout" and res["state"] == "queued"
     [c] = store.claim("pc", epoch, 1)
     holder = {}
+    last = store._last_seq(c["job_id"])  # client à jour : bloque jusqu'au changement
 
     def waiter():
-        holder["res"] = store.wait_for_change(c["job_id"], timeout_s=5)
+        holder["res"] = store.wait_for_change(c["job_id"], since_seq=last, timeout_s=5)
 
     t = threading.Thread(target=waiter)
     t.start()
     import time as _t
+
     _t.sleep(0.6)
     store.transition("pc", epoch, c["job_id"], c["fencing"], "claimed", "starting")
     t.join(timeout=10)
@@ -360,6 +379,108 @@ def test_wait_timeout_and_wakeup(env):
     assert holder["res"]["woke_by"] in ("state", "change")
     assert holder["res"]["state"] == "starting"
     assert store.wait_for_change("no-such-job") is None
+
+
+def test_wait_terminal_is_immediate(env):
+    """BUG1 : un job déjà terminal ne fait jamais attendre jusqu'au timeout."""
+    import time as _t
+
+    store, _, epoch = env
+    job, _ = start(store)
+    [c] = store.claim("pc", epoch, 1)
+    to_running(store, epoch, c)
+    store.transition("pc", epoch, c["job_id"], c["fencing"], "running", "completed", exit_code=0)
+    t0 = _t.monotonic()
+    res = store.wait_for_change(c["job_id"], since_seq=-1, timeout_s=10)
+    assert res["woke_by"] == "terminal" and res["state"] == "completed"
+    assert _t.monotonic() - t0 < 2
+    # cancelled terminal (annulé en file) : pareil
+    job2, _ = start(store, prompt="b")
+    store.cancel(job2["job_id"])
+    t0 = _t.monotonic()
+    res2 = store.wait_for_change(job2["job_id"], since_seq=-1, timeout_s=10)
+    assert res2["woke_by"] == "terminal" and res2["state"] == "cancelled"
+    assert _t.monotonic() - t0 < 2
+
+
+def test_wait_unseen_events_is_immediate(env):
+    """Client en retard (since_seq < last_seq) : retour immédiat `event`."""
+    import time as _t
+
+    store, _, epoch = env
+    job, _ = start(store)
+    [c] = store.claim("pc", epoch, 1)  # émet job_claimed (seq 0)
+    t0 = _t.monotonic()
+    res = store.wait_for_change(c["job_id"], since_seq=-1, timeout_s=10)
+    assert res["woke_by"] == "event" and res["state"] == "claimed"
+    assert _t.monotonic() - t0 < 2
+
+
+def test_wait_race_to_terminal(env):
+    """Transition terminale pendant l'attente : réveil `terminal` (pas `timeout`)."""
+    store, _, epoch = env
+    job, _ = start(store)
+    [c] = store.claim("pc", epoch, 1)
+    to_running(store, epoch, c)
+    last = store._last_seq(c["job_id"])
+    holder = {}
+
+    def waiter():
+        holder["res"] = store.wait_for_change(c["job_id"], since_seq=last, timeout_s=10)
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    import time as _t
+
+    _t.sleep(0.6)
+    store.transition("pc", epoch, c["job_id"], c["fencing"], "running", "completed", exit_code=0)
+    t.join(timeout=12)
+    assert not t.is_alive()
+    assert holder["res"]["woke_by"] == "terminal"
+    assert holder["res"]["state"] == "completed"
+
+
+def test_telemetry_on_transition_and_event(env):
+    """BUG2 : la télémétrie jointe à RUNNING/event supprime la fenêtre null ;
+    sans télémétrie (vieux runner) les nulls restent + santé idle honnête."""
+    store, clock, epoch = env
+    job, _ = start(store)
+    [c] = store.claim("pc", epoch, 1)
+    store.transition("pc", epoch, c["job_id"], c["fencing"], "claimed", "starting")
+    store.transition(
+        "pc",
+        epoch,
+        c["job_id"],
+        c["fencing"],
+        "starting",
+        "running",
+        telemetry={"pid": 4724, "proc_alive": True, "proc_started_at": 1_000_000.0, "child_procs": 1},
+    )
+    view = store.get_job(c["job_id"])
+    assert view["process_alive"] is True and view["pid"] == 4724
+    assert view["child_process_count"] == 1 and view["telemetry_age_s"] is not None
+    # event sans télémétrie : pas d'écrasement ; avec : rafraîchi
+    store.event("pc", epoch, c["job_id"], c["fencing"], "evt-t2-00001", output="pid=4724")
+    assert store.get_job(c["job_id"])["pid"] == 4724
+    store.event(
+        "pc",
+        epoch,
+        c["job_id"],
+        c["fencing"],
+        "evt-t2-00002",
+        output="x",
+        telemetry={"pid": 4724, "proc_alive": True, "proc_started_at": 1_000_000.0, "child_procs": 3, "tool": "tool: Bash"},
+    )
+    view = store.get_job(c["job_id"])
+    assert view["child_process_count"] == 3 and view["current_tool"] == "tool: Bash"
+    assert view["execution_health"] == "healthy"
+    # vieux runner : nulls + idle, jamais de faux stall
+    job2, _ = start(store, prompt="old")
+    [c2] = store.claim("pc", epoch, 1)
+    to_running(store, epoch, c2)
+    view2 = store.get_job(c2["job_id"])
+    assert view2["process_alive"] is None and view2["telemetry_at"] is None
+    assert view2["telemetry_age_s"] is None and view2["execution_health"] == "idle"
 
 
 # -------------------------------------------------------------- compat

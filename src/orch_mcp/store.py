@@ -295,6 +295,66 @@ class Store:
         row = db.execute("SELECT COALESCE(MAX(seq), -1) AS m FROM job_events WHERE job_id=?", (job_id,)).fetchone()
         return int(row["m"])
 
+    @staticmethod
+    def _telemetry_values(h: dict[str, Any]) -> dict[str, Any] | None:
+        """Normalise la télémétrie d'exécution d'un payload runner (held d'un
+        heartbeat, event de sortie, ou transition). Retourne None si aucune clé
+        présente (non observé : on ne touche à rien, jamais inventé) ; sinon un
+        mapping colonne -> valeur (None = observé-mais-inconnu, ex. requête Job
+        Object en échec). Mapping UNIQUE pour les trois chemins (heartbeat,
+        event, transition) : la sortie et la télémétrie restent cohérentes."""
+        if not isinstance(h, dict) or not any(
+            k in h for k in ("pid", "proc_alive", "proc_started_at", "child_procs", "tool")
+        ):
+            return None
+        try:
+            pid = h.get("pid")
+            pid = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        alive = h.get("proc_alive")
+        alive = int(bool(alive)) if alive is not None else None
+        try:
+            pstarted = h.get("proc_started_at")
+            pstarted = float(pstarted) if pstarted is not None else None
+        except (TypeError, ValueError):
+            pstarted = None
+        try:
+            children = h.get("child_procs")
+            children = int(children) if children is not None else None
+            if children is not None and children < 0:
+                children = None  # requête Job Object en échec : inconnu, pas 0
+        except (TypeError, ValueError):
+            children = None
+        return {
+            "proc_pid": pid,
+            "proc_started_at": pstarted,
+            "proc_alive": alive,
+            "child_procs": children,
+            "current_tool": P.clip(redact(str(h["tool"])[:120]), 120) if h.get("tool") else None,
+        }
+
+    def _store_telemetry(self, db, job_id: str, tele: dict[str, Any] | None) -> None:
+        """Persiste une télémétrie normalisée (horodatée). Ne touche PAS à
+        updated_at : un ping de présence n'est pas un changement significatif
+        pour job_wait (seuls event/transition réveillent)."""
+        if not tele:
+            return
+        db.execute(
+            """UPDATE jobs SET telemetry_at=?, proc_pid=?, proc_started_at=?,
+                 proc_alive=?, child_procs=?, current_tool=?
+               WHERE id=?""",
+            (
+                self.clock(),
+                tele["proc_pid"],
+                tele["proc_started_at"],
+                tele["proc_alive"],
+                tele["child_procs"],
+                tele["current_tool"],
+                job_id,
+            ),
+        )
+
     # ---------------------------------------------------------------- runners
     def _runner_epoch_ok(self, db, runner_id: str, epoch: int) -> None:
         row = db.execute("SELECT epoch FROM runners WHERE id=?", (runner_id,)).fetchone()
@@ -403,38 +463,9 @@ class Store:
                 if row["cancel_requested"]:
                     cancel.append(str(job_id))
                 # Télémétrie d'exécution (optionnelle, runners récents) : état du
-                # processus observé localement. Ne touche PAS à updated_at (un ping
-                # de présence n'est pas un changement significatif pour job_wait).
-                if any(k in h for k in ("pid", "proc_alive", "proc_started_at", "child_procs", "tool")):
-                    try:
-                        pid = h.get("pid")
-                        pid = int(pid) if pid is not None else None
-                    except (TypeError, ValueError):
-                        pid = None
-                    alive = h.get("proc_alive")
-                    alive = int(bool(alive)) if alive is not None else None
-                    try:
-                        pstarted = h.get("proc_started_at")
-                        pstarted = float(pstarted) if pstarted is not None else None
-                    except (TypeError, ValueError):
-                        pstarted = None
-                    try:
-                        children = h.get("child_procs")
-                        children = int(children) if children is not None else None
-                        if children is not None and children < 0:
-                            children = None  # requête Job Object en échec : inconnu, pas 0
-                    except (TypeError, ValueError):
-                        children = None
-                    db.execute(
-                        """UPDATE jobs SET telemetry_at=?, proc_pid=?, proc_started_at=?,
-                             proc_alive=?, child_procs=?, current_tool=?
-                           WHERE id=?""",
-                        (
-                            now, pid, pstarted, alive, children,
-                            P.clip(redact(str(h["tool"])[:120]), 120) if h.get("tool") else None,
-                            job_id,
-                        ),
-                    )
+                # processus observé localement. Mapping unique (_telemetry_values) :
+                # absent = non observé (on ne touche à rien), jamais inventé.
+                self._store_telemetry(db, job_id, self._telemetry_values(h))
         return {"cancel": cancel, "abandon": unknown}
 
     def runners(self) -> list[dict[str, Any]]:
@@ -589,12 +620,14 @@ class Store:
         result_summary: str | None = None,
         error: str | None = None,
         runtime_session_id: str | None = None,
+        telemetry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if (src, dst) not in P.RUNNER_TRANSITIONS:
             raise BrokerError("invalid_transition", f"{src}->{dst} interdit au runner")
         if dst == P.COMPLETED and exit_code != 0:
             raise BrokerError("invalid_transition", "completed exige exit_code=0")
         now = self.clock()
+        tele = self._telemetry_values(telemetry or {})
         with self._tx() as db:
             self._runner_epoch_ok(db, runner_id, epoch)
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -603,7 +636,8 @@ class Store:
             if int(row["fencing"]) != int(fencing):
                 raise BrokerError("stale_fencing", "fencing token périmé")
             if row["state"] == dst:
-                return self._job_view(row)  # retry idempotent de la même transition
+                self._store_telemetry(db, job_id, tele)  # retry idempotent : télémétrie quand même fraîche
+                return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
             if row["state"] != src:
                 raise BrokerError("state_conflict", f"état actuel {row['state']}, attendu {src}")
             terminal = dst in P.TERMINAL
@@ -633,6 +667,10 @@ class Store:
             if cur.rowcount != 1:
                 raise BrokerError("state_conflict", "transition concurrente")
             self._log_transition(db, job_id, src, dst, f"runner:{runner_id}")
+            # Télémétrie jointe à la transition (surtout STARTING->RUNNING : le
+            # pid est connu dès le spawn, pas au prochain heartbeat). Sans elle,
+            # un job court (sortie avant le premier heartbeat) restait à null.
+            self._store_telemetry(db, job_id, tele)
             if (src, dst) == (P.CLAIMED, P.STARTING):
                 self._emit(db, job_id, P.EV_RUNTIME_SPAWNED, f"runtime {row['runtime']}")
             elif (src, dst) == (P.STARTING, P.RUNNING):
@@ -680,10 +718,12 @@ class Store:
         activity: str | None = None,
         output: str | None = None,
         runtime_session_id: str | None = None,
+        telemetry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(event_id, str) or not 8 <= len(event_id) <= 64:
             raise BrokerError("invalid_event", "event_id invalide")
         now = self.clock()
+        tele = self._telemetry_values(telemetry or {})
         with self._tx() as db:
             self._runner_epoch_ok(db, runner_id, epoch)
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -737,6 +777,10 @@ class Store:
                 self._emit(db, job_id, P.EV_OUTPUT_PROGRESS, f"{chars} caractères reçus")
             if new_activity and new_activity != (row["last_activity"] or None):
                 self._emit(db, job_id, P.EV_ACTIVITY, new_activity)
+            # Télémétrie piggyback (le runner joint son snapshot à chaque flush) :
+            # la sortie et l'état processus restent cohérents même si le job vit
+            # moins d'un intervalle de heartbeat.
+            self._store_telemetry(db, job_id, tele)
             return {"duplicate": False, "cancel": bool(row["cancel_requested"])}
 
     def cancel(self, job_id: str) -> dict[str, Any]:
@@ -1465,6 +1509,7 @@ class Store:
         alive = None if alive is None else bool(alive)
         children = row["child_procs"]
         children = None if children is None else int(children)
+        tele_at = row["telemetry_at"]
         view = {
             "job_id": row["id"],
             "display_title": P.display_title(row["prompt"], fallback=f"job {row['id'][:8]}"),
@@ -1487,8 +1532,12 @@ class Store:
             "output_truncated": bool(row["output_truncated"]),
             "attempt": row["attempt"],
             # --- supervision riche : état structuré d'exécution (null = non observé)
+            # telemetry_at/age : None + télémétrie null = runner sans
+            # instrumentation (vieux runner) ou pas encore observé ; jamais inventé.
             "runner_last_seen_at": _iso(runner_last_seen),
             "runner_heartbeat_age_s": hb_age,
+            "telemetry_at": _iso(tele_at),
+            "telemetry_age_s": round(now - tele_at, 1) if tele_at is not None else None,
             "process_alive": alive,
             "pid": row["proc_pid"],
             "process_started_at": _iso(row["proc_started_at"]),
@@ -1616,18 +1665,45 @@ class Store:
     def wait_for_change(self, job_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any] | None:
         """Long-poll borné : se réveille sur changement significatif (état, sortie,
         événement) ou à expiration du timeout. Réveil par polling 0,2 s, jamais plus
-        de WAIT_MAX_S. N'est PAS un fond de tâche : le réveil exige un tour actif."""
+        de WAIT_MAX_S. N'est PAS un fond de tâche : le réveil exige un tour actif.
+
+        Sémantique (woke_by) :
+        - job déjà terminal à l'appel => retour IMMÉDIAT `terminal` (jamais
+          d'attente jusqu'au timeout sur un état qui ne bougera plus) ;
+        - événements non vus (`last_seq > since_seq`) => retour IMMÉDIAT `event` ;
+        - pendant l'attente : `terminal` (état terminal atteint), `state`
+          (autre changement d'état), `change` (sortie/activité sans changement
+          d'état), `event` (nouvel événement au-delà de since_seq) ;
+        - sinon `timeout` à expiration du délai borné."""
         timeout_s = max(0.0, min(float(timeout_s), P.WAIT_MAX_S))
         since_seq = max(-1, int(since_seq))
         import time as _t
 
-        deadline = _t.monotonic() + timeout_s
+        def _snapshot(woke_by: str) -> dict[str, Any] | None:
+            view = self.get_job(job_id, tail_chars=0)
+            if view is None:
+                return None
+            return {
+                "job_id": job_id,
+                "state": view["state"],
+                "woke_by": woke_by,
+                "execution_health": view["execution_health"],
+                "last_event_seq": self._last_seq(job_id),
+            }
+
         with self._lock:
             row = self._db.execute("SELECT updated_at, state FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None:
                 return None
             baseline_updated, baseline_state = float(row["updated_at"]), row["state"]
             base_seq = self._event_seq(self._db, job_id)
+            # Réveil immédiat : état terminal déjà atteint (ne bougera plus).
+            if baseline_state in P.TERMINAL:
+                return _snapshot("terminal")
+            # Réveil immédiat : le client est en retard (événements non vus).
+            if base_seq > since_seq:
+                return _snapshot("event")
+        deadline = _t.monotonic() + timeout_s
         woke_by = "timeout"
         while _t.monotonic() < deadline:
             _t.sleep(0.2)
@@ -1636,13 +1712,13 @@ class Store:
                 if row is None:
                     return None
                 seq = self._event_seq(self._db, job_id)
-                if row["state"] in P.TERMINAL and row["state"] != baseline_state:
-                    woke_by = "terminal"
+                if row["state"] != baseline_state:
+                    woke_by = "terminal" if row["state"] in P.TERMINAL else "state"
                     break
                 if float(row["updated_at"]) != baseline_updated or seq != base_seq:
-                    woke_by = "change" if row["state"] == baseline_state else "state"
+                    woke_by = "change"
                     break
-                if seq > since_seq > base_seq:
+                if seq > since_seq:
                     woke_by = "event"
                     break
         view = self.get_job(job_id, tail_chars=0)

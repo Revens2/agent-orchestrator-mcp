@@ -137,6 +137,7 @@ def build_routes(store: Store, auth: RunnerAuth) -> list[Route]:
             await asyncio.sleep(0.5)
 
     async def event(runner_id: str, data: dict, _: Request) -> dict:
+        tele = {k: data[k] for k in ("pid", "proc_alive", "proc_started_at", "child_procs", "tool") if k in data}
         return await anyio.to_thread.run_sync(
             lambda: store.event(
                 runner_id,
@@ -147,11 +148,13 @@ def build_routes(store: Store, auth: RunnerAuth) -> list[Route]:
                 activity=data.get("activity"),
                 output=data.get("output"),
                 runtime_session_id=data.get("runtime_session_id"),
+                telemetry=tele or None,
             )
         )
 
     async def transition(runner_id: str, data: dict, _: Request) -> dict:
         exit_code = data.get("exit_code")
+        tele = {k: data[k] for k in ("pid", "proc_alive", "proc_started_at", "child_procs", "tool") if k in data}
         return await anyio.to_thread.run_sync(
             lambda: store.transition(
                 runner_id,
@@ -164,6 +167,7 @@ def build_routes(store: Store, auth: RunnerAuth) -> list[Route]:
                 result_summary=data.get("result_summary"),
                 error=data.get("error"),
                 runtime_session_id=data.get("runtime_session_id"),
+                telemetry=tele or None,
             )
         )
 

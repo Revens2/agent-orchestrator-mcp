@@ -117,8 +117,15 @@ couches `broker_health`/`runner_health`/`runtime_process_health`) →
   `stalled` (≥ 30 min). Notification seule : décider humainement (notify/cancel/resume
   via `agent_job_cancel` ou `agent_mission_retry`). Pas de télémétrie (vieux runner) =
   pas de faux signal (`execution_health` reste `idle`/`healthy`, champs à null).
-- `agent_job_wait` évite le polling agressif pendant un tour actif (≤ 60 s). Quand le
-  tour ChatGPT est fini, reprendre plus tard avec `agent_job_get` + `after_seq`.
+  Depuis la version télémétrie-sur-transition/event, le runner joint son snapshot
+  (pid, vivant, enfants, outil) à la transition `running` et à chaque event de
+  sortie : un job qui produit de la sortie a toujours sa télémétrie (`telemetry_age_s`
+  donne l'âge de la dernière observation ; `telemetry_at=null` + champs null =
+  runner sans instrumentation, jamais une panne).
+- `agent_job_wait` évite le polling agressif pendant un tour actif (≤ 60 s). Réveil
+  immédiat (sans attendre le timeout) si le job est déjà terminal (`woke_by=terminal`)
+  ou si des événements non vus existent (`last_seq > since_seq` → `woke_by=event`).
+  Quand le tour ChatGPT est fini, reprendre plus tard avec `agent_job_get` + `after_seq`.
 - `agent_runner_inspect` : versions/capacités des runtimes, workspaces allowlistés,
   git par workspace (`branch`/`head`/`dirty`, null si non observé), jobs actifs enrichis.
   Jamais de secrets, jamais de dump d'environnement (`current_command_sanitized`

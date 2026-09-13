@@ -27,7 +27,11 @@ def post(c, path, body, token=TOKEN, ip="10.200.208.99"):
     return c.post(f"/runner/v1/{path}", json={"protocol_version": P.PROTOCOL_VERSION, **body}, headers=headers)
 
 
-INFO = {"runtimes": [{"id": "fake", "available": True}], "workspaces": [{"id": "demo", "modes": ["read_only"]}], "max_parallel": 1}
+INFO = {
+    "runtimes": [{"id": "fake", "available": True}],
+    "workspaces": [{"id": "demo", "modes": ["read_only"]}],
+    "max_parallel": 1,
+}
 
 
 def test_auth_required(client):
@@ -62,13 +66,32 @@ def test_flow_over_http(client):
     assert jobs[0]["job_id"] == job["job_id"]
     fencing = jobs[0]["fencing"]
     for src, dst in (("claimed", "starting"), ("starting", "running")):
-        assert post(c, "transition", {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "from": src, "to": dst}).status_code == 200
-    assert post(c, "event", {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "event_id": "e-00000001", "output": "o"}).status_code == 200
+        assert (
+            post(
+                c, "transition", {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "from": src, "to": dst}
+            ).status_code
+            == 200
+        )
+    assert (
+        post(
+            c, "event", {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "event_id": "e-00000001", "output": "o"}
+        ).status_code
+        == 200
+    )
     # un autre runner authentifié ne peut pas toucher ce job
     e2 = post(c, "hello", {"info": INFO}, token=OTHER).json()["epoch"]
-    r = post(c, "transition", {"epoch": e2, "job_id": job["job_id"], "fencing": fencing, "from": "running", "to": "completed", "exit_code": 0}, token=OTHER)
+    r = post(
+        c,
+        "transition",
+        {"epoch": e2, "job_id": job["job_id"], "fencing": fencing, "from": "running", "to": "completed", "exit_code": 0},
+        token=OTHER,
+    )
     assert r.status_code == 404
-    r = post(c, "transition", {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "from": "running", "to": "completed", "exit_code": 0})
+    r = post(
+        c,
+        "transition",
+        {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "from": "running", "to": "completed", "exit_code": 0},
+    )
     assert r.status_code == 200 and r.json()["state"] == "completed"
 
 
@@ -84,3 +107,46 @@ def test_body_limit(client):
     c, _ = client
     r = post(c, "hello", {"info": INFO, "pad": "x" * 300_000})
     assert r.status_code == 400
+
+
+def test_telemetry_flows_over_http(client):
+    """BUG2 : télémétrie jointe aux transitions/events HTTP (fenêtre null
+    fermée) + heartbeat ; un vieux runner sans télémétrie reste à null."""
+    c, store = client
+    epoch = post(c, "hello", {"info": INFO}).json()["epoch"]
+    job, _ = store.create_job("pc", "fake", "demo", "hi", "read_only")
+    jobs = post(c, "claim", {"epoch": epoch, "free_slots": 1, "wait_s": 0}).json()["jobs"]
+    fencing = jobs[0]["fencing"]
+    tele = {"pid": 4724, "proc_alive": True, "proc_started_at": 1_000_000.0, "child_procs": 1}
+    r = post(c, "transition", {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "from": "claimed", "to": "starting"})
+    assert r.status_code == 200
+    r = post(
+        c,
+        "transition",
+        {"epoch": epoch, "job_id": job["job_id"], "fencing": fencing, "from": "starting", "to": "running", **tele},
+    )
+    assert r.status_code == 200
+    view = store.get_job(job["job_id"])
+    assert view["process_alive"] is True and view["pid"] == 4724 and view["telemetry_age_s"] is not None
+    r = post(
+        c,
+        "event",
+        {
+            "epoch": epoch,
+            "job_id": job["job_id"],
+            "fencing": fencing,
+            "event_id": "e-tele-001",
+            "output": "pid=4724",
+            **tele,
+            "child_procs": 2,
+            "tool": "tool: Bash",
+        },
+    )
+    assert r.status_code == 200
+    view = store.get_job(job["job_id"])
+    assert view["child_process_count"] == 2 and view["current_tool"] == "tool: Bash"
+    assert view["execution_health"] == "healthy"
+    # heartbeat sans télémétrie (vieux runner) : conserve le dernier connu
+    r = post(c, "heartbeat", {"epoch": epoch, "held": [{"job_id": job["job_id"], "fencing": fencing}]})
+    assert r.status_code == 200
+    assert store.get_job(job["job_id"])["pid"] == 4724
