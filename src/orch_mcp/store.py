@@ -899,7 +899,6 @@ class Store:
                 "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
                 (mission_id, 1, job["job_id"], now),
             )
-            self._emit(db, job["job_id"], P.EV_JOB_CLAIMED, f"tentative 1/{max_attempts} de la mission")
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
     def get_mission(self, mission_id: str) -> dict[str, Any] | None:
@@ -968,7 +967,6 @@ class Store:
                 "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
                 (mission_id, attempt_no, job["job_id"], now),
             )
-            self._emit(db, job["job_id"], P.EV_JOB_CLAIMED, f"tentative {attempt_no}/{m['max_attempts']} de la mission")
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
     def validate_mission(self, mission_id: str, verdict: str, note: str | None = None) -> dict[str, Any]:

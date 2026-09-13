@@ -75,7 +75,7 @@ def test_supervision_tools_via_mcp(client):
     assert got["execution_health"] == "idle" and got["runner_health"]["status"] == "online"
     assert got["broker_health"]["lease_valid"] is False  # queued : pas de bail
     evts = call(c, "agent_job_events", {"job_id": job_id})
-    assert evts["last_seq"] == 0 and [e["kind"] for e in evts["events"]] == ["job_claimed"]
+    assert evts["last_seq"] == -1 and evts["events"] == []  # mission créée : job queued, journal vide
     snap = call(c, "agent_runner_inspect", {"runner_id": "pc"})
     assert snap["status"] == "online" and "runner_version" in snap
     assert snap["workspace_git"] == [] and snap["active_jobs"] == []
