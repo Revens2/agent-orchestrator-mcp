@@ -95,6 +95,47 @@ CREATE TRIGGER IF NOT EXISTS jobs_terminal_immutable
 BEFORE UPDATE OF state ON jobs
 WHEN OLD.state IN ('completed','failed','timeout','cancelled','lost') AND NEW.state != OLD.state
 BEGIN SELECT RAISE(ABORT, 'terminal state is immutable'); END;
+-- Supervision riche : journal structuré borné + missions. Créées ici pour les
+-- bases neuves ; les bases existantes sont migrées par _migrate() (ADD COLUMN
+-- idempotent, nouvelles tables IF NOT EXISTS : rollback = redéployer l'ancien src).
+CREATE TABLE IF NOT EXISTS job_events (
+  job_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  at REAL NOT NULL,
+  kind TEXT NOT NULL,
+  detail TEXT,
+  PRIMARY KEY (job_id, seq)
+);
+CREATE INDEX IF NOT EXISTS job_events_job ON job_events(job_id, seq);
+CREATE TABLE IF NOT EXISTS runner_env (
+  runner_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  branch TEXT,
+  head TEXT,
+  dirty INTEGER,
+  at REAL NOT NULL,
+  PRIMARY KEY (runner_id, workspace_id)
+);
+CREATE TABLE IF NOT EXISTS missions (
+  id TEXT PRIMARY KEY,
+  objective TEXT NOT NULL,
+  acceptance_json TEXT NOT NULL DEFAULT '[]',
+  max_attempts INTEGER NOT NULL DEFAULT 2,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  current_job_id TEXT,
+  state TEXT NOT NULL DEFAULT 'executing',
+  validation_state TEXT,
+  validation_note TEXT,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mission_attempts (
+  mission_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL,
+  job_id TEXT NOT NULL,
+  at REAL NOT NULL,
+  PRIMARY KEY (mission_id, attempt_no)
+);
 """
 
 MAX_CLAIM_ATTEMPTS = 3
@@ -126,6 +167,7 @@ class Store:
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(SCHEMA)
+        self._migrate()
 
     # ------------------------------------------------------------------ utils
     def close(self) -> None:
@@ -159,6 +201,57 @@ class Store:
             (job_id, self.clock(), src, dst, actor),
         )
         log.info("job_transition job_id=%s %s->%s actor=%s", job_id, src, dst, actor)
+
+    def _migrate(self) -> None:
+        """Migration idempotente des bases v1 : nouvelles colonnes NULL (= inconnu)
+        et nouvelles tables. Sûre à rejouer ; l'ancien code ignore ces ajouts."""
+        with self._lock:
+            cols = {r["name"] for r in self._db.execute("PRAGMA table_info(jobs)").fetchall()}
+            # DDL littéraux (pas d'interpolation : exigence semgrep) ; chaque
+            # colonne n'est ajoutée que si absente.
+            if "last_output_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN last_output_at REAL")
+            if "last_event_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN last_event_at REAL")
+            if "telemetry_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN telemetry_at REAL")
+            if "proc_pid" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN proc_pid INTEGER")
+            if "proc_started_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN proc_started_at REAL")
+            if "proc_alive" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN proc_alive INTEGER")
+            if "child_procs" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN child_procs INTEGER")
+            if "current_tool" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN current_tool TEXT")
+            if "stall_suspect_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN stall_suspect_at REAL")
+            if "stall_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
+            log.info("migrated jobs columns ok")
+
+    def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
+        """Journal structuré borné : événement ordonné persistant (seq par job).
+        `detail` est redacted + borné. Les plus vieux au-delà de MAX_EVENTS_PER_JOB
+        sont supprimés (pas de transcript complet). Retourne le seq."""
+        now = self.clock()
+        row = db.execute("SELECT COALESCE(MAX(seq), -1) AS m FROM job_events WHERE job_id=?", (job_id,)).fetchone()
+        seq = int(row["m"]) + 1
+        clean = P.clip(redact(detail), 500) if detail else None
+        db.execute(
+            "INSERT INTO job_events(job_id, seq, at, kind, detail) VALUES (?,?,?,?,?)",
+            (job_id, seq, now, kind, clean),
+        )
+        db.execute(
+            "DELETE FROM job_events WHERE job_id=? AND seq <= (SELECT COALESCE(MAX(seq), -1) - ? FROM job_events WHERE job_id=?)",
+            (job_id, P.MAX_EVENTS_PER_JOB, job_id),
+        )
+        return seq
+
+    def _event_seq(self, db, job_id: str) -> int:
+        row = db.execute("SELECT COALESCE(MAX(seq), -1) AS m FROM job_events WHERE job_id=?", (job_id,)).fetchone()
+        return int(row["m"])
 
     # ---------------------------------------------------------------- runners
     def _runner_epoch_ok(self, db, runner_id: str, epoch: int) -> None:
@@ -213,6 +306,10 @@ class Store:
                         (epoch, now + P.LEASE_S, now, job["id"]),
                     )
                     continue
+                self._emit(
+                    db, job["id"], P.EV_RUNNER_DISCONNECT,
+                    f"runner reconnecté (epoch {epoch}) sans détenir ce job",
+                )
                 if job["state"] == P.CLAIMED:
                     self._requeue(db, job["id"], "runner_restart")
                 else:
@@ -220,6 +317,24 @@ class Store:
                         db, job["id"], job["state"], P.LOST, "broker",
                         error="runner redémarré ou reconnecté sans ce job : issue inconnue, non relancé",
                     )
+            # Snapshot d'environnement par workspace (git, si le runner l'observe) :
+            # cache broker rafraîchi au hello, jamais de secrets (branch/head/dirty seuls).
+            for ws_id, snap in (info.get("env") or {}).items():
+                if not P.valid_id(ws_id) or not isinstance(snap, dict):
+                    continue
+                db.execute(
+                    """INSERT INTO runner_env(runner_id, workspace_id, branch, head, dirty, at)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(runner_id, workspace_id) DO UPDATE SET
+                         branch=excluded.branch, head=excluded.head, dirty=excluded.dirty, at=excluded.at""",
+                    (
+                        runner_id, ws_id,
+                        str(snap.get("branch") or "")[:120] or None,
+                        str(snap.get("head") or "")[:40] or None,
+                        1 if snap.get("dirty") else 0,
+                        now,
+                    ),
+                )
         log.info("runner_connected runner_id=%s epoch=%s", runner_id, epoch)
         return epoch
 
@@ -245,6 +360,39 @@ class Store:
                 )
                 if row["cancel_requested"]:
                     cancel.append(str(job_id))
+                # Télémétrie d'exécution (optionnelle, runners récents) : état du
+                # processus observé localement. Ne touche PAS à updated_at (un ping
+                # de présence n'est pas un changement significatif pour job_wait).
+                if any(k in h for k in ("pid", "proc_alive", "proc_started_at", "child_procs", "tool")):
+                    try:
+                        pid = h.get("pid")
+                        pid = int(pid) if pid is not None else None
+                    except (TypeError, ValueError):
+                        pid = None
+                    alive = h.get("proc_alive")
+                    alive = int(bool(alive)) if alive is not None else None
+                    try:
+                        pstarted = h.get("proc_started_at")
+                        pstarted = float(pstarted) if pstarted is not None else None
+                    except (TypeError, ValueError):
+                        pstarted = None
+                    try:
+                        children = h.get("child_procs")
+                        children = int(children) if children is not None else None
+                        if children is not None and children < 0:
+                            children = None  # requête Job Object en échec : inconnu, pas 0
+                    except (TypeError, ValueError):
+                        children = None
+                    db.execute(
+                        """UPDATE jobs SET telemetry_at=?, proc_pid=?, proc_started_at=?,
+                             proc_alive=?, child_procs=?, current_tool=?
+                           WHERE id=?""",
+                        (
+                            now, pid, pstarted, alive, children,
+                            P.clip(redact(str(h["tool"])[:120]), 120) if h.get("tool") else None,
+                            job_id,
+                        ),
+                    )
         return {"cancel": cancel, "abandon": unknown}
 
     def runners(self) -> list[dict[str, Any]]:
@@ -370,6 +518,7 @@ class Store:
                 if cur.rowcount != 1:
                     continue
                 self._log_transition(db, row["id"], P.QUEUED, P.CLAIMED, f"runner:{runner_id}")
+                self._emit(db, row["id"], P.EV_JOB_CLAIMED, f"pris par {runner_id}")
                 fresh = db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
                 claimed.append(
                     {
@@ -418,13 +567,14 @@ class Store:
             terminal = dst in P.TERMINAL
             # Requête fixe : un champ absent (None) conserve sa valeur via COALESCE.
             cur = db.execute(
-                """UPDATE jobs SET state=?, updated_at=?, lease_expires=?,
+                """UPDATE jobs SET state=?, updated_at=?, last_event_at=?, lease_expires=?,
                      started_at=COALESCE(?, started_at), finished_at=COALESCE(?, finished_at),
                      exit_code=COALESCE(?, exit_code), result_summary=COALESCE(?, result_summary),
                      error=COALESCE(?, error), runtime_session_id=COALESCE(?, runtime_session_id)
                    WHERE id=? AND state=? AND fencing=?""",
                 (
                     dst,
+                    now,
                     now,
                     None if terminal else now + P.LEASE_S,
                     now if dst == P.RUNNING else None,
@@ -441,6 +591,13 @@ class Store:
             if cur.rowcount != 1:
                 raise BrokerError("state_conflict", "transition concurrente")
             self._log_transition(db, job_id, src, dst, f"runner:{runner_id}")
+            if (src, dst) == (P.CLAIMED, P.STARTING):
+                self._emit(db, job_id, P.EV_RUNTIME_SPAWNED, f"runtime {row['runtime']}")
+            elif (src, dst) == (P.STARTING, P.RUNNING):
+                self._emit(db, job_id, P.EV_PROCESS_RUNNING, "processus agent repris")
+            elif terminal:
+                self._emit(db, job_id, P.EV_PROCESS_EXIT, f"from={src} exit={exit_code}")
+                self._mission_on_job_terminal(db, job_id, dst)
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def event(
@@ -471,6 +628,8 @@ class Store:
             if row["state"] not in P.ACTIVE:
                 return {"duplicate": False, "ignored": True, "cancel": False}
             chunks, chars, truncated = int(row["output_chunks"]), int(row["output_chars"]), int(row["output_truncated"])
+            prev_step = chars // P.OUTPUT_PROGRESS_STEP_CHARS
+            got_output = False
             if output:
                 text = redact(output)[: P.MAX_CHUNK_CHARS]
                 room = P.MAX_OUTPUT_CHARS_PER_JOB - chars
@@ -482,15 +641,21 @@ class Store:
                         truncated = 1
                     db.execute("INSERT INTO output(job_id, seq, text) VALUES (?,?,?)", (job_id, chunks, text))
                     chunks, chars = chunks + 1, chars + len(text)
+                    got_output = True
+            new_activity = P.clip(redact(activity.strip()), P.MAX_ACTIVITY_CHARS) if activity else None
             db.execute(
-                """UPDATE jobs SET updated_at=?, lease_expires=?, last_activity=COALESCE(?, last_activity),
+                """UPDATE jobs SET updated_at=?, last_event_at=?, last_output_at=?,
+                     lease_expires=?, last_activity=COALESCE(?, last_activity),
                      runtime_session_id=COALESCE(?, runtime_session_id),
-                     output_chunks=?, output_chars=?, output_truncated=?
+                     output_chunks=?, output_chars=?, output_truncated=?,
+                     stall_suspect_at=NULL, stall_at=NULL
                    WHERE id=?""",
                 (
                     now,
+                    now,
+                    now if got_output else row["last_output_at"],
                     now + P.LEASE_S,
-                    P.clip(redact(activity.strip()), P.MAX_ACTIVITY_CHARS) if activity else None,
+                    new_activity,
                     str(runtime_session_id)[:128] if runtime_session_id else None,
                     chunks,
                     chars,
@@ -498,6 +663,10 @@ class Store:
                     job_id,
                 ),
             )
+            if got_output and chars // P.OUTPUT_PROGRESS_STEP_CHARS > prev_step:
+                self._emit(db, job_id, P.EV_OUTPUT_PROGRESS, f"{chars} caractères reçus")
+            if new_activity and new_activity != (row["last_activity"] or None):
+                self._emit(db, job_id, P.EV_ACTIVITY, new_activity)
             return {"duplicate": False, "cancel": bool(row["cancel_requested"])}
 
     def cancel(self, job_id: str) -> dict[str, Any]:
@@ -510,8 +679,10 @@ class Store:
                 return {"job_id": job_id, "result": "already_finished", "state": row["state"]}
             if row["state"] == P.QUEUED:
                 self._set_terminal(db, job_id, P.QUEUED, P.CANCELLED, "mcp", error="annulé avant prise en charge")
+                self._emit(db, job_id, P.EV_CANCEL_REQUESTED, "annulé en file par MCP")
                 return {"job_id": job_id, "result": "cancelled", "state": P.CANCELLED}
             db.execute("UPDATE jobs SET cancel_requested=1, updated_at=? WHERE id=?", (now, job_id))
+            self._emit(db, job_id, P.EV_CANCEL_REQUESTED, f"annulation demandée (état {row['state']})")
             log.info("job_cancel_requested job_id=%s state=%s", job_id, row["state"])
             return {"job_id": job_id, "result": "cancel_requested", "state": row["state"]}
 
@@ -521,7 +692,10 @@ class Store:
             row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None:
                 return None
-            view = self._job_view(row)
+            runner = self._db.execute(
+                "SELECT last_seen FROM runners WHERE id=?", (row["runner_id"],)
+            ).fetchone()
+            view = self._job_view(row, runner["last_seen"] if runner else None)
             tail_chars = max(0, min(int(tail_chars), 8_000))
             if tail_chars and row["output_chunks"]:
                 chunks = self._db.execute(
@@ -592,14 +766,19 @@ class Store:
 
     # ----------------------------------------------------------- maintenance
     def reap(self) -> dict[str, int]:
-        """Bails expirés et timeouts durs. Appelé périodiquement par le serveur."""
+        """Bails expirés, timeouts durs et détection de stalls. Appelé périodiquement par le serveur.
+
+        Politique sûre : la détection de stall ÉMET un événement (notify) ; elle ne
+        relance ni n'annule jamais seule. Un `lost` garde 'issue inconnue' avec les
+        couches broker/runner/process pour diagnostiquer la cause observable."""
         now = self.clock()
-        stats = {"requeued": 0, "lost": 0, "timeout_cancel": 0, "failed": 0}
+        stats = {"requeued": 0, "lost": 0, "timeout_cancel": 0, "failed": 0, "stalled": 0, "suspected_stall": 0}
         with self._tx() as db:
             for row in db.execute(
                 "SELECT id, state, attempt, cancel_requested FROM jobs WHERE state IN ('claimed','starting','running') AND lease_expires < ?",
                 (now,),
             ).fetchall():
+                self._emit(db, row["id"], P.EV_LEASE_EXPIRED, f"bail expiré en état {row['state']}")
                 if row["state"] == P.CLAIMED:
                     if row["cancel_requested"]:
                         self._set_terminal(db, row["id"], P.CLAIMED, P.CANCELLED, "reaper", error="annulé, bail expiré avant lancement")
@@ -608,6 +787,7 @@ class Store:
                         stats["failed"] += 1
                     else:
                         self._requeue(db, row["id"], "lease_expired")
+                        self._emit(db, row["id"], P.EV_REQUEUED, "bail expiré avant lancement : remis en file")
                         stats["requeued"] += 1
                 else:
                     self._set_terminal(
@@ -615,11 +795,30 @@ class Store:
                         error="bail expiré (runner muet) après lancement : issue inconnue, non relancé",
                     )
                     stats["lost"] += 1
+            # Stalls : processus vivant (télémétrie) + silence d'activité/output.
+            # Edge-triggered via stall_suspect_at/stall_at (réarmés à la prochaine activité).
+            for row in db.execute(
+                """SELECT id, state, proc_alive, last_event_at, started_at, created_at,
+                          stall_suspect_at, stall_at, lease_expires
+                   FROM jobs WHERE state IN ('starting','running') AND lease_expires >= ? AND proc_alive = 1""",
+                (now,),
+            ).fetchall():
+                last_sig = row["last_event_at"] or row["started_at"] or row["created_at"] or now
+                silence = now - last_sig
+                if silence >= P.STALL_S and not row["stall_at"]:
+                    db.execute("UPDATE jobs SET stall_at=? WHERE id=?", (now, row["id"]))
+                    self._emit(db, row["id"], P.EV_STALLED, f"aucune activité/output depuis {int(silence)} s (processus vivant)")
+                    stats["stalled"] += 1
+                elif silence >= P.STALL_SUSPECT_S and not row["stall_suspect_at"]:
+                    db.execute("UPDATE jobs SET stall_suspect_at=? WHERE id=?", (now, row["id"]))
+                    self._emit(db, row["id"], P.EV_SUSPECTED_STALL, f"aucune activité/output depuis {int(silence)} s (processus vivant)")
+                    stats["suspected_stall"] += 1
             for row in db.execute(
                 "SELECT id FROM jobs WHERE state='running' AND cancel_requested=0 AND started_at + timeout_s + 120 < ?",
                 (now,),
             ).fetchall():
                 db.execute("UPDATE jobs SET cancel_requested=1, updated_at=? WHERE id=?", (now, row["id"]))
+                self._emit(db, row["id"], P.EV_TIMEOUT_MARKED, "timeout dur dépassé : annulation demandée")
                 stats["timeout_cancel"] += 1
         return stats
 
@@ -640,9 +839,168 @@ class Store:
             for job_id in old:
                 db.execute("DELETE FROM events WHERE job_id=?", (job_id,))
                 db.execute("DELETE FROM transitions WHERE job_id=?", (job_id,))
+                db.execute("DELETE FROM job_events WHERE job_id=?", (job_id,))
                 db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
             db.execute("DELETE FROM events WHERE received_at < ?", (now - retention.output_s,))
+            db.execute("DELETE FROM job_events WHERE at < ?", (now - retention.output_s,))
+            db.execute(
+                "DELETE FROM mission_attempts WHERE mission_id IN (SELECT id FROM missions WHERE state IN ('validated','failed') AND updated_at < ?)",
+                (now - retention.meta_s,),
+            )
+            db.execute(
+                "DELETE FROM missions WHERE state IN ('validated','failed') AND updated_at < ?",
+                (now - retention.meta_s,),
+            )
         return {"prompts": p, "output_chunks": o, "jobs": len(old)}
+
+    # -------------------------------------------------------------- missions
+    def create_mission(
+        self,
+        objective: str,
+        acceptance_criteria: list[str],
+        max_attempts: int = 2,
+        runner_id: str = "",
+        runtime: str = "",
+        workspace_id: str = "",
+        mode: str = "read_only",
+        timeout_s: int | None = None,
+        prompt: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Crée une mission + sa première tentative (un job). `completed` (exit 0)
+        ne valide JAMAIS la mission : le job terminal exit 0 passe la mission en
+        `needs_validation`, tout autre terminal en `incomplete`. Aucun retry auto."""
+        if not isinstance(objective, str) or not objective.strip() or len(objective) > P.MAX_OBJECTIVE_CHARS:
+            raise BrokerError("invalid_objective", f"objectif requis (1..{P.MAX_OBJECTIVE_CHARS} car.)")
+        if (
+            not isinstance(acceptance_criteria, list)
+            or not 1 <= len(acceptance_criteria) <= P.MAX_CRITERIA
+            or any(not isinstance(c, str) or not c.strip() or len(c) > P.MAX_CRITERION_CHARS for c in acceptance_criteria)
+        ):
+            raise BrokerError("invalid_criteria", f"1..{P.MAX_CRITERIA} critères non vides requis")
+        max_attempts = int(max_attempts or 2)
+        if not 1 <= max_attempts <= P.MAX_MISSION_ATTEMPTS:
+            raise BrokerError("invalid_max_attempts", f"max_attempts 1..{P.MAX_MISSION_ATTEMPTS}")
+        first_prompt = prompt if isinstance(prompt, str) and prompt.strip() else objective
+        job, _ = self.create_job(runner_id, runtime, workspace_id, first_prompt, mode, timeout_s, idempotency_key)
+        now = self.clock()
+        mission_id = str(uuid.uuid4())
+        with self._tx() as db:
+            db.execute(
+                """INSERT INTO missions(id, objective, acceptance_json, max_attempts, attempts,
+                     current_job_id, state, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    mission_id, objective, json.dumps(acceptance_criteria, ensure_ascii=False)[:12_000],
+                    max_attempts, 1, job["job_id"], P.MISSION_EXECUTING, now, now,
+                ),
+            )
+            db.execute(
+                "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
+                (mission_id, 1, job["job_id"], now),
+            )
+        return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
+
+    def get_mission(self, mission_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if row is None:
+                return None
+            attempts = self._db.execute(
+                "SELECT attempt_no, job_id FROM mission_attempts WHERE mission_id=? ORDER BY attempt_no",
+                (mission_id,),
+            ).fetchall()
+            job_summary = None
+            if row["current_job_id"]:
+                j = self._db.execute(
+                    "SELECT state, exit_code, result_summary FROM jobs WHERE id=?", (row["current_job_id"],)
+                ).fetchone()
+                if j:
+                    job_summary = {"job_id": row["current_job_id"], "state": j["state"], "exit_code": j["exit_code"]}
+            return {
+                "mission_id": row["id"],
+                "objective": row["objective"],
+                "acceptance_criteria": json.loads(row["acceptance_json"]),
+                "max_attempts": row["max_attempts"],
+                "attempts": row["attempts"],
+                "current_job_id": row["current_job_id"],
+                "current_job": job_summary,
+                "state": row["state"],
+                "validation_state": row["validation_state"],
+                "validation_note": row["validation_note"],
+                "attempt_job_ids": [a["job_id"] for a in attempts],
+                "created_at": _iso(row["created_at"]),
+                "updated_at": _iso(row["updated_at"]),
+            }
+
+    def retry_mission(self, mission_id: str, prompt: str | None = None) -> dict[str, Any]:
+        """Nouvelle tentative de la MÊME mission (nouveau job). Exige : mission en
+        needs_validation/incomplete, tentative précédente terminale, attempts < max.
+        Jamais de relance aveugle : l'appelant MCP décide après examen du journal."""
+        with self._tx() as db:
+            m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if m is None:
+                raise BrokerError("unknown_mission", "mission inconnue")
+            if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE):
+                raise BrokerError("mission_not_retryable", f"mission {m['state']} : retry refusé")
+            if int(m["attempts"]) >= int(m["max_attempts"]):
+                raise BrokerError("max_attempts_reached", "plus de tentatives autorisées")
+            cur = db.execute("SELECT state FROM jobs WHERE id=?", (m["current_job_id"],)).fetchone() if m["current_job_id"] else None
+            if cur is None or cur["state"] not in P.TERMINAL:
+                raise BrokerError("attempt_still_active", "la tentative en cours n'est pas terminée")
+            job_spec = db.execute(
+                "SELECT runner_id, runtime, workspace_id, mode, timeout_s FROM jobs WHERE id=?", (m["current_job_id"],)
+            ).fetchone()
+        job, _ = self.create_job(
+            job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
+            prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
+            job_spec["mode"], job_spec["timeout_s"],
+        )
+        now = self.clock()
+        with self._tx() as db:
+            attempt_no = int(m["attempts"]) + 1
+            db.execute(
+                "UPDATE missions SET attempts=?, current_job_id=?, state=?, validation_state=NULL, updated_at=? WHERE id=?",
+                (attempt_no, job["job_id"], P.MISSION_EXECUTING, now, mission_id),
+            )
+            db.execute(
+                "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
+                (mission_id, attempt_no, job["job_id"], now),
+            )
+        return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
+
+    def validate_mission(self, mission_id: str, verdict: str, note: str | None = None) -> dict[str, Any]:
+        """Validation humaine (ChatGPT) : seule elle fait passer une mission à
+        `validated`. `completed` du processus ≠ mission réussie."""
+        if verdict not in ("validated", "incomplete", "blocked", "failed"):
+            raise BrokerError("invalid_verdict", "verdict : validated | incomplete | blocked | failed")
+        now = self.clock()
+        with self._tx() as db:
+            m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if m is None:
+                raise BrokerError("unknown_mission", "mission inconnue")
+            if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
+                raise BrokerError("mission_not_validatable", f"mission {m['state']} : validation refusée")
+            clean_note = P.clip(redact(note.strip()), 2_000) if isinstance(note, str) and note.strip() else None
+            db.execute(
+                "UPDATE missions SET state=?, validation_state=?, validation_note=?, updated_at=? WHERE id=?",
+                (verdict, verdict, clean_note, now, mission_id),
+            )
+        return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
+
+    def _mission_on_job_terminal(self, db, job_id: str, job_state: str) -> None:
+        """Hook : un job terminal fait progresser sa mission, sans jamais valider.
+        exit 0 -> needs_validation ; sinon -> incomplete. Pas de retry automatique."""
+        m = db.execute(
+            "SELECT id, state FROM missions WHERE current_job_id=? AND state=?", (job_id, P.MISSION_EXECUTING)
+        ).fetchone()
+        if m is None:
+            return
+        nxt = P.MISSION_NEEDS_VALIDATION if job_state == P.COMPLETED else P.MISSION_INCOMPLETE
+        db.execute(
+            "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
+        )
+        log.info("mission_progress mission_id=%s job %s -> %s", m["id"], job_state, nxt)
 
     # -------------------------------------------------------------- internes
     def _requeue(self, db, job_id: str, reason: str) -> None:
@@ -655,19 +1013,32 @@ class Store:
     def _set_terminal(self, db, job_id: str, src: str, dst: str, actor: str, error: str | None = None) -> None:
         now = self.clock()
         cur = db.execute(
-            "UPDATE jobs SET state=?, finished_at=?, updated_at=?, lease_expires=NULL, error=COALESCE(?, error) WHERE id=? AND state=?",
-            (dst, now, now, error, job_id, src),
+            "UPDATE jobs SET state=?, finished_at=?, updated_at=?, last_event_at=?, lease_expires=NULL, error=COALESCE(?, error) WHERE id=? AND state=?",
+            (dst, now, now, now, error, job_id, src),
         )
         if cur.rowcount == 1:
             self._log_transition(db, job_id, src, dst, actor)
+            if src == P.QUEUED:
+                self._emit(db, job_id, P.EV_PROCESS_EXIT, f"from={src} : aucun processus lancé")
+            else:
+                self._emit(db, job_id, P.EV_PROCESS_EXIT, f"from={src} par {actor}")
+            self._mission_on_job_terminal(db, job_id, dst)
 
-    def _job_view(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _job_view(self, row: sqlite3.Row, runner_last_seen: float | None = None) -> dict[str, Any]:
         now = self.clock()
         started, finished = row["started_at"], row["finished_at"]
         duration = None
         if started:
             duration = round((finished or now) - started, 1)
-        return {
+        lease_exp = row["lease_expires"]
+        lease_valid = lease_exp is not None and lease_exp > now and row["state"] in P.ACTIVE
+        hb_age = round(now - runner_last_seen, 1) if runner_last_seen is not None else None
+        runner_online = runner_last_seen is not None and now - runner_last_seen <= P.ONLINE_WINDOW_S
+        alive = row["proc_alive"]
+        alive = None if alive is None else bool(alive)
+        children = row["child_procs"]
+        children = None if children is None else int(children)
+        view = {
             "job_id": row["id"],
             "runner_id": row["runner_id"],
             "runtime": row["runtime"],
@@ -687,7 +1058,180 @@ class Store:
             "output_chars": row["output_chars"],
             "output_truncated": bool(row["output_truncated"]),
             "attempt": row["attempt"],
+            # --- supervision riche : état structuré d'exécution (null = non observé)
+            "runner_last_seen_at": _iso(runner_last_seen),
+            "runner_heartbeat_age_s": hb_age,
+            "process_alive": alive,
+            "pid": row["proc_pid"],
+            "process_started_at": _iso(row["proc_started_at"]),
+            "last_output_at": _iso(row["last_output_at"]),
+            "last_event_at": _iso(row["last_event_at"]),
+            "current_activity": row["last_activity"],
+            "current_tool": row["current_tool"],
+            "current_command_sanitized": None,  # non observable via les adapters : jamais inventé
+            "child_process_count": children,
+            "output_chunks": row["output_chunks"],
+            "execution_health": self._execution_health(row, runner_last_seen, now),
+            "broker_health": {
+                "lease_expires_at": _iso(lease_exp),
+                "lease_valid": bool(lease_valid),
+            },
+            "runner_health": {
+                "status": "online" if runner_online else "offline",
+                "seconds_since_seen": hb_age,
+            },
+            "runtime_process_health": {
+                "alive": alive,
+                "pid": row["proc_pid"],
+                "started_at": _iso(row["proc_started_at"]),
+                "child_process_count": children,
+            },
         }
+        return view
+
+    def _execution_health(self, row: sqlite3.Row, runner_last_seen: float | None, now: float) -> str | None:
+        """Santé d'exécution calculée, jamais inventée : chaque signal manquant
+        dégrade vers une valeur prudente (unknown -> couches à null)."""
+        state = row["state"]
+        if state in P.TERMINAL:
+            return None  # un état terminal se lit via state/exit_code, pas via la santé
+        if runner_last_seen is None or now - runner_last_seen > P.ONLINE_WINDOW_S:
+            return P.RUNNER_DISCONNECTED
+        if state in (P.QUEUED, P.CLAIMED):
+            return P.IDLE  # en attente de prise en charge / lancement
+        alive = row["proc_alive"]
+        if alive is not None and not alive:
+            return P.PROCESS_DEAD
+        last_sig = row["last_event_at"] or row["started_at"] or row["created_at"]
+        silence = now - (last_sig or now)
+        if alive and silence >= P.STALL_S:
+            return P.STALLED
+        if alive and silence >= P.STALL_SUSPECT_S:
+            return P.SUSPECTED_STALL
+        if not row["output_chunks"] and silence < 120:
+            return P.IDLE  # démarrage récent, rien reçu encore
+        if alive:
+            return P.HEALTHY
+        return P.IDLE  # télémétrie absente (vieux runner) mais bail frais : pas de faux signal
+
+    # ------------------------------------------------- journal d'événements
+    def read_events(self, job_id: str, after_seq: int = -1, limit: int = 50) -> dict[str, Any] | None:
+        """Événements structurés ordonnés et paginés (pas de transcript)."""
+        limit = max(1, min(int(limit), 200))
+        after_seq = max(-1, int(after_seq))
+        with self._lock:
+            exists = self._db.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if exists is None:
+                return None
+            rows = self._db.execute(
+                "SELECT seq, at, kind, detail FROM job_events WHERE job_id=? AND seq > ? ORDER BY seq LIMIT ?",
+                (job_id, after_seq, limit),
+            ).fetchall()
+            last = self._db.execute("SELECT COALESCE(MAX(seq), -1) AS m FROM job_events WHERE job_id=?", (job_id,)).fetchone()
+            return {
+                "job_id": job_id,
+                "events": [
+                    {"seq": r["seq"], "at": _iso(r["at"]), "kind": r["kind"], "detail": r["detail"]}
+                    for r in rows
+                ],
+                "next_seq": rows[-1]["seq"] + 1 if rows else after_seq + 1,
+                "last_seq": int(last["m"]),
+            }
+
+    # ------------------------------------------------------- runner inspect
+    def runner_inspect(self, runner_id: str) -> dict[str, Any] | None:
+        """Snapshot compact runner/environnement : versions, capacités, workspaces,
+        état réseau/broker, jobs actifs enrichis, git par workspace si observé.
+        Jamais de secrets, jamais de dump d'environnement."""
+        now = self.clock()
+        with self._lock:
+            r = self._db.execute("SELECT * FROM runners WHERE id=?", (runner_id,)).fetchone()
+            if r is None:
+                return None
+            online = r["last_seen"] is not None and now - float(r["last_seen"]) <= P.ONLINE_WINDOW_S
+            env = [
+                {
+                    "workspace_id": e["workspace_id"],
+                    "branch": e["branch"],
+                    "head": e["head"],
+                    "dirty": bool(e["dirty"]),
+                    "observed_at": _iso(e["at"]),
+                }
+                for e in self._db.execute(
+                    "SELECT * FROM runner_env WHERE runner_id=? ORDER BY workspace_id", (runner_id,)
+                ).fetchall()
+            ]
+            active_ids = self._db.execute(
+                "SELECT id FROM jobs WHERE runner_id=? AND state IN ('claimed','starting','running') ORDER BY created_at",
+                (runner_id,),
+            ).fetchall()
+            active = []
+            for a in active_ids:
+                row = self._db.execute("SELECT * FROM jobs WHERE id=?", (a["id"],)).fetchone()
+                v = self._job_view(row, r["last_seen"])
+                v.pop("output_tail", None)
+                active.append(v)
+            return {
+                "runner_id": r["id"],
+                "status": "online" if online else "offline",
+                "last_seen": _iso(r["last_seen"]),
+                "seconds_since_seen": None if r["last_seen"] is None else round(now - r["last_seen"], 1),
+                "runner_version": r["version"],
+                "max_parallel": r["max_parallel"],
+                "runtimes": json.loads(r["runtimes_json"]),
+                "workspaces": json.loads(r["workspaces_json"]),
+                "workspace_git": env,
+                "active_jobs": active,
+            }
+
+    # ------------------------------------------------------------- attente
+    def wait_for_change(self, job_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any] | None:
+        """Long-poll borné : se réveille sur changement significatif (état, sortie,
+        événement) ou à expiration du timeout. Réveil par polling 0,2 s, jamais plus
+        de WAIT_MAX_S. N'est PAS un fond de tâche : le réveil exige un tour actif."""
+        timeout_s = max(0.0, min(float(timeout_s), P.WAIT_MAX_S))
+        since_seq = max(-1, int(since_seq))
+        import time as _t
+
+        deadline = _t.monotonic() + timeout_s
+        with self._lock:
+            row = self._db.execute("SELECT updated_at, state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            baseline_updated, baseline_state = float(row["updated_at"]), row["state"]
+            base_seq = self._event_seq(self._db, job_id)
+        woke_by = "timeout"
+        while _t.monotonic() < deadline:
+            _t.sleep(0.2)
+            with self._lock:
+                row = self._db.execute("SELECT updated_at, state FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row is None:
+                    return None
+                seq = self._event_seq(self._db, job_id)
+                if row["state"] in P.TERMINAL and row["state"] != baseline_state:
+                    woke_by = "terminal"
+                    break
+                if float(row["updated_at"]) != baseline_updated or seq != base_seq:
+                    woke_by = "change" if row["state"] == baseline_state else "state"
+                    break
+                if seq > since_seq > base_seq:
+                    woke_by = "event"
+                    break
+        view = self.get_job(job_id, tail_chars=0)
+        if view is None:
+            return None
+        return {
+            "job_id": job_id,
+            "state": view["state"],
+            "woke_by": woke_by,
+            "execution_health": view["execution_health"],
+            "last_event_seq": self._last_seq(job_id),
+        }
+
+    def _last_seq(self, job_id: str) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT COALESCE(MAX(seq), -1) AS m FROM job_events WHERE job_id=?", (job_id,)).fetchone()
+            return int(row["m"])
 
 
 def _iso(ts: float | None) -> str | None:

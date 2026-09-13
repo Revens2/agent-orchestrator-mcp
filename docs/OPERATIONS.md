@@ -96,6 +96,34 @@ curl -s http://10.200.114.203:8803/health     # depuis le PC (NetBird)
 %USERPROFILE%\.orch-runner\venv\Scripts\python.exe -m orch_runner status   # statut runner local
 ```
 
+## Supervision d'une mission longue (depuis ChatGPT)
+
+Flux recommandé : `agent_runner_list` → `agent_runner_inspect(runner_id)` →
+`agent_mission_create(objective, acceptance_criteria, …)` → boucle
+`agent_job_wait(job_id, timeout_s=25)` + `agent_job_get` (champ `execution_health`,
+couches `broker_health`/`runner_health`/`runtime_process_health`) →
+`agent_job_events(job_id, after_seq)` pour le journal → à la fin du job :
+`agent_mission_validate(mission_id, verdict)`.
+
+- `completed` (exit 0) ≠ mission réussie : le job passe la mission en `needs_validation`,
+  tout autre terminal (`failed`, `timeout`, `cancelled`, `lost`) en `incomplete`.
+- `agent_mission_retry` crée une NOUVELLE tentative (nouveau job) de la même mission,
+  dans la limite `max_attempts`, sur décision explicite après examen du journal.
+  Le serveur ne relance jamais seul, surtout pas une mission `workspace_write`.
+- `lost` = issue inconnue : `agent_job_get` + `agent_job_events` (`lease_expired`,
+  `runner_disconnect`) montrent la cause observable (runner offline ? processus mort ?).
+  Vérifier l'état réel du workspace avant tout retry.
+- Stalls : événement `suspected_stall` (silence ≥ 10 min, processus vivant) puis
+  `stalled` (≥ 30 min). Notification seule : décider humainement (notify/cancel/resume
+  via `agent_job_cancel` ou `agent_mission_retry`). Pas de télémétrie (vieux runner) =
+  pas de faux signal (`execution_health` reste `idle`/`healthy`, champs à null).
+- `agent_job_wait` évite le polling agressif pendant un tour actif (≤ 60 s). Quand le
+  tour ChatGPT est fini, reprendre plus tard avec `agent_job_get` + `after_seq`.
+- `agent_runner_inspect` : versions/capacités des runtimes, workspaces allowlistés,
+  git par workspace (`branch`/`head`/`dirty`, null si non observé), jobs actifs enrichis.
+  Jamais de secrets, jamais de dump d'environnement (`current_command_sanitized`
+  est toujours null : les adapters n'exposent pas les commandes, par design).
+
 ## Logs
 
 - VPS : `journalctl -u orch-mcp -u orch-gateway` (transitions `job_transition job_id=…`, `runner_connected`,
@@ -114,8 +142,12 @@ L'arbre de processus est tué via le Job Object ; état final `cancelled`.
 - VPS : recopier `src/` (et `deploy/` si changé) dans `/srv/orch`, `sudo bash /srv/orch/deploy/install.sh`
   (idempotent), `sudo systemctl restart orch-mcp orch-gateway`. Les jobs `running` survivent au
   redémarrage du broker (bail 60 s, retries runner).
+- La migration DB est automatique et backward-compatible (`ALTER TABLE … ADD COLUMN` idempotent,
+  nouvelles tables `IF NOT EXISTS`, NULL = non observé). Un ancien `src/` redéployé sur une DB
+  migrée continue de fonctionner (colonnes ignorées) : c'est le chemin de rollback.
 - PC : `deploy\windows\install-runner.ps1` (arrête le runner, recopie, relance). Un job en cours sur le PC
   pendant la mise à jour finit `lost` : mettre à jour hors activité (`agent_job_list state=running`).
+  Un vieux runner (sans télémétrie) reste compatible : champs à null, pas de stall détecté.
 
 ## Rollback
 

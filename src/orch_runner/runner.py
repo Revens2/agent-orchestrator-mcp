@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -28,8 +29,39 @@ from orch_runner import winproc
 from orch_runner.adapters import ADAPTERS, Adapter
 from orch_runner.policy import Config, PolicyError, child_env, load_token, resolve_workspace
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 log = logging.getLogger("orch.runner")
+
+
+def _git_snapshot(path: str) -> dict[str, Any] | None:
+    """Snapshot git borné d'un workspace (branch/HEAD/dirty), ou None si non
+    observable (pas un dépôt, git absent, timeout). Jamais de secret : les trois
+    champs seuls, sorties bornées, échec silencieux -> None."""
+    import os as _os
+
+    def _run(args: list[str]) -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", *args], cwd=path, capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000 if _os.name == "nt" else 0,
+                encoding="utf-8", errors="replace",
+            )
+        except Exception:  # noqa: BLE001 - snapshot best-effort : échec silencieux -> None
+            return None
+        if out.returncode != 0:
+            return None
+        return (out.stdout or "").strip()[:4_000]
+
+    branch = _run(["branch", "--show-current"])
+    if branch is None:
+        return None  # pas un dépôt git (ou git indisponible) : on omet le workspace
+    head = _run(["rev-parse", "HEAD"])
+    porcelain = _run(["status", "--porcelain"])
+    return {
+        "branch": (branch or None),
+        "head": (head[:40] if head else None),
+        "dirty": bool(porcelain) if porcelain is not None else None,
+    }
 
 ABORT_CODES = {"stale_fencing", "state_conflict", "unknown_job", "invalid_transition"}
 RESYNC_CODES = {"superseded", "unknown_runner"}
@@ -83,6 +115,8 @@ class JobWorker(threading.Thread):
         self._out_lock = threading.Lock()
         self._out: list[str] = []
         self._activity: str | None = None
+        self._tool: str | None = None  # outil courant observé ("tool: X" des adapters), sinon None
+        self.proc_started_at: float | None = None  # time.time() à la création du processus
         self._sent_chars = 0
         self._stderr_tail = ""
         self.session_id: str | None = None
@@ -159,6 +193,8 @@ class JobWorker(threading.Thread):
                     self._sent_chars += len(text)
                 if activity:
                     self._activity = activity
+                    if activity.startswith("tool:"):
+                        self._tool = redact(activity[5:].strip())[:120] or None
 
     # --------------------------------------------------------------- lifecycle
     def run(self) -> None:
@@ -211,6 +247,7 @@ class JobWorker(threading.Thread):
         try:
             launch = adapter.build(prompt, job["mode"], cwd, tmpdir)
             self.proc = winproc.JobProcess(launch.argv, cwd, child_env(self.job_id, launch.env_extra))
+            self.proc_started_at = time.time()
         except (winproc.LaunchError, ValueError, OSError) as exc:
             shutil.rmtree(tmpdir, ignore_errors=True)
             return self._transition(P.FAILED, error=f"launch_failed: {exc}") and None
@@ -304,18 +341,48 @@ class Runner:
             if rt.enabled and rt_id in ADAPTERS:
                 runtimes.append(ADAPTERS[rt_id](rt.exe, rt.extra, self.config.permission_policy).probe())
         workspaces = []
+        env: dict[str, Any] = {}
         for ws in self.config.workspaces.values():
             try:
-                resolve_workspace(ws)
+                path = resolve_workspace(ws)
             except PolicyError as exc:
                 log.warning("workspace_invalid id=%s code=%s", ws.id, exc.code)
                 continue
             workspaces.append({"id": ws.id, "modes": ws.modes, "description": ws.description})
-        return {"version": VERSION, "max_parallel": self.config.max_parallel, "runtimes": runtimes, "workspaces": workspaces}
+            snap = _git_snapshot(path)
+            if snap is not None:
+                env[ws.id] = snap
+        return {"version": VERSION, "max_parallel": self.config.max_parallel, "runtimes": runtimes, "workspaces": workspaces, "env": env}
 
     def held(self) -> list[dict[str, Any]]:
+        """Jobs réellement détenus + télémétrie d'exécution (pid, vivant, enfants,
+        outil courant). Champs absents = non observés ; le broker les stocke NULL."""
         with self.lock:
-            return [{"job_id": w.job_id, "fencing": w.fencing} for w in self.workers.values() if not w.done.is_set()]
+            out = []
+            for w in self.workers.values():
+                if w.done.is_set():
+                    continue
+                entry: dict[str, Any] = {"job_id": w.job_id, "fencing": w.fencing}
+                if w.proc is not None:
+                    try:
+                        alive = w.proc.proc.poll() is None
+                    except Exception:  # noqa: BLE001 - télémétrie best-effort : inconnu plutôt qu'inventé
+                        alive = None
+                    try:
+                        children = w.proc.active_processes()
+                    except Exception:  # noqa: BLE001 - télémétrie best-effort : inconnu plutôt qu'inventé
+                        children = None
+                    entry.update(
+                        {
+                            "pid": w.proc.pid,
+                            "proc_alive": alive,
+                            "proc_started_at": w.proc_started_at,
+                            "child_procs": children,
+                            "tool": w._tool,
+                        }
+                    )
+                out.append(entry)
+            return out
 
     def hello(self) -> None:
         if self._info_cache is None:

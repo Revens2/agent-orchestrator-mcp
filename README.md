@@ -10,7 +10,7 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
                                                                             ▼
                          orch-gateway  127.0.0.1:8801   OAuth + politique outil par outil
                                                                             ▼
-                         orch-mcp      127.0.0.1:8802   MCP (7 outils) + broker SQLite (autorité)
+                         orch-mcp      127.0.0.1:8802   MCP (14 outils) + broker SQLite (autorité)
                                                                             ▲
                          nginx 10.200.114.203:8803      /runner/v1/* — IP NetBird uniquement
                                                                             │ long-poll SORTANT
@@ -43,12 +43,30 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 | `agent_runner_list` | lecture | runners, présence réelle (heartbeat < 30 s), runtimes, jobs actifs |
 | `agent_workspace_list` | lecture | workspaces autorisés (ids + modes), jamais de chemin |
 | `agent_job_start` | écriture | crée un job `queued`, retour immédiat ; `idempotency_key` optionnelle |
-| `agent_job_get` | lecture | vue compacte + `output_tail` borné |
+| `agent_job_get` | lecture | état structuré d'exécution + `output_tail` borné : heartbeat runner, processus (pid, vivant, enfants), progression, `execution_health`, couches `broker/runner/process` |
 | `agent_job_output` | lecture | sortie paginée (`cursor`, `limit` ≤ 20 000) |
+| `agent_job_events` | lecture | journal structuré borné et paginé (`after_seq`, `limit` ≤ 200), pas de transcript |
+| `agent_runner_inspect` | lecture | snapshot runner : versions, capacités, workspaces, git (branch/HEAD/dirty), jobs actifs |
+| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) sur changement significatif ; pas un fond de tâche |
 | `agent_job_cancel` | écriture | `cancelled` / `cancel_requested` / `already_finished` / `unknown_job` |
 | `agent_job_list` | lecture | liste filtrable |
+| `agent_mission_create` | écriture | mission (objectif + critères) + 1re tentative ; jamais de retry auto |
+| `agent_mission_get` | lecture | objectif, critères, tentatives, job courant, validation |
+| `agent_mission_retry` | écriture | nouvelle tentative explicite de la même mission (≤ `max_attempts`) |
+| `agent_mission_validate` | écriture | `validated` \| `incomplete` \| `blocked` \| `failed` (seule preuve de succès) |
 
 États : `queued → claimed → starting → running → completed | failed | timeout | cancelled | lost`.
+
+> **Sémantique** : `completed` = processus terminé avec exit 0, **PAS mission validée**.
+> Un job `completed` passe sa mission en `needs_validation` ; seul `agent_mission_validate`
+> (humain/ChatGPT après examen) fait passer à `validated`. Un `lost` garde « issue inconnue » :
+> `agent_job_get` expose alors les couches `broker_health` / `runner_health` /
+> `runtime_process_health` pour diagnostiquer la cause observable, et `agent_job_events`
+> le journal (`lease_expired`, `runner_disconnect`, …).
+>
+> **Stalls** : processus vivant + silence d'activité/output ≥ 10 min → événement
+> `suspected_stall`, ≥ 30 min → `stalled`. Notification seule : jamais de relance ni
+> d'annulation automatique (surtout pas pour une mission d'écriture).
 
 ## Arborescence
 

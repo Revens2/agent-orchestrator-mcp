@@ -6,7 +6,7 @@ explicitement ci-dessous. Tout outil absent de cette classification est INCONNU 
 jamais annonce dans `tools/list`, jamais executable (fail-closed) tant qu'un
 mainteneur ne l'a pas classe et deploye.
 
-Outils de l'upstream orch-mcp (agent orchestrator, 7 outils). Lancer/annuler un agent = ecriture.
+Outils de l'upstream orch-mcp (agent orchestrator, 14 outils). Lancer/annuler un agent = ecriture.
 """
 
 from __future__ import annotations
@@ -21,6 +21,10 @@ OUTILS_LECTURE: frozenset[str] = frozenset(
         "agent_job_get",
         "agent_job_list",
         "agent_job_output",
+        "agent_job_events",
+        "agent_runner_inspect",
+        "agent_job_wait",
+        "agent_mission_get",
         "agent_runner_list",
         "agent_workspace_list",
     }
@@ -31,6 +35,9 @@ OUTILS_ECRITURE: frozenset[str] = frozenset(
     {
         "agent_job_cancel",
         "agent_job_start",
+        "agent_mission_create",
+        "agent_mission_retry",
+        "agent_mission_validate",
     }
 )
 

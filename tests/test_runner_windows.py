@@ -158,7 +158,9 @@ class Broker:
 
     def stop(self):
         self.server.should_exit = True
-        self.thread.join(timeout=15)
+        # Un long-poll claim (25 s) peut être en vol : attendre sa fin avant de
+        # fermer la DB, sinon ProgrammingError en tâche de fond (race teardown).
+        self.thread.join(timeout=35)
         self.store.close()
 
 
