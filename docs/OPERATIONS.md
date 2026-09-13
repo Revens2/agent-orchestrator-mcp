@@ -124,6 +124,33 @@ couches `broker_health`/`runner_health`/`runtime_process_health`) →
   Jamais de secrets, jamais de dump d'environnement (`current_command_sanitized`
   est toujours null : les adapters n'exposent pas les commandes, par design).
 
+## Alertes infra unifiées ([ETUDE]/[NEXUS])
+
+Persistance normalisée des alertes sortantes dans le broker (`infra_alerts`),
+l'historique Telegram n'étant jamais la source de vérité. Écriture réservée
+aux ingesteurs locaux du VPS (jamais via MCP) ; lecture ChatGPT via
+`infra_alert_list` / `infra_alert_get` (read-only, bornés, redactés).
+
+```bash
+# Enregistrer (compte orch-app, loopback) : dedup par empreinte (fenêtre 1 h,
+# occurrences+1 + escalade de sévérité au lieu d'une nouvelle ligne)
+sudo -u orch-app env PYTHONPATH=/srv/orch/src /srv/orch/venv/bin/python \
+  -m orch_mcp.alert_cli --db /srv/orch/data/orch.db \
+  record --source etude --service orch-mcp --severity critical \
+  --title "broker hors ligne" --detail "exit 1 ..." [--fingerprint ...]
+# Lister / détail / acquitter / résoudre :
+.../alert_cli list --source etude --state active --limit 20
+.../alert_cli get --id <alert_id>
+.../alert_cli ack --id <alert_id> ; .../alert_cli resolve --id <alert_id>
+```
+
+Format Telegram canonique (même vue que le MCP) :
+`[ETUDE] [critical] <titre>` + timestamp UTC + détail borné.
+`alert_cli record --telegram-format` affiche le message à envoyer via
+`/usr/local/bin/send_telegram.sh` (Étude). Rétention 90 j (purge horaire),
+plafond 5 000 lignes. Rollback : table additive ignorée par l'ancien `src/`
+(sauvegarde `/root/orch-src-bak-*` avant chaque déploiement).
+
 ## Logs
 
 - VPS : `journalctl -u orch-mcp -u orch-gateway` (transitions `job_transition job_id=…`, `runner_connected`,
