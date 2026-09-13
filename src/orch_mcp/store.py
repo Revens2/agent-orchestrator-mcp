@@ -136,6 +136,25 @@ CREATE TABLE IF NOT EXISTS mission_attempts (
   at REAL NOT NULL,
   PRIMARY KEY (mission_id, attempt_no)
 );
+-- Alertes infra (observabilité Telegram unifiée). Écriture réservée aux
+-- ingesteurs locaux ; lecture via infra_alert_list/get (MCP read-only).
+-- SCHEMA est rejoué à chaque init (IF NOT EXISTS) : les bases existantes
+-- gagnent la table sans migration ; rollback = redéployer l'ancien src.
+CREATE TABLE IF NOT EXISTS infra_alerts (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  service TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'active',
+  title TEXT NOT NULL,
+  detail TEXT,
+  fingerprint TEXT NOT NULL,
+  occurrences INTEGER NOT NULL DEFAULT 1,
+  first_at REAL NOT NULL,
+  last_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS infra_alerts_src ON infra_alerts(source, state, last_at);
+CREATE INDEX IF NOT EXISTS infra_alerts_fp ON infra_alerts(fingerprint, last_at);
 """
 
 MAX_CLAIM_ATTEMPTS = 3
@@ -851,7 +870,10 @@ class Store:
                 "DELETE FROM missions WHERE state IN ('validated','failed') AND updated_at < ?",
                 (now - retention.meta_s,),
             )
-        return {"prompts": p, "output_chunks": o, "jobs": len(old)}
+            a = db.execute(
+                "DELETE FROM infra_alerts WHERE last_at < ?", (now - P.ALERT_RETENTION_S,)
+            ).rowcount
+        return {"prompts": p, "output_chunks": o, "jobs": len(old), "alerts": a}
 
     # -------------------------------------------------------------- missions
     def create_mission(
@@ -1001,6 +1023,149 @@ class Store:
             "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
         )
         log.info("mission_progress mission_id=%s job %s -> %s", m["id"], job_state, nxt)
+
+    # ------------------------------------------------------- alertes infra
+    @staticmethod
+    def _alert_fingerprint(source: str, service: str, title: str) -> str:
+        h = hashlib.sha256()
+        h.update(source.encode() + b"\x00" + service.encode() + b"\x00" + title.encode())
+        return h.hexdigest()
+
+    def record_alert(
+        self,
+        source: str,
+        service: str,
+        severity: str,
+        title: str,
+        detail: str | None = None,
+        fingerprint: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persiste une alerte sortante (ingesteurs locaux du VPS uniquement).
+
+        Déduplication anti-spam : même empreinte revue dans
+        ALERT_DEDUP_WINDOW_S et non résolue => `occurrences` + 1 (avec
+        escalade de sévérité et détail rafraîchi), pas de nouvelle ligne.
+        Retourne (alerte, created)."""
+        if source not in P.ALERT_SOURCES:
+            raise BrokerError("invalid_source", f"source : {' | '.join(P.ALERT_SOURCES)}")
+        if not isinstance(service, str) or not service.strip() or len(service) > P.MAX_ALERT_SERVICE_CHARS:
+            raise BrokerError("invalid_service", f"service requis (1..{P.MAX_ALERT_SERVICE_CHARS} car.)")
+        if severity not in P.ALERT_SEVERITIES:
+            raise BrokerError("invalid_severity", f"sévérité : {' | '.join(P.ALERT_SEVERITIES)}")
+        if not isinstance(title, str) or not title.strip() or len(title) > P.MAX_ALERT_TITLE_CHARS:
+            raise BrokerError("invalid_title", f"titre requis (1..{P.MAX_ALERT_TITLE_CHARS} car.)")
+        service = service.strip()
+        title = title.strip()
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str) or not fingerprint.strip() or len(fingerprint) > 128
+        ):
+            raise BrokerError("invalid_fingerprint", "empreinte 1..128 car.")
+        fp = fingerprint.strip() if isinstance(fingerprint, str) and fingerprint.strip() else self._alert_fingerprint(source, service, title)
+        clean_detail = P.clip(redact(detail), P.MAX_ALERT_DETAIL_CHARS) if detail else None
+        now = self.clock()
+        with self._tx() as db:
+            row = db.execute(
+                "SELECT * FROM infra_alerts WHERE fingerprint=? ORDER BY last_at DESC LIMIT 1", (fp,)
+            ).fetchone()
+            if (
+                row is not None
+                and row["state"] != P.ALERT_RESOLVED
+                and float(row["last_at"]) >= now - P.ALERT_DEDUP_WINDOW_S
+            ):
+                sev = row["severity"]
+                if P.ALERT_SEVERITIES.index(severity) > P.ALERT_SEVERITIES.index(sev):
+                    sev = severity
+                db.execute(
+                    "UPDATE infra_alerts SET occurrences=occurrences+1, last_at=?, severity=?, detail=? WHERE id=?",
+                    (now, sev, clean_detail if clean_detail is not None else row["detail"], row["id"]),
+                )
+                log.info("alert_dedup alert_id=%s fp=%s occurrences=%d", row["id"], fp[:12], int(row["occurrences"]) + 1)
+                alert_id, created = row["id"], False
+            else:
+                alert_id, created = str(uuid.uuid4()), True
+                db.execute(
+                    """INSERT INTO infra_alerts(id, source, service, severity, state, title, detail,
+                         fingerprint, occurrences, first_at, last_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (alert_id, source, service, severity, P.ALERT_ACTIVE, title, clean_detail,
+                     fp, 1, now, now),
+                )
+                log.info("alert_recorded alert_id=%s source=%s severity=%s service=%s", alert_id, source, severity, service)
+            db.execute(
+                "DELETE FROM infra_alerts WHERE id NOT IN "
+                "(SELECT id FROM infra_alerts ORDER BY last_at DESC LIMIT ?)",
+                (P.MAX_ALERTS,),
+            )
+        return self.get_alert(alert_id) or {"error": "internal", "alert_id": alert_id}, created
+
+    @staticmethod
+    def _alert_compact(row) -> dict[str, Any]:
+        return {
+            "alert_id": row["id"],
+            "source": row["source"],
+            "service": row["service"],
+            "severity": row["severity"],
+            "state": row["state"],
+            "title": row["title"],
+            "fingerprint": row["fingerprint"],
+            "occurrences": row["occurrences"],
+            "first_at": _iso(row["first_at"]),
+            "last_at": _iso(row["last_at"]),
+        }
+
+    def list_alerts(
+        self,
+        source: str | None = None,
+        severity: str | None = None,
+        state: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Vue compacte filtrable (jamais le détail complet : voir get_alert)."""
+        if source is not None and source not in P.ALERT_SOURCES:
+            raise BrokerError("invalid_source", f"source : {' | '.join(P.ALERT_SOURCES)}")
+        if severity is not None and severity not in P.ALERT_SEVERITIES:
+            raise BrokerError("invalid_severity", f"sévérité : {' | '.join(P.ALERT_SEVERITIES)}")
+        if state is not None and state not in P.ALERT_STATES:
+            raise BrokerError("invalid_state", f"état : {' | '.join(P.ALERT_STATES)}")
+        limit = max(1, min(int(limit or 20), P.MAX_ALERT_LIST))
+        # SQL statique (pas de concaténation : exigence semgrep) ; chaque filtre
+        # optionnel est neutralisé par son doublon NULL.
+        query = (
+            "SELECT * FROM infra_alerts "
+            "WHERE (? IS NULL OR source=?) AND (? IS NULL OR severity=?) AND (? IS NULL OR state=?) "
+            "AND (? IS NULL OR last_at>=?) AND (? IS NULL OR last_at<=?) "
+            "ORDER BY last_at DESC LIMIT ?"
+        )
+        params: list[Any] = [source, source, severity, severity, state, state, since, since, until, until, limit]
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+            alerts = [self._alert_compact(r) for r in rows]
+        return {"alerts": alerts, "count": len(alerts)}
+
+    def get_alert(self, alert_id: str) -> dict[str, Any] | None:
+        """Alerte complète, détail borné (redacted). None si inconnue."""
+        with self._lock:
+            row = self._db.execute("SELECT * FROM infra_alerts WHERE id=?", (alert_id,)).fetchone()
+            if row is None:
+                return None
+            out = self._alert_compact(row)
+            out["detail"] = row["detail"]
+            return out
+
+    def set_alert_state(self, alert_id: str, state: str) -> dict[str, Any]:
+        """Acquittement/résolution (CLI locale d'exploitation, pas le MCP)."""
+        if state not in (P.ALERT_ACKED, P.ALERT_RESOLVED):
+            raise BrokerError("invalid_state", "état : acked | resolved")
+        now = self.clock()
+        with self._tx() as db:
+            row = db.execute("SELECT id FROM infra_alerts WHERE id=?", (alert_id,)).fetchone()
+            if row is None:
+                raise BrokerError("unknown_alert", "alerte inconnue")
+            db.execute("UPDATE infra_alerts SET state=?, last_at=? WHERE id=?", (state, now, alert_id))
+            log.info("alert_state alert_id=%s state=%s", alert_id, state)
+        return self.get_alert(alert_id) or {"error": "internal", "alert_id": alert_id}
 
     # -------------------------------------------------------------- internes
     def _requeue(self, db, job_id: str, reason: str) -> None:

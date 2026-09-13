@@ -137,6 +137,27 @@ MAX_CRITERION_CHARS = 500
 WAIT_DEFAULT_S = 25
 WAIT_MAX_S = 60
 
+# --- alertes infra (observabilité Telegram unifiée : [ETUDE]/[NEXUS]) --------
+# Persistance normalisée des alertes sortantes (jamais l'historique Telegram
+# comme source de vérité). Écriture réservée aux ingesteurs locaux du VPS
+# (CLI loopback) ; le MCP n'expose que la lecture (infra_alert_list/get).
+ALERT_ETUDE = "etude"
+ALERT_NEXUS = "nexus"
+ALERT_SOURCES = (ALERT_ETUDE, ALERT_NEXUS)
+ALERT_INFO, ALERT_WARNING, ALERT_CRITICAL = "info", "warning", "critical"
+ALERT_SEVERITIES = (ALERT_INFO, ALERT_WARNING, ALERT_CRITICAL)
+ALERT_ACTIVE, ALERT_ACKED, ALERT_RESOLVED = "active", "acked", "resolved"
+ALERT_STATES = (ALERT_ACTIVE, ALERT_ACKED, ALERT_RESOLVED)
+MAX_ALERT_TITLE_CHARS = 500
+MAX_ALERT_DETAIL_CHARS = 4_000
+MAX_ALERT_SERVICE_CHARS = 128
+# Même empreinte revue dans la fenêtre => occurrences+1, pas de nouvelle ligne
+# (anti-spam : une erreur répétée ne crée pas d'alerte, cf. dedup Telegram).
+ALERT_DEDUP_WINDOW_S = 3_600
+MAX_ALERTS = 5_000
+ALERT_RETENTION_S = 90 * 86_400
+MAX_ALERT_LIST = 100
+
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 

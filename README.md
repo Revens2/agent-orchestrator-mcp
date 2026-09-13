@@ -10,7 +10,7 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
                                                                             ▼
                          orch-gateway  127.0.0.1:8801   OAuth + politique outil par outil
                                                                             ▼
-                         orch-mcp      127.0.0.1:8802   MCP (14 outils) + broker SQLite (autorité)
+                         orch-mcp      127.0.0.1:8802   MCP (16 outils) + broker SQLite (autorité)
                                                                             ▲
                          nginx 10.200.114.203:8803      /runner/v1/* — IP NetBird uniquement
                                                                             │ long-poll SORTANT
@@ -54,6 +54,8 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 | `agent_mission_get` | lecture | objectif, critères, tentatives, job courant, validation |
 | `agent_mission_retry` | écriture | nouvelle tentative explicite de la même mission (≤ `max_attempts`) |
 | `agent_mission_validate` | écriture | `validated` \| `incomplete` \| `blocked` \| `failed` (seule preuve de succès) |
+| `infra_alert_list` | lecture | alertes infra [ETUDE]/[NEXUS] filtrables (source, sévérité, état, période), vue compacte |
+| `infra_alert_get` | lecture | détail borné d'une alerte (erreur, contexte, empreinte, occurrences) |
 
 États : `queued → claimed → starting → running → completed | failed | timeout | cancelled | lost`.
 
