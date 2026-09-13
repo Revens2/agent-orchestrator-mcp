@@ -151,6 +151,14 @@ Format Telegram canonique (même vue que le MCP) :
 plafond 5 000 lignes. Rollback : table additive ignorée par l'ancien `src/`
 (sauvegarde `/root/orch-src-bak-*` avant chaque déploiement).
 
+## Titres de conversations
+
+`display_title` stable (fonction pure du premier objectif, jamais renommé) :
+`agent_job_get` / `agent_job_list` / `agent_mission_get` l'exposent (calculé à
+la lecture, aucune migration, identités ConvIA intactes). Seul OpenCode pose un
+titre natif (`opencode run --title`, via le runner). Claude/Codex/AGY n'offrent
+aucun mécanisme headless : fallback `display_title` broker uniquement.
+
 ## Session OpenCode corrompue (reprise)
 
 Ne jamais réutiliser une session reconnue corrompue. Chaîne :
