@@ -151,6 +151,18 @@ Format Telegram canonique (même vue que le MCP) :
 plafond 5 000 lignes. Rollback : table additive ignorée par l'ancien `src/`
 (sauvegarde `/root/orch-src-bak-*` avant chaque déploiement).
 
+## Session OpenCode corrompue (reprise)
+
+Ne jamais réutiliser une session reconnue corrompue. Chaîne :
+`opencode` (adapter : signature exacte via `match_corruption`, jamais le mot
+`error`) → job `failed` (`session_corrupted:<signature>`, handoff minimal en
+`result_summary`) → événement structuré `session_corrupted` → `agent_mission_retry`
+crée une NOUVELLE session (`session_recreated`, handoff : objectif + job
+abandonné + prochaine action, jamais le transcript).
+Anti-boucle : 2 corruptions consécutives sur la même mission ⇒ `retry` refuse
+(`session_corruption_loop`, cause config/plugin/auth à corriger) ; `max_attempts` borne le reste.
+Journal : `agent_job_events` (`session_corrupted`, `session_recreated`).
+
 ## Logs
 
 - VPS : `journalctl -u orch-mcp -u orch-gateway` (transitions `job_transition job_id=…`, `runner_connected`,
