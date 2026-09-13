@@ -136,6 +136,48 @@ CREATE TABLE IF NOT EXISTS mission_attempts (
   at REAL NOT NULL,
   PRIMARY KEY (mission_id, attempt_no)
 );
+-- Alertes infra (observabilité Telegram unifiée). Écriture réservée aux
+-- ingesteurs locaux ; lecture via infra_alert_list/get (MCP read-only).
+-- SCHEMA est rejoué à chaque init (IF NOT EXISTS) : les bases existantes
+-- gagnent la table sans migration ; rollback = redéployer l'ancien src.
+CREATE TABLE IF NOT EXISTS infra_alerts (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  service TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'active',
+  title TEXT NOT NULL,
+  detail TEXT,
+  fingerprint TEXT NOT NULL,
+  occurrences INTEGER NOT NULL DEFAULT 1,
+  first_at REAL NOT NULL,
+  last_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS infra_alerts_src ON infra_alerts(source, state, last_at);
+CREATE INDEX IF NOT EXISTS infra_alerts_fp ON infra_alerts(fingerprint, last_at);
+-- Questions en attente (Photon/iMessage) : état explicite waiting_for_user.
+-- SCHEMA rejoué à chaque init (IF NOT EXISTS) : rollback = ancien src.
+CREATE TABLE IF NOT EXISTS pending_questions (
+  id TEXT PRIMARY KEY,
+  origin TEXT NOT NULL,
+  session_ref TEXT NOT NULL,
+  runtime TEXT NOT NULL,
+  title TEXT NOT NULL,
+  question TEXT NOT NULL,
+  options_json TEXT NOT NULL DEFAULT '[]',
+  fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  notify_after_s INTEGER NOT NULL DEFAULT 300,
+  notified_at REAL,
+  notify_status TEXT NOT NULL DEFAULT 'pending',
+  answer TEXT,
+  answered_at REAL,
+  answer_from TEXT,
+  created_at REAL NOT NULL,
+  expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_questions_due ON pending_questions(status, notified_at, created_at);
+CREATE INDEX IF NOT EXISTS pending_questions_fp ON pending_questions(fingerprint, status);
 """
 
 MAX_CLAIM_ATTEMPTS = 3
@@ -597,8 +639,36 @@ class Store:
                 self._emit(db, job_id, P.EV_PROCESS_RUNNING, "processus agent repris")
             elif terminal:
                 self._emit(db, job_id, P.EV_PROCESS_EXIT, f"from={src} exit={exit_code}")
+                if dst == P.FAILED and isinstance(error, str) and error.startswith(P.SESSION_CORRUPTED_PREFIX):
+                    # Session reconnue corrompue : événement structuré visible,
+                    # session abandonnée (jamais réutilisée : le retry crée un
+                    # nouveau job = nouvelle session + handoff, pas de transcript).
+                    self._emit(db, job_id, P.EV_SESSION_CORRUPTED, error[:500])
                 self._mission_on_job_terminal(db, job_id, dst)
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+
+    def record_runner_question(
+        self,
+        runner_id: str,
+        epoch: int,
+        job_id: str,
+        fencing: int,
+        runtime: str,
+        title: str,
+        question: str,
+        options: list[str] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Question explicite remontée par le runner (convention [[QUESTION]]).
+        Vérifie epoch/fencing comme event() : un runner ne déclare une question
+        que pour SON job actif. session_ref = job_id (routage exact)."""
+        with self._lock:
+            self._runner_epoch_ok(self._db, runner_id, epoch)
+            row = self._db.execute("SELECT runner_id, fencing FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["runner_id"] != runner_id:
+                raise BrokerError("unknown_job", "job inconnu pour ce runner")
+            if int(row["fencing"]) != int(fencing):
+                raise BrokerError("stale_fencing", "fencing token périmé")
+        return self.record_question("agent", job_id, runtime, title, question, options)
 
     def event(
         self,
@@ -728,6 +798,7 @@ class Store:
         return [
             {
                 "job_id": r["id"],
+                "display_title": P.display_title(r["prompt"], fallback=f"job {r['id'][:8]}"),
                 "state": r["state"],
                 "runtime": r["runtime"],
                 "workspace_id": r["workspace_id"],
@@ -851,7 +922,19 @@ class Store:
                 "DELETE FROM missions WHERE state IN ('validated','failed') AND updated_at < ?",
                 (now - retention.meta_s,),
             )
-        return {"prompts": p, "output_chunks": o, "jobs": len(old)}
+            a = db.execute(
+                "DELETE FROM infra_alerts WHERE last_at < ?", (now - P.ALERT_RETENTION_S,)
+            ).rowcount
+            expired = db.execute(
+                "UPDATE pending_questions SET status='expired' WHERE status='open' AND expires_at <= ?",
+                (now,),
+            ).rowcount
+            q = db.execute(
+                "DELETE FROM pending_questions WHERE status IN ('answered','expired') "
+                "AND COALESCE(answered_at, expires_at, 0) < ?",
+                (now - Retention().output_s,),
+            ).rowcount
+        return {"prompts": p, "output_chunks": o, "jobs": len(old), "alerts": a, "questions": q + expired}
 
     # -------------------------------------------------------------- missions
     def create_mission(
@@ -919,6 +1002,7 @@ class Store:
                     job_summary = {"job_id": row["current_job_id"], "state": j["state"], "exit_code": j["exit_code"]}
             return {
                 "mission_id": row["id"],
+                "display_title": P.display_title(row["objective"], fallback=f"mission {row['id'][:8]}"),
                 "objective": row["objective"],
                 "acceptance_criteria": json.loads(row["acceptance_json"]),
                 "max_attempts": row["max_attempts"],
@@ -949,8 +1033,26 @@ class Store:
             if cur is None or cur["state"] not in P.TERMINAL:
                 raise BrokerError("attempt_still_active", "la tentative en cours n'est pas terminée")
             job_spec = db.execute(
-                "SELECT runner_id, runtime, workspace_id, mode, timeout_s FROM jobs WHERE id=?", (m["current_job_id"],)
+                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error FROM jobs WHERE id=?", (m["current_job_id"],)
             ).fetchone()
+            prev_corrupted = bool(job_spec and isinstance(job_spec["error"], str)
+                                  and job_spec["error"].startswith(P.SESSION_CORRUPTED_PREFIX))
+            if prev_corrupted:
+                # Anti-boucle : N corruptions consécutives sur la même mission
+                # => intervention humaine, pas une nouvelle tentative aveugle.
+                chain = db.execute(
+                    """SELECT j.error FROM mission_attempts a JOIN jobs j ON j.id = a.job_id
+                       WHERE a.mission_id=? ORDER BY a.attempt_no DESC LIMIT ?""",
+                    (mission_id, P.MAX_CONSECUTIVE_CORRUPTIONS),
+                ).fetchall()
+                if (len(chain) == P.MAX_CONSECUTIVE_CORRUPTIONS and all(
+                    isinstance(r["error"], str) and r["error"].startswith(P.SESSION_CORRUPTED_PREFIX) for r in chain
+                )):
+                    raise BrokerError(
+                        "session_corruption_loop",
+                        f"{P.MAX_CONSECUTIVE_CORRUPTIONS} sessions corrompues d'affilée : "
+                        "corriger la cause (config/plugin/auth opencode) avant tout retry",
+                    )
         job, _ = self.create_job(
             job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
             prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
@@ -967,6 +1069,16 @@ class Store:
                 "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
                 (mission_id, attempt_no, job["job_id"], now),
             )
+            if prev_corrupted:
+                # Nouvelle session propre, une seule fois par retry : handoff
+                # minimal durable (objectif + job précédent + prochaine action),
+                # jamais le transcript corrompu.
+                self._emit(
+                    db, job["job_id"], P.EV_SESSION_RECREATED,
+                    f"session corrompue abandonnée (job {m['current_job_id']}) ; "
+                    f"reprendre l'objectif « {P.display_title(m['objective'], fallback='mission')} » "
+                    "via progress et fichiers concernés",
+                )
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
     def validate_mission(self, mission_id: str, verdict: str, note: str | None = None) -> dict[str, Any]:
@@ -1001,6 +1113,321 @@ class Store:
             "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
         )
         log.info("mission_progress mission_id=%s job %s -> %s", m["id"], job_state, nxt)
+
+    # ------------------------------------------------------- alertes infra
+    @staticmethod
+    def _alert_fingerprint(source: str, service: str, title: str) -> str:
+        h = hashlib.sha256()
+        h.update(source.encode() + b"\x00" + service.encode() + b"\x00" + title.encode())
+        return h.hexdigest()
+
+    def record_alert(
+        self,
+        source: str,
+        service: str,
+        severity: str,
+        title: str,
+        detail: str | None = None,
+        fingerprint: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persiste une alerte sortante (ingesteurs locaux du VPS uniquement).
+
+        Déduplication anti-spam : même empreinte revue dans
+        ALERT_DEDUP_WINDOW_S et non résolue => `occurrences` + 1 (avec
+        escalade de sévérité et détail rafraîchi), pas de nouvelle ligne.
+        Retourne (alerte, created)."""
+        if source not in P.ALERT_SOURCES:
+            raise BrokerError("invalid_source", f"source : {' | '.join(P.ALERT_SOURCES)}")
+        if not isinstance(service, str) or not service.strip() or len(service) > P.MAX_ALERT_SERVICE_CHARS:
+            raise BrokerError("invalid_service", f"service requis (1..{P.MAX_ALERT_SERVICE_CHARS} car.)")
+        if severity not in P.ALERT_SEVERITIES:
+            raise BrokerError("invalid_severity", f"sévérité : {' | '.join(P.ALERT_SEVERITIES)}")
+        if not isinstance(title, str) or not title.strip() or len(title) > P.MAX_ALERT_TITLE_CHARS:
+            raise BrokerError("invalid_title", f"titre requis (1..{P.MAX_ALERT_TITLE_CHARS} car.)")
+        service = service.strip()
+        title = title.strip()
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str) or not fingerprint.strip() or len(fingerprint) > 128
+        ):
+            raise BrokerError("invalid_fingerprint", "empreinte 1..128 car.")
+        fp = fingerprint.strip() if isinstance(fingerprint, str) and fingerprint.strip() else self._alert_fingerprint(source, service, title)
+        clean_detail = P.clip(redact(detail), P.MAX_ALERT_DETAIL_CHARS) if detail else None
+        now = self.clock()
+        with self._tx() as db:
+            row = db.execute(
+                "SELECT * FROM infra_alerts WHERE fingerprint=? ORDER BY last_at DESC LIMIT 1", (fp,)
+            ).fetchone()
+            if (
+                row is not None
+                and row["state"] != P.ALERT_RESOLVED
+                and float(row["last_at"]) >= now - P.ALERT_DEDUP_WINDOW_S
+            ):
+                sev = row["severity"]
+                if P.ALERT_SEVERITIES.index(severity) > P.ALERT_SEVERITIES.index(sev):
+                    sev = severity
+                db.execute(
+                    "UPDATE infra_alerts SET occurrences=occurrences+1, last_at=?, severity=?, detail=? WHERE id=?",
+                    (now, sev, clean_detail if clean_detail is not None else row["detail"], row["id"]),
+                )
+                log.info("alert_dedup alert_id=%s fp=%s occurrences=%d", row["id"], fp[:12], int(row["occurrences"]) + 1)
+                alert_id, created = row["id"], False
+            else:
+                alert_id, created = str(uuid.uuid4()), True
+                db.execute(
+                    """INSERT INTO infra_alerts(id, source, service, severity, state, title, detail,
+                         fingerprint, occurrences, first_at, last_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (alert_id, source, service, severity, P.ALERT_ACTIVE, title, clean_detail,
+                     fp, 1, now, now),
+                )
+                log.info("alert_recorded alert_id=%s source=%s severity=%s service=%s", alert_id, source, severity, service)
+            db.execute(
+                "DELETE FROM infra_alerts WHERE id NOT IN "
+                "(SELECT id FROM infra_alerts ORDER BY last_at DESC LIMIT ?)",
+                (P.MAX_ALERTS,),
+            )
+        return self.get_alert(alert_id) or {"error": "internal", "alert_id": alert_id}, created
+
+    @staticmethod
+    def _alert_compact(row) -> dict[str, Any]:
+        return {
+            "alert_id": row["id"],
+            "source": row["source"],
+            "service": row["service"],
+            "severity": row["severity"],
+            "state": row["state"],
+            "title": row["title"],
+            "fingerprint": row["fingerprint"],
+            "occurrences": row["occurrences"],
+            "first_at": _iso(row["first_at"]),
+            "last_at": _iso(row["last_at"]),
+        }
+
+    def list_alerts(
+        self,
+        source: str | None = None,
+        severity: str | None = None,
+        state: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Vue compacte filtrable (jamais le détail complet : voir get_alert)."""
+        if source is not None and source not in P.ALERT_SOURCES:
+            raise BrokerError("invalid_source", f"source : {' | '.join(P.ALERT_SOURCES)}")
+        if severity is not None and severity not in P.ALERT_SEVERITIES:
+            raise BrokerError("invalid_severity", f"sévérité : {' | '.join(P.ALERT_SEVERITIES)}")
+        if state is not None and state not in P.ALERT_STATES:
+            raise BrokerError("invalid_state", f"état : {' | '.join(P.ALERT_STATES)}")
+        limit = max(1, min(int(limit or 20), P.MAX_ALERT_LIST))
+        # SQL statique (pas de concaténation : exigence semgrep) ; chaque filtre
+        # optionnel est neutralisé par son doublon NULL.
+        query = (
+            "SELECT * FROM infra_alerts "
+            "WHERE (? IS NULL OR source=?) AND (? IS NULL OR severity=?) AND (? IS NULL OR state=?) "
+            "AND (? IS NULL OR last_at>=?) AND (? IS NULL OR last_at<=?) "
+            "ORDER BY last_at DESC LIMIT ?"
+        )
+        params: list[Any] = [source, source, severity, severity, state, state, since, since, until, until, limit]
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+            alerts = [self._alert_compact(r) for r in rows]
+        return {"alerts": alerts, "count": len(alerts)}
+
+    def get_alert(self, alert_id: str) -> dict[str, Any] | None:
+        """Alerte complète, détail borné (redacted). None si inconnue."""
+        with self._lock:
+            row = self._db.execute("SELECT * FROM infra_alerts WHERE id=?", (alert_id,)).fetchone()
+            if row is None:
+                return None
+            out = self._alert_compact(row)
+            out["detail"] = row["detail"]
+            return out
+
+    def set_alert_state(self, alert_id: str, state: str) -> dict[str, Any]:
+        """Acquittement/résolution (CLI locale d'exploitation, pas le MCP)."""
+        if state not in (P.ALERT_ACKED, P.ALERT_RESOLVED):
+            raise BrokerError("invalid_state", "état : acked | resolved")
+        now = self.clock()
+        with self._tx() as db:
+            row = db.execute("SELECT id FROM infra_alerts WHERE id=?", (alert_id,)).fetchone()
+            if row is None:
+                raise BrokerError("unknown_alert", "alerte inconnue")
+            db.execute("UPDATE infra_alerts SET state=?, last_at=? WHERE id=?", (state, now, alert_id))
+            log.info("alert_state alert_id=%s state=%s", alert_id, state)
+        return self.get_alert(alert_id) or {"error": "internal", "alert_id": alert_id}
+
+    # ------------------------------------------------- questions en attente
+    @staticmethod
+    def _question_fingerprint(session_ref: str, question: str) -> str:
+        h = hashlib.sha256()
+        h.update(session_ref.encode() + b"\x00" + question.encode())
+        return h.hexdigest()
+
+    def record_question(
+        self,
+        origin: str,
+        session_ref: str,
+        runtime: str,
+        title: str,
+        question: str,
+        options: list[str] | None = None,
+        notify_after_s: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Enregistre un état waiting_for_user explicite (jamais de regex sur `?`).
+
+        Déduplication : même (session, question) ouverte et non expirée =>
+        retourne l'existante (UN seul message Photon). Retourne (question, created)."""
+        if origin not in ("agent", "chatgpt-web", "mission"):
+            raise BrokerError("invalid_origin", "origin : agent | chatgpt-web | mission")
+        if not isinstance(session_ref, str) or not session_ref.strip() or len(session_ref) > 128:
+            raise BrokerError("invalid_session_ref", "session_ref requise (1..128 car.)")
+        if runtime not in (*P.RUNTIMES, "chatgpt-web"):
+            raise BrokerError("invalid_runtime", "runtime inconnu")
+        if not isinstance(question, str) or not question.strip() or len(question) > P.MAX_QUESTION_CHARS:
+            raise BrokerError("invalid_question", f"question requise (1..{P.MAX_QUESTION_CHARS} car.)")
+        clean_opts: list[str] = []
+        for o in options or []:
+            if isinstance(o, str) and o.strip():
+                clean_opts.append(o.strip()[: P.MAX_QUESTION_OPTION_CHARS])
+            if len(clean_opts) >= P.MAX_QUESTION_OPTIONS:
+                break
+        session_ref = session_ref.strip()
+        title = P.display_title(title, fallback=f"session {session_ref[:8]}")
+        clean_q = P.clip(redact(question.strip()), P.MAX_QUESTION_CHARS) or ""
+        fp = self._question_fingerprint(session_ref, clean_q)
+        now = self.clock()
+        wait = P.QUESTION_NOTIFY_AFTER_S if notify_after_s is None else max(1, min(int(notify_after_s), 3_600))
+        with self._tx() as db:
+            row = db.execute(
+                "SELECT * FROM pending_questions WHERE fingerprint=? AND status='open' AND expires_at>? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (fp, now),
+            ).fetchone()
+            if row is not None:
+                log.info("question_dedup question_id=%s session=%s", row["id"], session_ref)
+                return self._question_view(row), False
+            qid = "q-" + uuid.uuid4().hex[:12]
+            db.execute(
+                """INSERT INTO pending_questions(id, origin, session_ref, runtime, title, question,
+                     options_json, fingerprint, status, notify_after_s, notify_status, created_at, expires_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (qid, origin, session_ref, runtime, title, clean_q, json.dumps(clean_opts, ensure_ascii=False),
+                 fp, P.Q_OPEN, wait, P.Q_NOTIFY_PENDING, now, now + P.QUESTION_EXPIRY_S),
+            )
+            log.info("question_recorded question_id=%s session=%s runtime=%s", qid, session_ref, runtime)
+        return self.get_question(qid) or {"error": "internal", "question_id": qid}, True
+
+    @staticmethod
+    def _question_view(row, with_answer: bool = False) -> dict[str, Any]:
+        out = {
+            "question_id": row["id"],
+            "origin": row["origin"],
+            "session_ref": row["session_ref"],
+            "runtime": row["runtime"],
+            "title": row["title"],
+            "question": row["question"],
+            "options": json.loads(row["options_json"]),
+            "status": row["status"],
+            "notify_status": row["notify_status"],
+            "notified_at": _iso(row["notified_at"]),
+            "created_at": _iso(row["created_at"]),
+            "expires_at": _iso(row["expires_at"]),
+        }
+        if with_answer:
+            out["answer"] = row["answer"]
+            out["answered_at"] = _iso(row["answered_at"])
+            out["answer_from"] = row["answer_from"]
+        return out
+
+    def get_question(self, question_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM pending_questions WHERE id=?", (question_id,)).fetchone()
+            return self._question_view(row, with_answer=True) if row is not None else None
+
+    def list_questions(
+        self, status: str | None = None, origin: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        if status is not None and status not in P.QUESTION_STATES:
+            raise BrokerError("invalid_state", f"état : {' | '.join(P.QUESTION_STATES)}")
+        if origin is not None and origin not in ("agent", "chatgpt-web", "mission"):
+            raise BrokerError("invalid_origin", "origin : agent | chatgpt-web | mission")
+        limit = max(1, min(int(limit or 20), 100))
+        # SQL statique (exigence semgrep) ; filtres neutralisés par doublon NULL.
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE (? IS NULL OR status=?) AND (? IS NULL OR origin=?) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (status, status, origin, origin, limit),
+            ).fetchall()
+            out = [self._question_view(r) for r in rows]
+        return {"questions": out, "count": len(out)}
+
+    def due_questions(self, now: float | None = None) -> list[dict[str, Any]]:
+        """Questions dues pour Photon : ouvertes, jamais notifiées, délai dépassé,
+        non expirées. Le dispatcher envoie UN message par question due."""
+        now = self.clock() if now is None else float(now)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM pending_questions WHERE status='open' AND notified_at IS NULL "
+                "AND created_at + notify_after_s <= ? AND expires_at > ? ORDER BY created_at",
+                (now, now),
+            ).fetchall()
+            return [self._question_view(r) for r in rows]
+
+    def mark_notified(self, question_id: str, notify_status: str) -> dict[str, Any] | None:
+        """Marque la notification (sent = message parti ; deferred = sender
+        indisponible, raison honnête visible ; failed = échec d'envoi)."""
+        if notify_status not in P.QUESTION_NOTIFY_STATES:
+            raise BrokerError("invalid_notify_status", "notify : pending | sent | deferred | failed")
+        now = self.clock()
+        with self._tx() as db:
+            row = db.execute("SELECT id, notified_at FROM pending_questions WHERE id=?", (question_id,)).fetchone()
+            if row is None:
+                raise BrokerError("unknown_question", "question inconnue")
+            if row["notified_at"] is not None:
+                return self.get_question(question_id)  # idempotent : un seul message
+            db.execute(
+                "UPDATE pending_questions SET notified_at=?, notify_status=? WHERE id=?",
+                (now, notify_status, question_id),
+            )
+            log.info("question_notified question_id=%s notify=%s", question_id, notify_status)
+        return self.get_question(question_id)
+
+    def answer_question(self, question_id: str, answer: str, answer_from: str) -> dict[str, Any]:
+        """Réponse single-use routée à la session émettrice (correlation_id +
+        expiration). `answer_from` = expéditeur allowlisté vérifié par l'appelant
+        (Photon/Hermes) ; stocké pour audit. Jamais une commande shell."""
+        if not isinstance(answer, str) or not answer.strip() or len(answer) > P.MAX_ANSWER_CHARS:
+            raise BrokerError("invalid_answer", f"réponse requise (1..{P.MAX_ANSWER_CHARS} car.)")
+        if not isinstance(answer_from, str) or not answer_from.strip() or len(answer_from) > 128:
+            raise BrokerError("invalid_answer_from", "expéditeur requis (allowlist Photon)")
+        now = self.clock()
+        with self._lock:
+            row = self._db.execute("SELECT * FROM pending_questions WHERE id=?", (question_id,)).fetchone()
+            if row is None:
+                raise BrokerError("unknown_question", "question inconnue")
+            status, expires_at, session_ref = row["status"], float(row["expires_at"]), row["session_ref"]
+        if status != P.Q_OPEN:
+            raise BrokerError("question_closed", f"question {status} (replay refusé)")
+        if expires_at <= now:
+            # Expirée : marquer en transaction validée SÉPARÉE (un raise
+            # annulerait la tx courante ; pas de tx imbriquée SQLite).
+            with self._tx() as db_exp:
+                db_exp.execute("UPDATE pending_questions SET status='expired' WHERE id=?", (question_id,))
+            raise BrokerError("question_expired", "question expirée")
+        clean = P.clip(redact(answer.strip()), P.MAX_ANSWER_CHARS) or ""
+        with self._tx() as db:
+            cur = db.execute(
+                "UPDATE pending_questions SET status='answered', answer=?, answered_at=?, answer_from=? "
+                "WHERE id=? AND status='open'",
+                (clean, now, answer_from.strip(), question_id),
+            )
+            if cur.rowcount != 1:
+                raise BrokerError("question_closed", "question déjà traitée (replay refusé)")
+            log.info("question_answered question_id=%s session=%s", question_id, session_ref)
+        return self.get_question(question_id) or {"error": "internal", "question_id": question_id}
 
     # -------------------------------------------------------------- internes
     def _requeue(self, db, job_id: str, reason: str) -> None:
@@ -1040,6 +1467,7 @@ class Store:
         children = None if children is None else int(children)
         view = {
             "job_id": row["id"],
+            "display_title": P.display_title(row["prompt"], fallback=f"job {row['id'][:8]}"),
             "runner_id": row["runner_id"],
             "runtime": row["runtime"],
             "workspace_id": row["workspace_id"],
