@@ -53,15 +53,18 @@ Base : main `a4aa694` (observabilité Telegram unifiée). Repo local aligné ava
 
 - Backup/rollback : migration DB additive (`IF NOT EXISTS` / `ADD COLUMN`, NULL =
   non observé) ; ancien `src/` redéployé reste fonctionnel (chemin de rollback).
-  Sauvegarde `/root/orch-src-bak-*` avant chaque déploiement (cf. OPERATIONS).
-- **VPS** : recopier `src/` (+ `deploy/` inchangé ici), `install.sh` idempotent,
-  `systemctl restart orch-mcp` (jobs `running` survivent : bail 60 s).
-- **PC** : `deploy\windows\install-runner.ps1` hors activité
-  (`agent_job_list state=running` vide) — le nouveau runner envoie la télémétrie
-  dès la transition `running`. Sans mise à jour du runner : compatible (nulls +
-  `idle`, pas de faux stall), mais BUG2 non corrigé côté process.
-- Statut : correctifs poussés sur `main` ; déploiement prod à exécuter avec accès
-  VPS/PC (voir § Erreurs si indisponible depuis ce poste).
+- **VPS FAIT (2026-09-14 ~00:28 UTC+2)** : backup `/root/orch-src-bak-<ts>` +
+  `/root/orch-db-bak-<ts>.sqlite`, `src/` du commit `12ea5a7` déployé
+  (tarball md5 vérifié), `systemctl restart orch-mcp`, `/health ok`
+  (reaper 2,7 s). Gateway non touchée (aucun changement).
+- **Preuve BUG1 live prod** : `wait_for_change` (depuis le broker prod) sur job
+  `completed` → `woke_by=terminal` en 0,0 s (`BUG1_LIVE_OK`).
+- **Runner PC (main-windows-pc) EN ATTENTE** : 1 job opencode actif en `e2e`
+  (`9dc5076e`, output récente — ne pas tuer). La MAJ runner
+  (`install-runner.ps1`) exige aucune activité (sinon job `lost`). Dès le job
+  terminé : MAJ runner, puis preuve BUG2 live (job fake → télémétrie non-null
+  dès `running`, `healthy`). Sans MAJ : broker corrigé, mais vieux runner =
+  télémétrie toujours null + `idle` (pas de faux stall — comportement voulu).
 
 ## Erreurs
 
