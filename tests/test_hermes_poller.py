@@ -29,7 +29,12 @@ FAKE_HERMES = (
     "p=sys.stdin.read()\n"
     "print('session_id: " + SID + "',flush=True)\n"
     "time.sleep(float(os.environ.get('FAKE_SLEEP','0')))\n"
-    "print('PONG_OK' if 'PONG_OK' in p else 'NOPE',flush=True)\n"
+    "leak=os.environ.get('FAKE_LEAK')\n"
+    "if leak=='always' or (leak=='once' and 'PAS ete execute' not in p):\n"
+    "    print('<atem:function_calls>\\n<atem:invoke name=\"default.terminal\">\\n'\n"
+    "          '</atem:invoke>\\n</atem:function_calls>',flush=True)\n"
+    "else:\n"
+    "    print('PONG_OK' if 'PONG_OK' in p or 'PAS ete execute' in p else 'NOPE',flush=True)\n"
     "sys.exit(int(os.environ.get('FAKE_EXIT','0')))\n"
 )
 
@@ -164,6 +169,41 @@ def test_resume_session_skips_claimed_transition(pv2, tmp_path, monkeypatch):
     _run(pv2.Supervisor(_Poller(st), jid))
     assert seen["argv"][-2:] == ["--resume", SID]
     assert [p["to"] for k, p in _outbox(st) if k == "transition"] == ["running", "completed"]
+
+
+def _spy_argvs(pv2, monkeypatch):
+    argvs = []
+    real = subprocess.Popen
+
+    def spy(argv, **kw):
+        argvs.append(argv)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(pv2.subprocess, "Popen", spy)
+    return argvs
+
+
+def test_text_tool_call_resumes_session_then_completes(pv2, tmp_path, monkeypatch):
+    """Régression a730531e : appel outil sérialisé en texte + exit 0 -> faux completed."""
+    monkeypatch.setenv("FAKE_LEAK", "once")
+    argvs = _spy_argvs(pv2, monkeypatch)
+    st, jid = _claimed(pv2, tmp_path)
+    _run(pv2.Supervisor(_Poller(st), jid))
+    assert len(argvs) == 2 and argvs[1][-2:] == ["--resume", SID]
+    trans = [p for k, p in _outbox(st) if k == "transition"]
+    assert [p["to"] for p in trans] == ["starting", "running", "completed"]
+    assert trans[-1]["result_summary"].endswith("PONG_OK")
+
+
+def test_persistent_text_tool_call_fails_after_bounded_retries(pv2, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_LEAK", "always")
+    argvs = _spy_argvs(pv2, monkeypatch)
+    st, jid = _claimed(pv2, tmp_path)
+    _run(pv2.Supervisor(_Poller(st), jid))
+    assert len(argvs) == 1 + pv2.LEAK_RETRIES
+    last = [p for k, p in _outbox(st) if k == "transition"][-1]
+    assert last["to"] == "failed" and "texte" in last["error"]
+    assert st.get_job(jid)["local_state"] == "done"
 
 
 def test_heartbeat_held_carries_flat_telemetry(pv2, tmp_path):

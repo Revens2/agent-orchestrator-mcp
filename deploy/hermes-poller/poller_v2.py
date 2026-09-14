@@ -45,7 +45,8 @@ LOG_DIR = os.path.join(SPOOL, "runs")
 
 RUNNER_ID = "hermes-vps"
 VERSION = "hermes-poller/2.1"
-INFO = {"version": VERSION, "max_parallel": 1,
+MAX_PARALLEL = 10
+INFO = {"version": VERSION, "max_parallel": MAX_PARALLEL,
         "runtimes": [{"id": "hermes", "available": True,
                       "modes": ["read_only", "workspace_write"],
                       "version": "intervention-directe-vps-hermes"}],
@@ -63,6 +64,19 @@ SESSION_RE = re.compile(r"^session_id:\s*([A-Za-z0-9_.:-]{4,128})\s*$", re.M)
 HERMES_ARGV = ["docker", "exec", "-i", "hermes", "hermes", "chat",
                "--query-file", "-", "-Q", "--yolo", "--accept-hooks",
                "--pass-session-id"]
+# Certains modeles (ex. muse-spark via opencode-free) finissent parfois un long
+# tour par un appel outil SERIALISE EN TEXTE (`<atem:function_calls>...`,
+# finish_reason=stop) : Hermes le prend pour la reponse finale, exit 0, rien
+# n'est execute. Detection ancree en fin de sortie -> relance bornee de la
+# meme session, puis echec explicite (jamais un faux `completed`).
+LEAKED_TOOL_CALL_RE = re.compile(
+    r"</(?:[A-Za-z0-9_.-]+:)?(?:function_calls|tool_calls?|invoke)>\s*$", re.I)
+LEAK_RETRIES = 2
+LEAK_NUDGE = (
+    "Ton message precedent contenait un appel d'outil ecrit en texte "
+    "(balises <function_calls>/<invoke>) : il n'a PAS ete execute. "
+    "Reprends exactement ou tu en etais en utilisant les VRAIS appels d'outils "
+    "natifs, jamais de balises XML dans ta reponse, puis termine la mission.")
 
 
 def LOG(*a):
@@ -362,7 +376,7 @@ class Supervisor(threading.Thread):
         # Default: ne rien faire
         LOG("etat local inattendu, ignore:", self.job_id, job.get("local_state"))
 
-    def _spawn(self, st, resume=None):
+    def _spawn(self, st, resume=None, prompt_text=None):
         job = st.get_job(self.job_id)
         prompt_path = job.get("prompt_path") or ""
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -374,11 +388,12 @@ class Supervisor(threading.Thread):
                        {"src": "claimed", "to": "starting"})
             st.set_job(self.job_id, local_state="starting")
         # Lire le prompt depuis le fichier local
-        try:
-            with open(prompt_path, "r") as pf:
-                prompt_text = pf.read()
-        except OSError:
-            prompt_text = ""
+        if prompt_text is None:
+            try:
+                with open(prompt_path, "r") as pf:
+                    prompt_text = pf.read()
+            except OSError:
+                prompt_text = ""
         # Passer via stdin (--query-file -) : pas de montage necessaire
         argv = list(HERMES_ARGV)
         if resume:
@@ -510,6 +525,22 @@ class Supervisor(threading.Thread):
         sid = self._drain(st, pid, sid)
         summary = self._summary()
         tele = {"runtime_session_id": sid, "pid": pid, "proc_alive": False}
+        if exit_code == 0 and LEAKED_TOOL_CALL_RE.search(summary):
+            key = "leak:" + self.job_id
+            n = int(st.get_meta(key) or 0)
+            if sid and n < LEAK_RETRIES:
+                st.set_meta(key, str(n + 1))
+                LOG("appel outil en texte, relance session:", self.job_id, n + 1)
+                self._spawn(st, resume=sid, prompt_text=LEAK_NUDGE)
+                return
+            st.enqueue(self.job_id, "transition",
+                       "tr-%s-failed" % self.job_id,
+                       {"src": "running", "to": "failed", "exit_code": 0,
+                        "result_summary": summary,
+                        "error": "appel outil emis en texte, non execute "
+                                 "(%d relance(s))" % n, **tele})
+            st.set_job(self.job_id, local_state="done", session_id=sid)
+            return
         if exit_code == 0:
             st.enqueue(self.job_id, "transition",
                        "tr-%s-completed" % self.job_id,
@@ -673,9 +704,10 @@ class Poller:
                     except Exception as e:
                         LOG("flush differe:", type(e).__name__)
                     last_flush = time.time()
-                if len(self.store.active_jobs()) < 1:
+                free_slots = MAX_PARALLEL - len(self.store.active_jobs())
+                if free_slots > 0:
                     for job in self.broker.claim(
-                            self.epoch, 1).get("jobs", []):
+                            self.epoch, free_slots).get("jobs", []):
                         jid = job["job_id"]
                         prompt_path = self.store.store_prompt(
                             jid, job.get("prompt") or "")
