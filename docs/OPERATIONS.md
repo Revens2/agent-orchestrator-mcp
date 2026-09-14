@@ -100,10 +100,24 @@ curl -s http://10.200.114.203:8803/health     # depuis le PC (NetBird)
 
 Flux recommandé : `agent_runner_list` → `agent_runner_inspect(runner_id)` →
 `agent_mission_create(objective, acceptance_criteria, …)` → boucle
-`agent_job_wait(job_id, timeout_s=25)` + `agent_job_get` (champ `execution_health`,
-couches `broker_health`/`runner_health`/`runtime_process_health`) →
-`agent_job_events(job_id, after_seq)` pour le journal → à la fin du job :
-`agent_mission_validate(mission_id, verdict)`.
+`agent_mission_wait(mission_id, timeout_s=25)` (ou `agent_job_wait(job_id,
+timeout_s=25, since_seq=…)` sur la tentative courante) + `agent_job_get`
+(champ `execution_health`, couches `broker_health`/`runner_health`/
+`runtime_process_health`) → `agent_job_events(job_id, after_seq)` pour le
+journal → à la fin du job : `agent_mission_validate(mission_id, verdict)`.
+
+CONTRAT DE SUIVI (non négociable, sauf `fire_and_forget=true` explicite) :
+chaque retour de `agent_job_start` / `agent_mission_create` / `agent_job_wait` /
+`agent_mission_wait` porte un bloc machine-lisible (`must_follow`, `terminal`,
+`should_continue`, `next_tool`, `wait_timeout_s`, `until=terminal`,
+`since_seq`/`last_event_seq`). Tant que `terminal=false` — Y COMPRIS
+`woke_by=timeout` — le caller DOIT rappeler `agent_job_wait` /
+`agent_mission_wait` avec `since_seq=last_event_seq` dans le MÊME tour, sans
+répondre à l'utilisateur. Un timeout pendant que le process continue n'est
+jamais une fin. Répondre uniquement après résultat terminal / validation.
+Seuls vrais arrêts : question `waiting_for_user` ouverte
+(`agent_question_list`), entrée utilisateur réellement requise, ou job
+`failed`/`timeout`/`cancelled`/`lost` à remonter explicitement.
 
 - `completed` (exit 0) ≠ mission réussie : le job passe la mission en `needs_validation`,
   tout autre terminal (`failed`, `timeout`, `cancelled`, `lost`) en `incomplete`.

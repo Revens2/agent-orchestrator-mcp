@@ -42,7 +42,7 @@ def test_tool_surface_has_no_shell(client):
     names = {t["name"] for t in tools}
     assert names == {"agent_runner_list", "agent_workspace_list", "agent_job_start", "agent_job_get", "agent_job_output", "agent_job_cancel", "agent_job_list",
                      "agent_job_events", "agent_runner_inspect", "agent_job_wait",
-                     "agent_mission_create", "agent_mission_get", "agent_mission_retry", "agent_mission_validate",
+                     "agent_mission_create", "agent_mission_get", "agent_mission_wait", "agent_mission_retry", "agent_mission_validate",
                      "infra_alert_list", "infra_alert_get",
                      "agent_question_list", "agent_question_get", "agent_question_answer"}
     for t in tools:
@@ -93,6 +93,33 @@ def test_supervision_tools_via_mcp(client):
     assert denied["error"] == "mission_not_retryable"  # tentative encore active
     denied_v = call(c, "agent_mission_validate", {"mission_id": m["mission_id"], "verdict": "validated"})
     assert denied_v["error"] == "mission_not_validatable"
+
+
+def test_followthrough_contract_via_mcp(client):
+    """Le contrat de suivi est machine-lisible dès le MCP : start/wait/mission."""
+    c, _ = client
+    started = call(c, "agent_job_start", {"runner_id": "pc", "runtime": "fake", "workspace_id": "demo", "prompt": "hi"})
+    assert started["state"] == "queued"
+    assert started["follow_up"]["must_follow"] is True
+    assert started["follow_up"]["next_tool"] == "agent_job_wait"
+    assert started["should_continue"] is True and started["terminal"] is False
+    assert started["until"] == "terminal"
+    w = call(c, "agent_job_wait", {"job_id": started["job_id"], "timeout_s": 0.5})
+    assert w["woke_by"] == "timeout" and w["terminal"] is False
+    assert w["should_continue"] is True and w["next_tool"] == "agent_job_wait"
+    assert w["since_seq"] == w["last_event_seq"]
+    m = call(c, "agent_mission_create", {"objective": "obj2", "acceptance_criteria": ["ok"],
+                                         "runner_id": "pc", "runtime": "fake", "workspace_id": "demo"})
+    assert m["follow_up"]["next_tool"] == "agent_mission_wait"
+    assert m["should_continue"] is True
+    mw = call(c, "agent_mission_wait", {"mission_id": m["mission_id"], "timeout_s": 0.5})
+    assert mw["mission_state"] == "executing" and mw["should_continue"] is True
+    assert mw["next_tool"] == "agent_mission_wait"
+    assert call(c, "agent_mission_wait", {"mission_id": "ghost"})["error"] == "unknown_mission"
+    # fire-and-forget explicite : le suivi ne s'applique pas
+    faf = call(c, "agent_job_start", {"runner_id": "pc", "runtime": "fake", "workspace_id": "demo",
+                                      "prompt": "bg", "fire_and_forget": True})
+    assert faf["follow_up"]["must_follow"] is False
 
 
 def test_invalid_runtime_rejected_by_schema(client):

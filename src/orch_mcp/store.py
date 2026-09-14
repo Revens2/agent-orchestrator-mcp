@@ -28,6 +28,46 @@ from orch_protocol.redact import redact
 
 log = logging.getLogger("orch.store")
 
+# ------------------------------------------------- contrat de suivi (follow-through)
+# Un timeout de wait pendant que le job continue N'EST PAS une raison de répondre
+# à l'utilisateur : le caller DOIT rappeler l'attente. Ces blocs machine-lisibles
+# rendent la boucle explicite (testée) au lieu de reposer sur une phrase doc.
+FOLLOW_UNTIL = "terminal"
+FOLLOW_WAIT_S = 25
+FOLLOW_NEXT_WAIT = "agent_job_wait"
+FOLLOW_NEXT_DONE = "agent_job_get"
+
+
+def follow_for_job(state: str, last_event_seq: int, wait_timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any]:
+    """Bloc de suivi pour un job non terminal : quoi appeler, avec quel curseur,
+    jusqu'à quoi. `terminal=True` => le job ne bougera plus (inspecter/valider)."""
+    terminal = state in P.TERMINAL
+    return {
+        "must_follow": not terminal,
+        "terminal": terminal,
+        "should_continue": not terminal,
+        "next_tool": FOLLOW_NEXT_DONE if terminal else FOLLOW_NEXT_WAIT,
+        "wait_timeout_s": int(wait_timeout_s),
+        "until": FOLLOW_UNTIL,
+        "since_seq": int(last_event_seq),
+    }
+
+
+def follow_for_wait(state: str, woke_by: str, last_event_seq: int) -> dict[str, Any]:
+    """Bloc de suivi pour un retour de wait : `woke_by=timeout` + non terminal
+    => rappeler `agent_job_wait` IMMÉDIATEMENT (même tour), pas de réponse user."""
+    terminal = state in P.TERMINAL
+    return {
+        "must_follow": not terminal,
+        "terminal": terminal,
+        "should_continue": not terminal,
+        "next_tool": FOLLOW_NEXT_DONE if terminal else FOLLOW_NEXT_WAIT,
+        "wait_timeout_s": FOLLOW_WAIT_S,
+        "until": FOLLOW_UNTIL,
+        "since_seq": int(last_event_seq),
+        "woke_by": woke_by,
+    }
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS runners (
@@ -1674,7 +1714,13 @@ class Store:
         - pendant l'attente : `terminal` (état terminal atteint), `state`
           (autre changement d'état), `change` (sortie/activité sans changement
           d'état), `event` (nouvel événement au-delà de since_seq) ;
-        - sinon `timeout` à expiration du délai borné."""
+        - sinon `timeout` à expiration du délai borné.
+        - contrat de suivi : chaque retour porte `terminal` (job figé ou non),
+          `should_continue`/`must_follow` (= non terminal), `next_tool`
+          (`agent_job_wait` tant que non terminal, `agent_job_get` sinon),
+          `since_seq`/`last_event_seq` (curseur : rappeler avec
+          `since_seq=last_event_seq`) et `until='terminal'`. Un `timeout` non
+          terminal impose de rappeler IMMÉDIATEMENT dans le même tour."""
         timeout_s = max(0.0, min(float(timeout_s), P.WAIT_MAX_S))
         since_seq = max(-1, int(since_seq))
         import time as _t
@@ -1683,13 +1729,17 @@ class Store:
             view = self.get_job(job_id, tail_chars=0)
             if view is None:
                 return None
-            return {
+            seq = self._last_seq(job_id)
+            out: dict[str, Any] = {
                 "job_id": job_id,
                 "state": view["state"],
                 "woke_by": woke_by,
                 "execution_health": view["execution_health"],
-                "last_event_seq": self._last_seq(job_id),
+                "last_event_seq": seq,
             }
+            out.update(follow_for_wait(view["state"], woke_by, seq))
+            out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+            return out
 
         with self._lock:
             row = self._db.execute("SELECT updated_at, state FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1724,12 +1774,59 @@ class Store:
         view = self.get_job(job_id, tail_chars=0)
         if view is None:
             return None
-        return {
+        seq = self._last_seq(job_id)
+        out: dict[str, Any] = {
             "job_id": job_id,
             "state": view["state"],
             "woke_by": woke_by,
             "execution_health": view["execution_health"],
-            "last_event_seq": self._last_seq(job_id),
+            "last_event_seq": seq,
+        }
+        out.update(follow_for_wait(view["state"], woke_by, seq))
+        out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+        return out
+
+    def wait_for_mission(
+        self, mission_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S
+    ) -> dict[str, Any] | None:
+        """Attente bornée sur la tentative COURANTE d'une mission (même sémantique
+        que `wait_for_change`, jamais plus de WAIT_MAX_S). Retourne l'état mission
+        + job + suivi : `executing` non terminal => rappeler ; `needs_validation`
+        / `incomplete` => inspecter puis `agent_mission_validate` (jamais confondre
+        `completed` process avec `validated` mission). Pas de callback de fond."""
+        m = self.get_mission(mission_id)
+        if m is None:
+            return None
+        job_id = m["current_job_id"]
+        if not job_id:
+            return {"mission_id": mission_id, "error": "no_attempt", **m}
+        w = self.wait_for_change(job_id, since_seq, timeout_s)
+        if w is None:
+            return None
+        m2 = self.get_mission(mission_id) or m
+        state = m2["state"]
+        pursuing = state == P.MISSION_EXECUTING and not w["terminal"]
+        if pursuing:
+            nxt = "agent_mission_wait"
+        elif state in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
+            nxt = "agent_mission_validate"
+        else:
+            nxt = "agent_mission_get"
+        return {
+            "mission_id": mission_id,
+            "mission_state": state,
+            "job_id": job_id,
+            "job_state": w["state"],
+            "woke_by": w["woke_by"],
+            "terminal": w["terminal"],
+            "should_continue": pursuing,
+            "must_follow": pursuing,
+            "next_tool": nxt,
+            "since_seq": w["since_seq"],
+            "last_event_seq": w["last_event_seq"],
+            "until": FOLLOW_UNTIL,
+            "wait_timeout_s": FOLLOW_WAIT_S,
+            "current_job_id": job_id,
         }
 
     def _last_seq(self, job_id: str) -> int:

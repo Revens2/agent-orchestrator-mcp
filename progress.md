@@ -1,7 +1,6 @@
 # Mission CRITICAL — BUG1 (wait) + BUG2 (télémétrie) : état d'avancement
 
 Base : main `a4aa694` (observabilité Telegram unifiée). Repo local aligné avant écriture.
-
 ## Diagnostic (reproduit localement avant fix)
 
 - **BUG1** (`Store.wait_for_change`) : job déjà terminal à l'appel → `woke_by='timeout'`
@@ -69,3 +68,49 @@ Base : main `a4aa694` (observabilité Telegram unifiée). Repo local aligné ava
 ## Erreurs
 
 - (aucune erreur bloquante restante côté code ; E2E timeouts bornés non déclenchés)
+
+---
+
+# Mission CRITICAL — Follow-through automatique (wait répétés jusqu'au terminal)
+
+Base : main `8a0cbf9`. Le bug `wait_for_change` (job déjà terminal → attente
+complète) restait corrigé et prouvé ; le problème restant était le contrat de
+suivi : après `agent_job_start`/`agent_mission_create`, rien n'imposait au
+caller de continuer jusqu'au terminal (repro : start → `{job_id, state,
+created}` sans `must_follow`/`next_tool` ; wait timeout → `woke_by=timeout`
+sans `should_continue`, indistinguable d'une fin).
+
+## Correctif (additif, sans migration DB, runner inchangé)
+
+1. `src/orch_mcp/store.py` : `follow_for_job()` / `follow_for_wait()` (bloc
+   machine-lisible : `must_follow`, `terminal`, `should_continue`, `next_tool`
+   (`agent_job_wait` / `agent_job_get`), `wait_timeout_s`, `until=terminal`,
+   `since_seq`) ; `wait_for_change` enrichi (retour immédiat ET boucle) ;
+   nouveau `wait_for_mission(mission_id, since_seq, timeout_s)` borné ≤ 60 s
+   (état mission + job + `next_tool` = `agent_mission_wait` tant que
+   `executing` non terminal, `agent_mission_validate` quand
+   `needs_validation`/`incomplete`/`blocked`).
+2. `src/orch_mcp/tools.py` : descriptions MCP renforcées (DOIT rester dans le
+   même tour, rappeler après chaque non-terminal, timeout ≠ fin, arrêts
+   autorisés uniquement : `waiting_for_user`, entrée réellement requise,
+   `failed/timeout/cancelled/lost` remonté) ; `agent_job_start` /
+   `agent_mission_create` retournent `follow_up` + `terminal` /
+   `should_continue` / `next_tool` / `since_seq` / `until`, avec
+   `fire_and_forget` explicite (opt-out) ; nouvel outil lecture
+   `agent_mission_wait`.
+3. `src/orch_gateway/politique.py` : `agent_mission_wait` en lecture (20 outils) ;
+   `src/orch_mcp/server.py` : INSTRUCTIONS avec contrat de suivi.
+4. `README.md` (20 outils), `docs/OPERATIONS.md` (flux + CONTRAT DE SUIVI).
+5. Tests : `tests/test_followthrough.py` (7 tests : helpers, timeout→rappel,
+   terminal immédiat, waits répétés→terminal, séquence job complète,
+   séquence mission→needs_validation→validated, failed→validate) ;
+   `tests/test_mcp_tools.py` (surface 20 outils + contrat via MCP +
+   fire-and-forget).
+
+## Preuves
+
+- `pytest` (hors runtimes réels/Windows) : **120 passed, 1 skipped** ; `ruff check` propre.
+- Matrice E2E locale (broker `src/` patché sur `:8802` + runner simulé) :
+  `e2e/e2e_matrix_local.py` → **42/42 PASS** (36 antérieurs + 6 follow-through :
+  start→follow, timeout→recall, waits répétés, mission_create→mission_wait,
+  mission_wait sur validée, fire-and-forget).

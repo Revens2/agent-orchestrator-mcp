@@ -10,7 +10,7 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
                                                                             ▼
                          orch-gateway  127.0.0.1:8801   OAuth + politique outil par outil
                                                                             ▼
-                         orch-mcp      127.0.0.1:8802   MCP (19 outils) + broker SQLite (autorité)
+                          orch-mcp      127.0.0.1:8802   MCP (20 outils) + broker SQLite (autorité)
                                                                             ▲
                          nginx 10.200.114.203:8803      /runner/v1/* — IP NetBird uniquement
                                                                             │ long-poll SORTANT
@@ -47,7 +47,8 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 | `agent_job_output` | lecture | sortie paginée (`cursor`, `limit` ≤ 20 000) |
 | `agent_job_events` | lecture | journal structuré borné et paginé (`after_seq`, `limit` ≤ 200), pas de transcript |
 | `agent_runner_inspect` | lecture | snapshot runner : versions, capacités, workspaces, git (branch/HEAD/dirty), jobs actifs |
-| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) sur changement significatif ; pas un fond de tâche |
+| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) ; retour machine-lisible (`terminal`, `should_continue`/`must_follow`, `next_tool`, curseur `since_seq`) : un timeout non terminal impose de rappeler dans le même tour, jamais de répondre |
+| `agent_mission_wait` | lecture | attente bornée (≤ 60 s) sur la tentative courante d'une mission (`mission_state`, `terminal`, `should_continue`, `next_tool` = `agent_mission_wait` ou `agent_mission_validate`) |
 | `agent_job_cancel` | écriture | `cancelled` / `cancel_requested` / `already_finished` / `unknown_job` |
 | `agent_job_list` | lecture | liste filtrable |
 | `agent_mission_create` | écriture | mission (objectif + critères) + 1re tentative ; jamais de retry auto |

@@ -13,7 +13,7 @@ import anyio
 from pydantic import Field
 
 import orch_protocol as P
-from orch_mcp.store import BrokerError, Store
+from orch_mcp.store import BrokerError, Store, follow_for_job
 
 RuntimeT = Literal["claude-code", "codex", "agy", "opencode", "fake", "hermes"]
 ModeT = Literal["read_only", "workspace_write"]
@@ -77,10 +77,22 @@ def register(mcp, store: Store) -> None:
         description=(
             "Lance un agent IA existant (Claude Code, Codex, Antigravity/agy ou OpenCode) sur le PC "
             "personnel autorisé, dans un workspace allowlisté, avec un prompt. Retourne IMMÉDIATEMENT "
-            "un job asynchrone (job_id, state=queued) sans attendre la fin : suivez-le ensuite avec "
-            "agent_job_get. Ce n'est pas un shell : aucune commande n'est exécutée, le prompt est "
-            "transmis tel quel à l'agent. Fournissez idempotency_key pour qu'un retry ne crée pas un "
-            "second job. " + STATE_HELP
+            "un job asynchrone (job_id, state=queued) SANS attendre la fin, PLUS un bloc de suivi "
+            "machine-lisible (must_follow, terminal, should_continue, next_tool=agent_job_wait, "
+            "wait_timeout_s, until=terminal, since_seq). CONTRAT DE SUIVI — sauf fire_and_forget=true "
+            "explicitement demandé par l'utilisateur (« lance et oublie ») : vous DEVEZ rester dans le "
+            "MÊME tour, appeler agent_job_wait (timeout 25 s, since_seq fourni) puis RAPPELER "
+            "agent_job_wait après CHAQUE retour non terminal. Un woke_by=timeout pendant que le job "
+            "continue N'EST PAS une fin et N'EST PAS une raison de répondre : rappelez immédiatement. "
+            "Ne répondez à l'utilisateur qu'une fois terminal=true (puis agent_job_get / "
+            "agent_job_output / agent_job_events pour le résultat). Arrêts intermédiaires autorisés "
+            "UNIQUEMENT sur : question waiting_for_user ouverte (agent_question_list), entrée "
+            "utilisateur réellement requise, ou job failed/timeout/cancelled/lost à remonter "
+            "explicitement. Ne dites JAMAIS « lancé, repromptez-moi quand il a fini » : l'expérience "
+            "normale est un seul message utilisateur puis une seule réponse finale avec le résultat. "
+            "Ce n'est pas un shell : aucune commande n'est exécutée, le prompt est transmis tel quel "
+            "à l'agent. Fournissez idempotency_key pour qu'un retry ne crée pas un second job. "
+            + STATE_HELP
         ),
     )
     async def agent_job_start(
@@ -91,6 +103,7 @@ def register(mcp, store: Store) -> None:
         mode: Annotated[ModeT, Field(description="read_only = analyse sans écriture ; workspace_write = peut modifier le workspace.")] = "read_only",
         timeout_s: Annotated[int | None, Field(description="Durée max en secondes (30..14400, défaut 3600).")] = None,
         idempotency_key: Annotated[str | None, Field(description="Clé unique (8..128 car.) pour dédupliquer les retries.")] = None,
+        fire_and_forget: Annotated[bool, Field(description="true = l'utilisateur demande explicitement à ne PAS attendre le résultat (lance-et-oublie) ; le contrat de suivi ne s'applique pas. Défaut false.")] = False,
     ) -> dict:
         try:
             job, created = await anyio.to_thread.run_sync(
@@ -99,7 +112,15 @@ def register(mcp, store: Store) -> None:
         except BrokerError as exc:
             return _err(exc)
         runner = next((r for r in await anyio.to_thread.run_sync(store.runners) if r["id"] == runner_id), None)
-        out = {"job_id": job["job_id"], "state": job["state"], "created": created}
+        seq = await anyio.to_thread.run_sync(store._last_seq, job["job_id"])
+        follow = follow_for_job(job["state"], seq)
+        if fire_and_forget:
+            follow["must_follow"] = False
+            follow["should_continue"] = False
+        out = {"job_id": job["job_id"], "state": job["state"], "created": created,
+               "follow_up": follow, "terminal": follow["terminal"],
+               "should_continue": follow["should_continue"], "next_tool": follow["next_tool"],
+               "since_seq": follow["since_seq"], "until": follow["until"]}
         if runner and runner["status"] != "online":
             out["warning"] = "runner offline : le job reste queued jusqu'à sa reconnexion (annulable)."
         return out
@@ -200,7 +221,16 @@ def register(mcp, store: Store) -> None:
         description=(
             "Attend un changement significatif d'un job (état, sortie, événement, terminal) jusqu'au "
             "timeout borné (≤ 60 s). Évite le polling agressif pendant un tour actif. N'est PAS un "
-            "fond de tâche : ne se réveille que pendant un tour ChatGPT actif."
+            "fond de tâche : ne se réveille que pendant un tour ChatGPT actif. Retour machine-lisible : "
+            "state, woke_by, terminal (bool), should_continue/must_follow (= non terminal), next_tool "
+            "(agent_job_wait tant que non terminal, agent_job_get sinon), since_seq/last_event_seq "
+            "(curseur), until=terminal. RÈGLE : si terminal=false — Y COMPRIS woke_by=timeout — vous "
+            "DEVEZ rappeler agent_job_wait avec since_seq=last_event_seq dans le MÊME tour, sans "
+            "répondre à l'utilisateur. Un timeout pendant que le process continue n'est jamais une fin. "
+            "Ne répondez qu'après terminal=true (puis agent_job_get / agent_job_output / "
+            "agent_job_events). Seuls vrais arrêts : question waiting_for_user ouverte "
+            "(agent_question_list), entrée utilisateur réellement requise, ou job "
+            "failed/timeout/cancelled/lost à remonter explicitement."
         ),
     )
     async def agent_job_wait(
@@ -215,9 +245,16 @@ def register(mcp, store: Store) -> None:
         name="agent_mission_create",
         description=(
             "Crée une MISSION (objectif + critères d'acceptation) au-dessus des jobs et démarre sa "
-            "première tentative. Rappel : `completed` (exit 0) ne valide jamais la mission : le job "
-            "terminal exit 0 passe la mission en needs_validation, sinon incomplete. Aucun retry "
-            "automatique. Validez avec agent_mission_validate."
+            "première tentative. Retourne la mission PLUS un bloc de suivi machine-lisible "
+            "(must_follow, terminal, should_continue, next_tool=agent_mission_wait, since_seq, "
+            "until=terminal) sur la tentative courante. CONTRAT DE SUIVI — sauf fire_and_forget=true "
+            "explicite : restez dans le MÊME tour, appelez agent_mission_wait (ou agent_job_wait sur "
+            "current_job_id) puis RAPPELER après chaque retour non terminal ; un timeout pendant que "
+            "la tentative continue impose de rappeler immédiatement, jamais de répondre. Rappel : "
+            "`completed` (exit 0) ne valide jamais la mission : le job terminal exit 0 passe la mission "
+            "en needs_validation (inspectez agent_job_get/output/events puis agent_mission_validate), "
+            "sinon incomplete. Aucun retry automatique. Validez avec agent_mission_validate ; ne "
+            "confondez jamais completed avec validated."
         ),
     )
     async def agent_mission_create(
@@ -231,9 +268,10 @@ def register(mcp, store: Store) -> None:
         timeout_s: Annotated[int | None, Field(description="Durée max par tentative (30..14400).")] = None,
         prompt: Annotated[str | None, Field(description="Prompt de la 1re tentative (défaut = objectif).")] = None,
         idempotency_key: Annotated[str | None, Field(description="Clé unique (8..128 car.).")] = None,
+        fire_and_forget: Annotated[bool, Field(description="true = l'utilisateur demande explicitement à ne PAS attendre le résultat ; le contrat de suivi ne s'applique pas. Défaut false.")] = False,
     ) -> dict:
         try:
-            return await anyio.to_thread.run_sync(
+            m = await anyio.to_thread.run_sync(
                 lambda: store.create_mission(
                     objective, acceptance_criteria, max_attempts, runner_id, runtime,
                     workspace_id, mode, timeout_s, prompt, idempotency_key,
@@ -241,6 +279,19 @@ def register(mcp, store: Store) -> None:
             )
         except BrokerError as exc:
             return _err(exc)
+        if "error" not in m and m.get("current_job_id"):
+            seq = await anyio.to_thread.run_sync(store._last_seq, m["current_job_id"])
+            follow = follow_for_job(m.get("current_job", {}).get("state", "queued"), seq)
+            if fire_and_forget:
+                follow["must_follow"] = False
+                follow["should_continue"] = False
+            follow["next_tool"] = "agent_mission_wait" if follow["should_continue"] else follow["next_tool"]
+            m["follow_up"] = follow
+            m["should_continue"] = follow["should_continue"]
+            m["next_tool"] = follow["next_tool"]
+            m["since_seq"] = follow["since_seq"]
+            m["until"] = follow["until"]
+        return m
 
     @mcp.tool(
         name="agent_mission_get",
@@ -251,6 +302,30 @@ def register(mcp, store: Store) -> None:
     ) -> dict:
         m = await anyio.to_thread.run_sync(store.get_mission, mission_id)
         return m if m is not None else {"error": "unknown_mission", "mission_id": mission_id}
+
+    @mcp.tool(
+        name="agent_mission_wait",
+        description=(
+            "Attend la tentative COURANTE d'une mission (borné ≤ 60 s, même sémantique que "
+            "agent_job_wait, pas un fond de tâche : réveil pendant un tour ChatGPT actif). Retour "
+            "machine-lisible : mission_state, job_state, woke_by, terminal (tentative figée ou non), "
+            "should_continue/must_follow, next_tool (agent_mission_wait tant que executing non "
+            "terminal ; agent_mission_validate quand needs_validation/incomplete/blocked — inspectez "
+            "d'abord agent_job_get / agent_job_output / agent_job_events puis validez : completed exit "
+            "0 ≠ validated), since_seq/last_event_seq (curseur), until=terminal. RÈGLE : tant que "
+            "should_continue=true — Y COMPRIS woke_by=timeout — RAPPELER agent_mission_wait avec "
+            "since_seq=last_event_seq dans le MÊME tour, sans répondre à l'utilisateur. Ne répondez "
+            "qu'après mission terminale validée (ou blocage réel : waiting_for_user, entrée requise, "
+            "failed/timeout/cancelled/lost à remonter explicitement)."
+        ),
+    )
+    async def agent_mission_wait(
+        mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
+        timeout_s: Annotated[float, Field(description="Attente max en secondes (0..60, défaut 25).")] = 25,
+        since_seq: Annotated[int, Field(description="Seq d'événement du job courant déjà connu (-1 = aucun).")] = -1,
+    ) -> dict:
+        res = await anyio.to_thread.run_sync(store.wait_for_mission, mission_id, since_seq, timeout_s)
+        return res if res is not None else {"error": "unknown_mission", "mission_id": mission_id}
 
     @mcp.tool(
         name="agent_mission_retry",
@@ -380,6 +455,7 @@ def register(mcp, store: Store) -> None:
 
 TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_get", "agent_job_output", "agent_job_list",
                         "agent_job_events", "agent_runner_inspect", "agent_job_wait", "agent_mission_get",
+                        "agent_mission_wait",
                         "infra_alert_list", "infra_alert_get", "agent_question_list", "agent_question_get"})
 TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel",
                          "agent_mission_create", "agent_mission_retry", "agent_mission_validate",
