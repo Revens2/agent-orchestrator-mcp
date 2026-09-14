@@ -240,6 +240,31 @@ Aucune réponse ne devient une commande shell (texte ≤500 car. stocké, relu �
 la prochaine activité de LA session émettrice). Allowlist Photon vérifiée à la
 réception par Hermes/Photon ; purge 7 j des réponses.
 
+## Runner Hermes (hermes-vps)
+
+Le runtime `hermes` n'utilise pas `orch_runner` : il est servi sur vps-etude par
+`deploy/hermes-poller/poller_v2.py` (unité `hermes-orch-poller.service`,
+`User=hermes-ops`, source live `/var/lib/hermes-ops/orch-poller-v2/`, journal
+`/var/lib/hermes-ops/orch-jobs/{poller.db,runs/,health.json}`). Invocation :
+`docker exec -i hermes hermes chat --query-file - -Q --yolo --accept-hooks
+--pass-session-id` (prompt sur stdin, stdout+stderr -> `runs/<job8>.log`,
+publiés en events `output` ; télémétrie `pid`/`proc_alive` à plat).
+
+```bash
+# deploiement (backup + remplacement atomique)
+B=/var/backups/hermes-poller-$(date +%Y%m%d-%H%M%S); sudo mkdir -p $B
+sudo cp -a /var/lib/hermes-ops/orch-poller-v2/poller_v2.py $B/
+sudo install -o hermes-ops -g hermes-ops -m 644 poller_v2.py /var/lib/hermes-ops/orch-poller-v2/poller_v2.py.new
+sudo mv /var/lib/hermes-ops/orch-poller-v2/poller_v2.py.new /var/lib/hermes-ops/orch-poller-v2/poller_v2.py
+sudo systemctl restart hermes-orch-poller && journalctl -u hermes-orch-poller -n 3  # "hello ok"
+# rollback
+sudo cp -a $B/poller_v2.py /var/lib/hermes-ops/orch-poller-v2/ && sudo systemctl restart hermes-orch-poller
+```
+
+Symptôme v2.0 corrigé en 2.1 : job bloqué `running` jusqu'au timeout avec
+`pid`/`runtime_session_id` null et `output_chars=0` alors que `runs/<job8>.log`
+contient la réponse (enfant zombie vu vivant par `os.kill(pid, 0)`).
+
 ## Logs
 
 - VPS : `journalctl -u orch-mcp -u orch-gateway` (transitions `job_transition job_id=…`, `runner_connected`,
