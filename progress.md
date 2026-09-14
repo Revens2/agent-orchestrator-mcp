@@ -114,3 +114,22 @@ sans `should_continue`, indistinguable d'une fin).
   `e2e/e2e_matrix_local.py` → **42/42 PASS** (36 antérieurs + 6 follow-through :
   start→follow, timeout→recall, waits répétés, mission_create→mission_wait,
   mission_wait sur validée, fire-and-forget).
+
+## Déploiement prod follow-through (VPS, 2026-09-14 ~12:20 UTC)
+
+- Commit déployé : `8e39297` (rebasé sur `df6040f` hermes) ; tarball `src/`+`deploy/`
+  md5 vérifié (`2d6b3d39…`, md5 `store.py`/`tools.py` identiques local/VPS).
+- Backups : `/root/orch-src-bak-20260914002906` (pré-déploiement, rollback),
+  `/root/orch-src-bak-*-follow` (post), `/root/orch-db-bak-*-follow.sqlite`
+  (via `/tmp` + `mv`, le `.backup` direct vers `/root` étant refusé à orch-app).
+  Rollback : recopier le backup pré-déploiement + `restart orch-mcp orch-gateway`.
+- Aucune migration DB (additif pur) ; runner PC inchangé (aucun code runner touché).
+- `systemctl restart orch-mcp orch-gateway` : `/health` ok des deux côtés.
+- Garde-fou : 1 job `running` live (`e2bed851`, cette mission, opencode/e2e) —
+  vérifié toujours `running` après restart (bail 60 s, aucun job tué).
+- Fixture live via MCP (loopback, lecture seule, aucun job créé) :
+  `tools/list` contient `agent_mission_wait` ; `agent_job_wait` sur job `failed`
+  `9dc5076e` → `woke_by=terminal`, `terminal=true`, `should_continue=false`,
+  `next_tool=agent_job_get` ; `agent_mission_wait` fantôme → `unknown_mission` propre.
+- Rebase : remote avait avancé (`87000ea` sync live, `df6040f` hermes RuntimeT) —
+  rebase sans conflit, tests relancés, push `8e39297` sur `main` (pas de force push).
