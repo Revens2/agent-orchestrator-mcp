@@ -32,8 +32,9 @@ log = logging.getLogger("orch_mcp")
 
 INSTRUCTIONS = (
     "Orchestrateur d'agents IA personnels (≠ MCP Astra). Lance de vrais agents existants "
-    "(Claude Code, Codex, Antigravity, OpenCode) sur le PC Windows autorisé, dans des workspaces "
-    "allowlistés. Flux : agent_runner_list -> agent_workspace_list -> agent_job_start (asynchrone, "
+    "(Claude Code, Claude Desktop via profil isolé claude-desktop, Codex, Antigravity, OpenCode) "
+    "sur le PC Windows autorisé, dans des workspaces allowlistés. Flux : agent_runner_list -> "
+    "agent_workspace_list -> agent_job_start (asynchrone, "
     "contrat de suivi : rappeler agent_job_wait jusqu'à terminal=true dans le même tour) "
     "-> agent_job_get/output/events jusqu'à un état terminal. Missions : agent_mission_create -> "
     "agent_mission_wait en boucle -> agent_mission_validate (completed exit 0 ≠ validated). "
@@ -44,9 +45,52 @@ INSTRUCTIONS = (
 def build_app(store: Store, runner_auth: RunnerAuth, reaper_interval_s: float = 5.0):
     from mcp.server.mcpserver import MCPServer
 
+    from orch_mcp.tools import set_request_origin
+
     mcp = MCPServer("agent-orchestrator", version=pkg_version("mcp"), instructions=INSTRUCTIONS)
     tools.register(mcp, store)
     mcp_app = mcp.streamable_http_app(stateless_http=True)
+
+    class _OriginMiddleware:
+        """Capte l'identité MCP réellement observable (posée par la gateway :
+        `x-orch-mcp-acteur` = client_id, `x-orch-mcp-mode` = cli/oauth) dans une
+        ContextVar lue par agent_job_start/mission_create. Boucle locale directe
+        => (None, None). Borné, jamais de secret, jamais bloquant."""
+
+        def __init__(self, app) -> None:
+            self.app = app
+
+        @property
+        def router(self):
+            return self.app.router
+
+        async def __call__(self, scope, receive, send):
+            token = None
+            try:
+                if scope.get("type") == "http":
+                    raw = {
+                        k.decode("latin-1").lower(): v.decode("latin-1")
+                        for k, v in scope.get("headers", [])
+                    }
+                    actor = (raw.get("x-orch-mcp-acteur") or "").strip()[:128] or None
+                    mode = (raw.get("x-orch-mcp-mode") or "").strip()[:32] or None
+                    if mode not in (None, "cli", "oauth"):
+                        mode = None
+                    token = set_request_origin(actor, mode)
+            except Exception:  # noqa: BLE001 - audit best-effort
+                token = None
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                try:
+                    if token is not None:
+                        from orch_mcp.tools import _request_origin
+
+                        _request_origin.reset(token)
+                except Exception:  # noqa: BLE001 - reset best-effort, jamais bloquant
+                    log.debug("origin_reset_failed")
+
+    mcp_app = _OriginMiddleware(mcp_app)
     state = {"last_reap": 0.0, "last_purge": 0.0}
 
     async def health(_: Request) -> JSONResponse:

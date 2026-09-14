@@ -109,7 +109,17 @@ CREATE TABLE IF NOT EXISTS jobs (
   runtime_session_id TEXT,
   output_chars INTEGER NOT NULL DEFAULT 0,
   output_chunks INTEGER NOT NULL DEFAULT 0,
-  output_truncated INTEGER NOT NULL DEFAULT 0
+  output_truncated INTEGER NOT NULL DEFAULT 0,
+  -- Traçabilité d'origine (additif, NULL = non transmis/non observable) :
+  -- actor/mode = identité MCP réellement observée (gateway client_id + cli/oauth),
+  -- label/conversation = corrélation optionnelle fournie par le client.
+  -- Limite connue : si le client (ChatGPT) ne transmet ni conversation/chat ID
+  -- ni label, une conversation précise n'est pas retrouvable après coup —
+  -- on n'invente rien, on stocke seulement l'observable.
+  origin_actor TEXT,
+  origin_mode TEXT,
+  origin_label TEXT,
+  conversation_id TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, runner_id, created_at);
 CREATE TABLE IF NOT EXISTS events (
@@ -311,6 +321,15 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_suspect_at REAL")
             if "stall_at" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
+            # Traçabilité d'origine (additif, NULL = non observé ; rollback = ancien src).
+            if "origin_actor" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN origin_actor TEXT")
+            if "origin_mode" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN origin_mode TEXT")
+            if "origin_label" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN origin_label TEXT")
+            if "conversation_id" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN conversation_id TEXT")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -539,6 +558,14 @@ class Store:
             return out
 
     # ------------------------------------------------------------------- jobs
+    @staticmethod
+    def _origin_value(value: object, limit: int) -> str | None:
+        """Normalise un champ d'origine (actor/mode/label/conversation) : borné,
+        redacté, None si absent. Jamais de secret stocké (redact) ni d'invention."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return P.clip(redact(value.strip()), limit)
+
     def create_job(
         self,
         runner_id: str,
@@ -548,9 +575,17 @@ class Store:
         mode: str,
         timeout_s: int | None = None,
         idempotency_key: str | None = None,
+        origin_actor: str | None = None,
+        origin_mode: str | None = None,
+        origin_label: str | None = None,
+        conversation_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Crée un job `queued`. Retourne (job, created). Refuse avant toute exécution
-        si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé."""
+        si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé.
+        Origine additive et optionnelle (rétrocompatible) : actor/mode réellement
+        observés (gateway client_id + cli/oauth), label/conversation fournis par le
+        client s'il les transmet. Absents => NULL (non retrouvable après coup :
+        limite documentée, rien n'est inventé)."""
         if not P.valid_id(runner_id):
             raise BrokerError("invalid_runner", "runner_id invalide")
         if runtime not in P.RUNTIMES:
@@ -572,6 +607,10 @@ class Store:
         req_hash = hashlib.sha256(
             json.dumps([runner_id, runtime, workspace_id, mode, timeout_s, prompt], ensure_ascii=False).encode()
         ).hexdigest()
+        actor = self._origin_value(origin_actor, 128)
+        omode = self._origin_value(origin_mode, 32)
+        olabel = self._origin_value(origin_label, 256)
+        conv = self._origin_value(conversation_id, 128)
         now = self.clock()
         with self._tx() as db:
             if idempotency_key:
@@ -594,12 +633,14 @@ class Store:
             job_id = str(uuid.uuid4())
             db.execute(
                 """INSERT INTO jobs(id, runner_id, runtime, workspace_id, mode, prompt, prompt_chars, idem_key, idem_hash,
-                     state, timeout_s, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     state, timeout_s, created_at, updated_at,
+                     origin_actor, origin_mode, origin_label, conversation_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job_id, runner_id, runtime, workspace_id, mode, prompt, len(prompt), idempotency_key, req_hash,
-                 P.QUEUED, timeout_s, now, now),
+                 P.QUEUED, timeout_s, now, now,
+                 actor, omode, olabel, conv),
             )
-            self._log_transition(db, job_id, None, P.QUEUED, "mcp")
+            self._log_transition(db, job_id, None, P.QUEUED, f"mcp:{actor}" if actor else "mcp")
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             return self._job_view(row), True
 
@@ -890,6 +931,8 @@ class Store:
                 "finished_at": _iso(r["finished_at"]),
                 "exit_code": r["exit_code"],
                 "last_activity": r["last_activity"],
+                "origin_actor": _col(r, "origin_actor"),
+                "conversation_id": _col(r, "conversation_id"),
             }
             for r in rows
         ]
@@ -1033,10 +1076,15 @@ class Store:
         timeout_s: int | None = None,
         prompt: str | None = None,
         idempotency_key: str | None = None,
+        origin_actor: str | None = None,
+        origin_mode: str | None = None,
+        origin_label: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Crée une mission + sa première tentative (un job). `completed` (exit 0)
         ne valide JAMAIS la mission : le job terminal exit 0 passe la mission en
-        `needs_validation`, tout autre terminal en `incomplete`. Aucun retry auto."""
+        `needs_validation`, tout autre terminal en `incomplete`. Aucun retry auto.
+        Origine additive propagée au job (mêmes règles que create_job)."""
         if not isinstance(objective, str) or not objective.strip() or len(objective) > P.MAX_OBJECTIVE_CHARS:
             raise BrokerError("invalid_objective", f"objectif requis (1..{P.MAX_OBJECTIVE_CHARS} car.)")
         if (
@@ -1049,7 +1097,11 @@ class Store:
         if not 1 <= max_attempts <= P.MAX_MISSION_ATTEMPTS:
             raise BrokerError("invalid_max_attempts", f"max_attempts 1..{P.MAX_MISSION_ATTEMPTS}")
         first_prompt = prompt if isinstance(prompt, str) and prompt.strip() else objective
-        job, _ = self.create_job(runner_id, runtime, workspace_id, first_prompt, mode, timeout_s, idempotency_key)
+        job, _ = self.create_job(
+            runner_id, runtime, workspace_id, first_prompt, mode, timeout_s, idempotency_key,
+            origin_actor=origin_actor, origin_mode=origin_mode,
+            origin_label=origin_label, conversation_id=conversation_id,
+        )
         now = self.clock()
         mission_id = str(uuid.uuid4())
         with self._tx() as db:
@@ -1603,6 +1655,13 @@ class Store:
                 "started_at": _iso(row["proc_started_at"]),
                 "child_process_count": children,
             },
+            # --- origine de la création (additif, NULL = non transmis/non observable).
+            # Limite : sans conversation/chat ID transmis par le client, une
+            # conversation ChatGPT précise n'est pas retrouvable après coup.
+            "origin_actor": _col(row, "origin_actor"),
+            "origin_mode": _col(row, "origin_mode"),
+            "origin_label": _col(row, "origin_label"),
+            "conversation_id": _col(row, "conversation_id"),
         }
         return view
 
@@ -1839,3 +1898,11 @@ def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+
+
+def _col(row: Any, name: str) -> Any:
+    """Lecture tolérante d'une colonne additive (bases pré-migration) : None si absente."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None

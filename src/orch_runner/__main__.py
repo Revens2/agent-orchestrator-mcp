@@ -63,8 +63,13 @@ def main(argv: list[str] | None = None) -> int:
     from orch_runner.runner import Runner
 
     if args.command == "probe":
+        import threading as _th
+
         info = Runner.__new__(Runner)
         info.config = cfg
+        info.lock = _th.RLock()
+        info._retry = {}
+        info._refresh_thread = None
         print(json.dumps(Runner.info(info), indent=1, ensure_ascii=False))
         return 0
 

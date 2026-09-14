@@ -59,7 +59,10 @@ def transition_allowed(src: str, dst: str) -> bool:
 
 
 # --- runtimes / modes ----------------------------------------------------
-RUNTIMES = ("claude-code", "codex", "agy", "opencode", "fake", "hermes")
+# claude-desktop = second compte Claude (celui utilisé dans Claude Desktop/MSIX),
+# piloté via un profil Claude Code CLI ISOLÉ (CLAUDE_CONFIG_DIR distinct).
+# Jamais d'automatisation GUI MSIX : même binaire que claude-code, auth séparée.
+RUNTIMES = ("claude-code", "claude-desktop", "codex", "agy", "opencode", "fake", "hermes")
 MODES = ("read_only", "workspace_write")
 # politique locale du runner (jamais fournie par le broker/MCP)
 UNATTENDED, GUARDED = "unattended", "guarded"

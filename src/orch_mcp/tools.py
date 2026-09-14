@@ -7,7 +7,7 @@ traité comme une donnée. Ce serveur n'est PAS le MCP Astra.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import anyio
 from pydantic import Field
@@ -15,7 +15,35 @@ from pydantic import Field
 import orch_protocol as P
 from orch_mcp.store import BrokerError, Store, follow_for_job
 
-RuntimeT = Literal["claude-code", "codex", "agy", "opencode", "fake", "hermes"]
+RuntimeT = Literal["claude-code", "claude-desktop", "codex", "agy", "opencode", "fake", "hermes"]
+
+# Origine MCP réellement observable, posée par le middleware Starlette de
+# orch_mcp.server (en-têtes relayés par la gateway : x-orch-mcp-acteur =
+# client_id OAuth/CLI, x-orch-mcp-mode = cli/oauth). ContextVar (pas de global)
+# : chaque requête HTTP porte la sienne ; hors HTTP (tests directs) => None.
+# Jamais de secret ici (client_id + mode seuls, bornés).
+import contextvars as _cv
+
+_request_origin: _cv.ContextVar[tuple[str | None, str | None]] = _cv.ContextVar(
+    "orch_request_origin", default=(None, None)
+)
+
+
+def set_request_origin(actor: str | None, mode: str | None) -> Any:
+    """Pose l'origine pour la requête courante (middleware). Retourne le token
+    de reset (le middleware le restaure après la requête)."""
+    actor = (actor.strip()[:128] or None) if isinstance(actor, str) else None
+    mode = (mode.strip()[:32] or None) if isinstance(mode, str) else None
+    if mode not in (None, "cli", "oauth"):
+        mode = None
+    return _request_origin.set((actor, mode))
+
+
+def _current_request_origin() -> tuple[str | None, str | None]:
+    try:
+        return _request_origin.get()
+    except Exception:  # noqa: BLE001 - audit best-effort, jamais bloquant
+        return None, None
 ModeT = Literal["read_only", "workspace_write"]
 StateT = Literal["queued", "claimed", "starting", "running", "completed", "failed", "timeout", "cancelled", "lost"]
 AlertSourceT = Literal["etude", "nexus"]
@@ -41,8 +69,8 @@ def register(mcp, store: Store) -> None:
         description=(
             "Liste les PC runners de l'orchestrateur d'agents IA personnel, leur présence réelle "
             "(online si heartbeat < 30 s, sinon offline), les runtimes d'agents disponibles "
-            "(claude-code, codex, agy, opencode) et le nombre de jobs actifs. À appeler avant "
-            "agent_job_start."
+            "(claude-code, claude-desktop [second compte, profil isolé], codex, agy, opencode) "
+            "et le nombre de jobs actifs. À appeler avant agent_job_start."
         ),
     )
     async def agent_runner_list() -> dict:
@@ -75,7 +103,8 @@ def register(mcp, store: Store) -> None:
     @mcp.tool(
         name="agent_job_start",
         description=(
-            "Lance un agent IA existant (Claude Code, Codex, Antigravity/agy ou OpenCode) sur le PC "
+            "Lance un agent IA existant (Claude Code, Claude Desktop via profil isolé claude-desktop, "
+            "Codex, Antigravity/agy ou OpenCode) sur le PC "
             "personnel autorisé, dans un workspace allowlisté, avec un prompt. Retourne IMMÉDIATEMENT "
             "un job asynchrone (job_id, state=queued) SANS attendre la fin, PLUS un bloc de suivi "
             "machine-lisible (must_follow, terminal, should_continue, next_tool=agent_job_wait, "
@@ -104,10 +133,17 @@ def register(mcp, store: Store) -> None:
         timeout_s: Annotated[int | None, Field(description="Durée max en secondes (30..14400, défaut 3600).")] = None,
         idempotency_key: Annotated[str | None, Field(description="Clé unique (8..128 car.) pour dédupliquer les retries.")] = None,
         fire_and_forget: Annotated[bool, Field(description="true = l'utilisateur demande explicitement à ne PAS attendre le résultat (lance-et-oublie) ; le contrat de suivi ne s'applique pas. Défaut false.")] = False,
+        source_label: Annotated[str | None, Field(description="Libellé de corrélation optionnel (ex. titre/ID de conversation transmis par le client ; stocké tel quel, borné). Absent = non retrouvable après coup.")] = None,
+        conversation_id: Annotated[str | None, Field(description="ID de conversation/chat optionnel si le client le transmet (jamais obligatoire, jamais inventé).")] = None,
     ) -> dict:
         try:
+            _actor, _mode = _current_request_origin()
             job, created = await anyio.to_thread.run_sync(
-                lambda: store.create_job(runner_id, runtime, workspace_id, prompt, mode, timeout_s, idempotency_key)
+                lambda: store.create_job(
+                    runner_id, runtime, workspace_id, prompt, mode, timeout_s, idempotency_key,
+                    origin_actor=_actor, origin_mode=_mode,
+                    origin_label=source_label, conversation_id=conversation_id,
+                )
             )
         except BrokerError as exc:
             return _err(exc)
@@ -269,12 +305,17 @@ def register(mcp, store: Store) -> None:
         prompt: Annotated[str | None, Field(description="Prompt de la 1re tentative (défaut = objectif).")] = None,
         idempotency_key: Annotated[str | None, Field(description="Clé unique (8..128 car.).")] = None,
         fire_and_forget: Annotated[bool, Field(description="true = l'utilisateur demande explicitement à ne PAS attendre le résultat ; le contrat de suivi ne s'applique pas. Défaut false.")] = False,
+        source_label: Annotated[str | None, Field(description="Libellé de corrélation optionnel (stocké, borné).")] = None,
+        conversation_id: Annotated[str | None, Field(description="ID de conversation/chat optionnel si le client le transmet (jamais obligatoire).")] = None,
     ) -> dict:
         try:
+            _actor, _mode = _current_request_origin()
             m = await anyio.to_thread.run_sync(
                 lambda: store.create_mission(
                     objective, acceptance_criteria, max_attempts, runner_id, runtime,
                     workspace_id, mode, timeout_s, prompt, idempotency_key,
+                    origin_actor=_actor, origin_mode=_mode,
+                    origin_label=source_label, conversation_id=conversation_id,
                 )
             )
         except BrokerError as exc:

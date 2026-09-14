@@ -13,6 +13,19 @@ default_permission_policy = "unattended"
 enabled = true
 exe = 'C:\Users\<user>\.local\bin\claude.exe'
 
+# Second compte Claude (celui utilisé dans Claude Desktop/MSIX) via un profil
+# CLI ISOLÉ — jamais d'automatisation GUI MSIX. Même binaire que claude-code,
+# auth séparée dans CLAUDE_CONFIG_DIR distinct (défaut : %USERPROFILE%\.claude-desktop).
+# 1) laisser enabled = false tant que le profil n'est pas connecté ;
+# 2) connecter UNE fois : $env:CLAUDE_CONFIG_DIR="$env:USERPROFILE\.claude-desktop" ; claude auth login
+#    (avec le compte Desktop ; le CLI existant ~/.claude reste intact, aucun token copié) ;
+# 3) passer à enabled = true puis relancer la tâche orch-runner.
+# config_dir explicite (optionnel, même effet que le défaut) :
+[runtimes.claude-desktop]
+enabled = false
+exe = 'C:\Users\<user>\.local\bin\claude.exe'
+# config_dir = 'C:\Users\<user>\.claude-desktop'
+
 [runtimes.codex]
 enabled = true
 exe = 'C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe'

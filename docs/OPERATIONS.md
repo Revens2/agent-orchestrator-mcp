@@ -65,9 +65,28 @@ workspace reste le verrou le plus fort.
 | Runtime | Prompt | read_only | workspace_write `unattended` | workspace_write `guarded` | Limite connue |
 |---|---|---|---|---|---|
 | claude-code | stdin | `--permission-mode plan --permission-prompts none` | `--permission-mode bypassPermissions` | `--permission-mode acceptEdits --permission-prompts none` | charge settings/hooks/MCP utilisateur |
+| claude-desktop | stdin (mêmes flags que claude-code) | idem claude-code | idem claude-code | idem claude-code | profil CLI isolé (`CLAUDE_CONFIG_DIR`, défaut `~/.claude-desktop`) ; jamais de GUI MSIX |
 | codex | stdin | `-s read-only -c approval_policy="never"` | `-s danger-full-access -c approval_policy="never"` | `-s workspace-write -c approval_policy="never"` | sandbox + approbation toujours explicites (jamais `config.toml`) |
 | agy | `--print=` | `--mode plan --sandbox` | `--mode accept-edits --dangerously-skip-permissions` | `--mode accept-edits --sandbox` | workspace via `--add-dir` + prompt : pas de confinement strict du dossier |
 | opencode | argv après `--` | `--agent plan` | `--agent build --auto` | refusé | `-m` épinglé par `model` ; `--auto` n'honore que les `deny` explicites de la config opencode |
+
+### Claude Desktop (second compte, profil isolé)
+
+Le compte CLI (`~/.claude`, ex. `claude-code`) et le compte Desktop (MSIX interactif)
+sont réellement distincts. Desktop ne s'automatise PAS (pas d'interface headless) :
+le runtime `claude-desktop` pilote le **même binaire `claude.exe`** avec un
+**profil CLI isolé** (`CLAUDE_CONFIG_DIR`, défaut `%USERPROFILE%\.claude-desktop`),
+à connecter avec le compte utilisé dans Desktop.
+
+- Jamais de copie/extraction des tokens/cookies Desktop, jamais de logout du CLI existant.
+- Probe : `--version` puis `claude auth status` (JSON, seul `loggedIn` lu, email/org
+  ignorés) dans le profil isolé. Non connecté → `available=false`,
+  `reason=auth_required: … claude auth login …` (action interactive à faire à la main).
+- `runner.toml` : voir `deploy/windows/runner.toml.example` (`[runtimes.claude-desktop]`,
+  `enabled=false` tant que non connecté, `config_dir` optionnel). Le re-probe borné
+  (backoff) remonte le runtime automatiquement après le login + relance du runner.
+- Injection : l'adapter ajoute `CLAUDE_CONFIG_DIR` au seul environnement enfant
+  (`Launch.env_extra`), sans toucher à l'environnement du runner.
 
 ### OpenCode
 
@@ -199,6 +218,20 @@ prod CI → relecture utilisateur requise avant merge).
 la lecture, aucune migration, identités ConvIA intactes). Seul OpenCode pose un
 titre natif (`opencode run --title`, via le runner). Claude/Codex/AGY n'offrent
 aucun mécanisme headless : fallback `display_title` broker uniquement.
+
+## Origine des jobs (audit, additif)
+
+Chaque création (`agent_job_start`, `agent_mission_create`) stocke, quand c'est
+réellement observable, `origin_actor` (client_id gateway : OAuth ou
+`orch-cli-statique`), `origin_mode` (`cli`/`oauth`), plus `origin_label` et
+`conversation_id` optionnels transmis par le client. Exposés en lecture
+(`agent_job_get`, `agent_job_list`) ; transition initiale `queued` loggée
+`mcp:<actor>` (sinon `mcp`). Colonnes NULL = non transmis/non observable ;
+migration additive, rétrocompatible (aucun champ obligatoire).
+
+Limite assumée : si le client (ChatGPT Web) ne transmet ni conversation/chat ID
+ni label, une conversation précise n'est PAS retrouvable après coup — le broker
+n'invente rien (pas de devinette d'ID, pas de corrélation implicite).
 
 ## Session OpenCode corrompue (reprise)
 

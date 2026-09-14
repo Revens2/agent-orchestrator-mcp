@@ -93,6 +93,63 @@ def _json(line: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+# Profil CLI isolé pour le second compte Claude (celui de Claude Desktop).
+# Dossier par défaut hors AppData (les apps MSIX virtualisent AppData\Local) :
+# le CLI existant (~/.claude) n'est jamais touché, aucun token copié.
+DESKTOP_DEFAULT_DIRNAME = ".claude-desktop"
+# Commande réellement supportée par le CLI installé pour l'état d'auth
+# (vérifié : `claude auth status` sort du JSON avec `loggedIn`, exit 1 si non
+# connecté ; `claude auth login` = flow interactif, jamais lancé par le runner).
+_CLAUDE_AUTH_STATUS_ARGS = ["auth", "status"]
+
+
+def _claude_config_dir(extra: dict | None) -> str | None:
+    """Dossier de profil isolé demandé via la config runner (runner.toml).
+    Clés acceptées : `config_dir` (canonique) ou `claude_config_dir` (alias).
+    Retourne None = profil ambient (~/.claude). Jamais de secret lu ici."""
+    if not isinstance(extra, dict):
+        return None
+    for key in ("config_dir", "claude_config_dir", "CLAUDE_CONFIG_DIR"):
+        val = extra.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _default_desktop_config_dir() -> str:
+    return str(Path.home() / DESKTOP_DEFAULT_DIRNAME)
+
+
+def _claude_auth_logged_in(exe: str, config_dir: str | None) -> tuple[bool | None, str | None]:
+    """État d'auth via `claude auth status` (JSON). Retourne (logged_in, error).
+    logged_in True/False si le JSON est lisible, None si non observable
+    (binaire en échec, timeout, JSON illisible). Ne lit aucun secret : seul le
+    booléen `loggedIn` est interprété (email/org ignorés)."""
+    import json as _json
+
+    env = None
+    if config_dir:
+        env = dict(__import__("os").environ)
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    try:
+        out = subprocess.run(
+            [exe, *_CLAUDE_AUTH_STATUS_ARGS], capture_output=True, text=True, timeout=20,
+            creationflags=0x08000000, encoding="utf-8", errors="replace", env=env,
+        )
+    except Exception as exc:  # noqa: BLE001 - probe best-effort
+        return None, type(exc).__name__
+    blob = (out.stdout or "").strip()
+    if not blob:
+        return None, "auth_status_empty"
+    try:
+        data = _json.loads(blob)
+    except ValueError:
+        return None, "auth_status_unparsable"
+    if not isinstance(data, dict) or "loggedIn" not in data:
+        return None, "auth_status_unexpected"
+    return bool(data.get("loggedIn")), None
+
+
 class ClaudeCode(Adapter):
     """`claude -p` ; prompt sur stdin ; stream-json (NDJSON) ; fin = message `result`."""
 
@@ -109,11 +166,40 @@ class ClaudeCode(Adapter):
         super().__init__(exe, extra, policy)
         self.result: dict | None = None
 
+    def config_dir(self) -> str | None:
+        """Dossier CLAUDE_CONFIG_DIR runtime-specific, ou None (ambient)."""
+        return _claude_config_dir(self.extra)
+
+    def _env_extra(self) -> dict[str, str]:
+        cfg = self.config_dir()
+        return {"CLAUDE_CONFIG_DIR": cfg} if cfg else {}
+
+    def probe(self) -> dict[str, Any]:
+        info = super().probe()
+        cfg = self.config_dir()
+        if cfg:
+            # Profil isolé demandé : l'exe seul ne suffit pas, l'auth doit être prête.
+            if not info.get("available"):
+                return info
+            logged_in, err = _claude_auth_logged_in(self.exe, cfg)
+            if logged_in is True:
+                info["profile"] = "isolated"
+                return info
+            info["available"] = False
+            info["reason"] = (
+                "auth_required: profil CLI isolé non connecté "
+                f"(CLAUDE_CONFIG_DIR={cfg}) — connecter avec le compte voulu via "
+                "`claude auth login` dans ce profil (jamais de copie de tokens, CLI existant intact)"
+                if logged_in is False else
+                f"auth_unverifiable: état d'auth non observable ({err or 'inconnu'})"
+            )
+        return info
+
     def build(self, prompt, mode, cwd, tmpdir):
         argv = [self.exe, "-p", "--output-format", "stream-json", "--verbose", *self.MODE[self.policy][mode]]
         if self.extra.get("max_budget_usd"):
             argv += ["--max-budget-usd", str(float(self.extra["max_budget_usd"]))]
-        return Launch(argv, prompt)
+        return Launch(argv, prompt, self._env_extra())
 
     def on_line(self, line):
         data = _json(line)
@@ -344,6 +430,43 @@ class OpenCode(Adapter):
         return Outcome(ok, self.last_text, None if ok else (f"exit code {exit_code}" + (f", {error}" if error else "")))
 
 
+class ClaudeDesktop(ClaudeCode):
+    """Second compte Claude (celui utilisé dans Claude Desktop/MSIX) via un profil
+    Claude Code CLI ISOLÉ (`CLAUDE_CONFIG_DIR` distinct, défaut `~/.claude-desktop`).
+
+    Sémantique obligatoire : PAS d'automatisation GUI MSIX (Desktop est interactif
+    et n'expose pas d'interface headless). Même binaire et mêmes flags que
+    claude-code, seule l'auth diffère (profil isolé à connecter avec le compte
+    Desktop). Ne copie/extrait jamais les tokens Desktop, ne logout jamais le
+    CLI existant (~/.claude intact).
+    """
+
+    id = "claude-desktop"
+
+    def config_dir(self) -> str | None:
+        return _claude_config_dir(self.extra) or _default_desktop_config_dir()
+
+    def probe(self) -> dict[str, Any]:
+        info = Adapter.probe(self)
+        if not info.get("available"):
+            return info
+        cfg = self.config_dir() or ""
+        logged_in, err = _claude_auth_logged_in(self.exe, cfg)
+        if logged_in is True:
+            info["profile"] = "isolated-desktop"
+            return info
+        info["available"] = False
+        if logged_in is False:
+            info["reason"] = (
+                "auth_required: profil Desktop isolé non connecté "
+                f"(CLAUDE_CONFIG_DIR={cfg}) — lancer `claude auth login` avec le compte "
+                "utilisé dans Claude Desktop (profil CLI existant intact, aucun token copié)"
+            )
+        else:
+            info["reason"] = f"auth_unverifiable: état d'auth non observable ({err or 'inconnu'})"
+        return info
+
+
 class Fake(Adapter):
     """Fixture de test : `python fake_agent.py`, script piloté par le prompt (stdin)."""
 
@@ -365,4 +488,4 @@ class Fake(Adapter):
         return line, line.strip()[:120] or None
 
 
-ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, Codex, Agy, OpenCode, Fake)}
+ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, ClaudeDesktop, Codex, Agy, OpenCode, Fake)}

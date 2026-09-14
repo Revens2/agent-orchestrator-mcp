@@ -1,7 +1,7 @@
 # agent-orchestrator-mcp
 
 MCP distant qui permet à ChatGPT Web de lancer, suivre et annuler de **vrais agents IA existants**
-(Claude Code, Codex, Antigravity, OpenCode) sur un PC Windows personnel, sans exposer de shell distant.
+(Claude Code, Claude Desktop via profil isolé, Codex, Antigravity, OpenCode) sur un PC Windows personnel, sans exposer de shell distant.
 
 ```text
 ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)──┐
@@ -14,9 +14,9 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
                                                                             ▲
                          nginx 10.200.114.203:8803      /runner/v1/* — IP NetBird uniquement
                                                                             │ long-poll SORTANT
-                         PC Windows : orch-runner (tâche planifiée, session utilisateur)
-                           └─ Job Object ─▶ claude.exe / codex.exe / agy.exe / opencode.exe
-                                             dans un workspace allowlisté
+                          PC Windows : orch-runner (tâche planifiée, session utilisateur)
+                            └─ Job Object ─▶ claude.exe (+ profil isolé claude-desktop) / codex.exe / agy.exe / opencode.exe
+                                              dans un workspace allowlisté
 ```
 
 ## Principes
