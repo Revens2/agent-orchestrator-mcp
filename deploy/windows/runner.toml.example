@@ -32,3 +32,13 @@ model = "opencode/muse-spark-1.3-contributor-free"   # épinglé : ne dépend pa
 path = 'C:\Users\<user>\orch-workspaces\e2e'
 modes = ["read_only", "workspace_write"]
 description = "Workspace de test E2E de l'orchestrateur (fixtures jetables)"
+
+# Clone réel du dépôt agent-orchestrator-mcp sur ce PC : workspace explicite,
+# borné au seul sous-dossier du clone (jamais orch-workspaces entier ni le disque).
+# read_only par défaut (lecture / audit) ; ajouter "workspace_write" seulement si
+# un agent doit modifier ce clone. Sans cette section, tout accès hors cwd (e2e)
+# est refusé (opencode : refus type external_directory).
+[workspaces.agent-orchestrator-mcp]
+path = 'C:\Users\<user>\orch-workspaces\agent-orchestrator-mcp'
+modes = ["read_only"]
+description = "Clone réel Revens2/agent-orchestrator-mcp (lecture par défaut)"
