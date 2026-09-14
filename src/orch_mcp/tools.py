@@ -15,7 +15,7 @@ from pydantic import Field
 import orch_protocol as P
 from orch_mcp.store import BrokerError, Store
 
-RuntimeT = Literal["claude-code", "codex", "agy", "opencode", "fake"]
+RuntimeT = Literal["claude-code", "codex", "agy", "opencode", "fake", "hermes"]
 ModeT = Literal["read_only", "workspace_write"]
 StateT = Literal["queued", "claimed", "starting", "running", "completed", "failed", "timeout", "cancelled", "lost"]
 AlertSourceT = Literal["etude", "nexus"]
