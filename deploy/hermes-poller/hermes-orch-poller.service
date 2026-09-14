@@ -1,0 +1,23 @@
+# /etc/systemd/system/hermes-orch-poller.service (copie versionnee du live vps-etude)
+[Unit]
+Description=Poller Hermes pour l'orchestrateur (runner hermes-vps) — v2 durable
+After=network-online.target orch-mcp.service
+Wants=network-online.target
+
+[Service]
+User=hermes-ops
+Group=hermes-ops
+WorkingDirectory=/var/lib/hermes-ops/orch-poller-v2
+ExecStart=/usr/bin/python3 /var/lib/hermes-ops/orch-poller-v2/poller_v2.py
+Restart=always
+RestartSec=10
+# Start limits: tolerate transient broker issues
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/hermes-ops/orch-jobs
+ReadWritePaths=/var/lib/hermes-ops/orch-poller-v2
+
+[Install]
+WantedBy=multi-user.target
