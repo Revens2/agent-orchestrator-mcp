@@ -46,10 +46,12 @@ RUNNER_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         (STARTING, RUNNING),
         (STARTING, FAILED),
         (STARTING, CANCELLED),
+        (STARTING, LOST),  # durable runner recovery: exit outcome unavailable
         (RUNNING, COMPLETED),
         (RUNNING, FAILED),
         (RUNNING, TIMEOUT),
         (RUNNING, CANCELLED),
+        (RUNNING, LOST),
     }
 )
 
@@ -76,6 +78,9 @@ MAX_OUTPUT_PAGE = 20_000
 DEFAULT_TIMEOUT_S = 3_600
 MAX_TIMEOUT_S = 4 * 3_600
 LEASE_S = 60
+# Final output / durable recovery may finish after the process exits. This
+# deadline starts at the FIRST negative observation, never at the next ping.
+PROCESS_RECOVERY_S = 60
 HEARTBEAT_S = 5
 ONLINE_WINDOW_S = 30
 CLAIM_POLL_S = 25

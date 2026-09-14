@@ -41,6 +41,7 @@ FAKE_HERMES = (
 
 @pytest.fixture
 def pv2(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "deploy" / "hermes-poller"))
     spec = importlib.util.spec_from_file_location("poller_v2", ROOT / "deploy" / "hermes-poller" / "poller_v2.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -48,6 +49,7 @@ def pv2(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "PROMPT_DIR", str(tmp_path / "prompts"))
     monkeypatch.setattr(mod, "PROC_POLL_S", 0.1)
     monkeypatch.setattr(mod, "HERMES_ARGV", [sys.executable, "-c", FAKE_HERMES])
+    monkeypatch.setattr(mod, "DURABLE_LAUNCH", False)
     return mod
 
 
@@ -155,20 +157,27 @@ def test_abandon_publishes_no_terminal(pv2, tmp_path, monkeypatch):
     assert [p["to"] for k, p in _outbox(st) if k == "transition"] == ["starting", "running"]
 
 
-def test_resume_session_skips_claimed_transition(pv2, tmp_path, monkeypatch):
-    seen = {}
+def test_recovery_without_process_evidence_never_respawns(pv2, tmp_path, monkeypatch):
+    """Session ID seule ne prouve ni vie ni mort : aucune relance aveugle.
+    Sans processus hôte ni receipt, recovery -> terminal `lost` déterministe,
+    exit code non inventé, aucune relance automatique."""
+    spawned = []
     real = subprocess.Popen
 
     def spy(argv, **kw):
-        seen["argv"] = argv
+        spawned.append(argv)
         return real(argv, **kw)
 
     monkeypatch.setattr(pv2.subprocess, "Popen", spy)
     st, jid = _claimed(pv2, tmp_path)
     st.set_job(jid, local_state="recovery", session_id=SID)
     _run(pv2.Supervisor(_Poller(st), jid))
-    assert seen["argv"][-2:] == ["--resume", SID]
-    assert [p["to"] for k, p in _outbox(st) if k == "transition"] == ["running", "completed"]
+    assert spawned == []
+    trans = [p for k, p in _outbox(st) if k == "transition"]
+    assert [p["to"] for p in trans] == ["lost"]
+    assert trans[0]["src"] == "running"
+    assert "exit_code" not in trans[0]
+    assert st.get_job(jid)["local_state"] == "done"
 
 
 def _spy_argvs(pv2, monkeypatch):
@@ -206,12 +215,57 @@ def test_persistent_text_tool_call_fails_after_bounded_retries(pv2, tmp_path, mo
     assert st.get_job(jid)["local_state"] == "done"
 
 
-def test_heartbeat_held_carries_flat_telemetry(pv2, tmp_path):
+def test_heartbeat_held_never_invents_liveness(pv2, tmp_path):
+    """Sans superviseur vivant, un pid local ne prouve rien : held minimal.
+    Seul un snapshot supervisé frais porte proc_alive ; un job done avec
+    outbox restante reste held pour livraison terminale bornée."""
     st, jid = _claimed(pv2, tmp_path)
     st.set_job(jid, pid=os.getpid(), local_state="running")
     poller = pv2.Poller.__new__(pv2.Poller)
     poller.store = st
-    assert poller.held_payload() == [{"job_id": jid, "fencing": 1, "pid": os.getpid(), "proc_alive": True}]
+    poller.supervisors = {}
+    assert poller.held_payload() == [{"job_id": jid, "fencing": 1}]
+
+
+def test_held_carries_fresh_supervisor_snapshot(pv2, tmp_path):
+    st, jid = _claimed(pv2, tmp_path)
+    st.set_job(jid, pid=os.getpid(), local_state="running")
+    poller = pv2.Poller.__new__(pv2.Poller)
+    poller.store = st
+
+    class _Sup:
+        snapshot = {"pid": os.getpid(), "proc_alive": True}
+        last_tick = time.monotonic()
+        def is_alive(self):
+            return True
+
+    sup = _Sup()
+    poller.supervisors = {jid: sup}
+    # Frais : superviseur vivant.
+    held = poller.held_payload()
+    assert held[0]["proc_alive"] is True and held[0]["supervisor_alive"] is True
+
+    # Périmé : tick trop ancien -> supervisor_alive False (télémétrie non fraîche).
+    sup.last_tick = time.monotonic() - (pv2.SUPERVISOR_FRESH_S + 1)
+    held = poller.held_payload()
+    assert held[0]["supervisor_alive"] is False
+
+
+def test_terminal_outbox_survives_restart_without_respawn(pv2, tmp_path, monkeypatch):
+    """Résultat persistant après restart : un terminal déjà en outbox avant
+    crash appartient à la publication, jamais à une nouvelle exécution."""
+    monkeypatch.setattr(pv2.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("respawn interdit")))
+    st, jid = _claimed(pv2, tmp_path)
+    st.set_job(jid, local_state="running", session_id=SID)
+    st.enqueue(jid, "transition", f"tr-{jid}-completed",
+               {"src": "running", "to": "completed", "exit_code": 0, "result_summary": "PONG_OK"})
+    poller = pv2.Poller.__new__(pv2.Poller)
+    poller.store = st
+    poller.supervisors = {}
+    poller.ensure_supervisor(jid)
+    assert jid not in poller.supervisors
+    assert st.get_job(jid)["local_state"] == "done"
+    assert [p["to"] for k, p in _outbox(st) if k == "transition"] == ["completed"]
 
 
 def test_e2e_contract_with_real_broker_api(pv2, tmp_path):

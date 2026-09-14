@@ -19,6 +19,7 @@ Cause racine v1 (82 lignes : claim + JSON non-atomique + held memoire seule
 - health.json atomique. Aucun secret dans ce fichier ni en logs.
 """
 import json
+import http.client
 import os
 import shutil
 import signal
@@ -26,10 +27,14 @@ import sqlite3
 import subprocess
 import threading
 import time
+import sys
+from pathlib import Path
 import urllib.request
 import urllib.error
 
 import re
+
+import runtime_support as runtime
 
 BASE = os.environ.get("ORCH_BROKER_BASE", "http://127.0.0.1:8803")
 if not BASE.startswith(("http://", "https://")):
@@ -44,7 +49,7 @@ PROMPT_DIR = os.path.join(SPOOL, "prompts")
 LOG_DIR = os.path.join(SPOOL, "runs")
 
 RUNNER_ID = "hermes-vps"
-VERSION = "hermes-poller/2.1"
+VERSION = "hermes-poller/2.2"
 MAX_PARALLEL = 10
 INFO = {"version": VERSION, "max_parallel": MAX_PARALLEL,
         "runtimes": [{"id": "hermes", "available": True,
@@ -54,10 +59,14 @@ INFO = {"version": VERSION, "max_parallel": MAX_PARALLEL,
                         "description": "Intervention directe Hermes sur vps-etude"}]}
 
 HB_INTERVAL = 5
-CLAIM_WAIT = 25
+CLAIM_WAIT = 0  # heartbeat/outbox must not wait behind a claim long-poll
 OUTBOX_FLUSH_EVERY = 5
 PROC_POLL_S = 2
 OUTPUT_CHUNK = 16000
+RECOVERY_S = 30
+SUPERVISOR_FRESH_S = 20
+NATIVE_POLL_S = 5
+DURABLE_LAUNCH = os.name == "posix"
 # `--pass-session-id` : Hermes ecrit `session_id: <id>` sur la sortie.
 SESSION_RE = re.compile(r"^session_id:\s*([A-Za-z0-9_.:-]{4,128})\s*$", re.M)
 # Invocation non interactive (stdin non-TTY + -Q => oneshot). Surchargeable en test.
@@ -103,7 +112,7 @@ class Store:
     CREATE TABLE IF NOT EXISTS outbox(
       seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
       kind TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL,
-      attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
+      attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, fencing INTEGER);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     """
 
@@ -119,6 +128,10 @@ class Store:
                                       check_same_thread=False)
             self.db.execute("PRAGMA journal_mode=WAL;")
             self.db.executescript(self.SCHEMA)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(outbox)")}
+            if "fencing" not in cols:
+                self.db.execute("ALTER TABLE outbox ADD COLUMN fencing INTEGER")
+                self.db.execute("UPDATE outbox SET fencing=(SELECT fencing FROM local_jobs WHERE local_jobs.job_id=outbox.job_id)")
             self.db.commit()
             self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('init','1')")
             self.db.commit()
@@ -211,12 +224,23 @@ class Store:
             self.db.row_factory = None
             return [dict(r) for r in rows]
 
+    def held_jobs(self):
+        """Execution OR pending durable publication (including terminal outbox)."""
+        with self.lock:
+            self.db.row_factory = sqlite3.Row
+            rows = self.db.execute(
+                "SELECT * FROM local_jobs WHERE local_state!='abandoned' AND "
+                "(local_state!='done' OR EXISTS(SELECT 1 FROM outbox WHERE outbox.job_id=local_jobs.job_id))"
+            ).fetchall()
+            self.db.row_factory = None
+            return [dict(r) for r in rows]
+
     def enqueue(self, job_id, kind, event_id, payload):
         with self.lock:
             self.db.execute(
-                "INSERT OR IGNORE INTO outbox(job_id,kind,event_id,payload,created_at)"
-                " VALUES(?,?,?,?,?)",
-                (job_id, kind, event_id, json.dumps(payload), time.time()))
+                "INSERT OR IGNORE INTO outbox(job_id,kind,event_id,payload,created_at,fencing)"
+                " VALUES(?,?,?,?,?,(SELECT fencing FROM local_jobs WHERE job_id=?))",
+                (job_id, kind, event_id, json.dumps(payload), time.time(), job_id))
             self.db.commit()
 
     def outbox_peek(self, limit=20):
@@ -230,6 +254,11 @@ class Store:
     def outbox_del(self, seq):
         with self.lock:
             self.db.execute("DELETE FROM outbox WHERE seq=?", (seq,))
+            self.db.commit()
+
+    def outbox_payload(self, seq, payload):
+        with self.lock:
+            self.db.execute("UPDATE outbox SET payload=? WHERE seq=?", (json.dumps(payload), seq))
             self.db.commit()
 
     def outbox_bump(self, seq):
@@ -290,7 +319,7 @@ class Broker:
                      "Authorization": "Bearer " + self.token,
                      "User-Agent": VERSION})
         # BASE valide http(s) au chargement du module
-        with urllib.request.urlopen(req, timeout=45) as r:  # nosemgrep
+        with urllib.request.urlopen(req, timeout=5) as r:  # nosemgrep
             return json.load(r)
 
     def hello(self, info, held):
@@ -317,6 +346,8 @@ class Broker:
 def proc_alive(pid):
     """Vivant = existe ET n'est pas zombie. v2.0 : os.kill(pid, 0) reussit sur
     un enfant termine non reaped -> boucle de suivi infinie jusqu'au timeout."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except (OSError, OverflowError):
@@ -337,44 +368,121 @@ class Supervisor(threading.Thread):
         self.job_id = job_id
         self.stop_ev = threading.Event()
         self.cancel_ev = threading.Event()
+        self.last_tick = time.monotonic()
+        self.snapshot = {}
+        self.last_native = 0
+        self.native_ended = False
+        self.exit_code = None
+
+    def _source(self):
+        return "orch-" + self.job_id
+
+    def _native(self, st, force=False):
+        if HERMES_ARGV[0] != "docker" or (not force and time.monotonic() - self.last_native < NATIVE_POLL_S):
+            return
+        self.last_native = time.monotonic()
+        key = "native:" + self.job_id
+        cursor = int(st.get_meta(key) or 0)
+        try:
+            snap = runtime.native_snapshot(st.get_job(self.job_id), self._source(), cursor)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return  # absence of native evidence is not evidence of progress
+        if not snap:
+            return
+        st.set_job(self.job_id, session_id=snap["session_id"])
+        self.native_ended = snap.get("ended_at") is not None
+        for message in snap["messages"]:
+            mid = message["id"]
+            role = message["role"]
+            tool = re.sub(r"[^A-Za-z0-9_.-]", "", message.get("tool") or "")[:80]
+            payload = {"runtime_session_id": snap["session_id"],
+                       "activity": "Hermes %s%s (message %s)" % (role, ": " + tool if tool else "", mid),
+                       **self.snapshot}
+            if message.get("text"):
+                payload["output"] = message["text"] + "\n"
+                st.set_meta("summary:" + self.job_id, message["text"][-2000:])
+            if tool:
+                payload["tool"] = tool
+            st.enqueue(self.job_id, "event", "native-%s-%s" % (self.job_id, mid), payload)
+            st.set_meta(key, str(mid))  # enqueue before cursor: replay is idempotent
+
+    def _observe(self, st, pid, popen=None):
+        """Snapshot from the supervised runtime, never a fresh blind PID ping."""
+        job = st.get_job(self.job_id)
+        if HERMES_ARGV[0] != "docker":
+            alive = popen.poll() is None if popen is not None else proc_alive(pid)
+            self.snapshot = {"pid": pid, "proc_alive": alive,
+                             "proc_started_at": job.get("proc_started_at"),
+                             "child_procs": runtime.process_children(pid) if os.name == "posix" else None}
+        else:
+            key = "exec:" + self.job_id
+            eid = st.get_meta(key)
+            try:
+                ex = runtime.docker_get("/exec/" + eid + "/json") if eid else runtime.find_exec(job, self._source())
+                if ex:
+                    st.set_meta(key, ex["ID"])
+                    actual_pid = ex.get("Pid")
+                    if ex.get("Running"):
+                        info = runtime.process_info(actual_pid)
+                        if info:
+                            st.set_meta("runtime:" + self.job_id, json.dumps(info))
+                        self.snapshot = {"pid": actual_pid, "proc_alive": bool(info and info["alive"]),
+                                         "proc_started_at": info["started_at"] if info else None,
+                                         "child_procs": runtime.process_children(actual_pid)}
+                    else:
+                        self.exit_code = ex.get("ExitCode")
+                        self.snapshot = {**self.snapshot, "proc_alive": False}
+                else:
+                    saved = json.loads(st.get_meta("runtime:" + self.job_id) or "null")
+                    info = runtime.process_info(saved["pid"]) if saved else None
+                    alive = bool(info and info["identity"] == saved["identity"] and info["alive"])
+                    # During startup the CLI may not have created its exec yet.
+                    if not saved and proc_alive(pid):
+                        alive = None
+                    self.snapshot = {"pid": saved["pid"] if saved else None, "proc_alive": alive,
+                                     "child_procs": runtime.process_children(saved["pid"]) if alive else None}
+            except (OSError, ValueError, http.client.HTTPException):
+                self.snapshot = {**self.snapshot, "proc_alive": None}
+        self.last_tick = time.monotonic()
+        return self.snapshot.get("proc_alive")
 
     def run(self):
+        try:
+            self._run()
+        except Exception as exc:
+            LOG("supervision interrompue:", self.job_id, type(exc).__name__)
+            job = self.poller.store.get_job(self.job_id)
+            if job and job["local_state"] not in ("done", "abandoned"):
+                self.poller.store.set_job(self.job_id, local_state="recovery")
+
+    def _run(self):
         st = self.poller.store
         job = st.get_job(self.job_id)
-        if not job:
+        if not job or job["local_state"] in ("done", "abandoned"):
             return
-        # Cas 1: processus local encore vivant -> reattache
-        if job.get("pid") and proc_alive(job["pid"]):
+        if job["local_state"] == "claimed" and not job.get("pid"):
+            self._spawn(st)
+            return
+        # Recover durable launcher metadata before deciding whether anything died.
+        receipt = self._receipt(st)
+        if receipt.get("pid"):
+            st.set_job(self.job_id, pid=receipt["pid"])
+            job = st.get_job(self.job_id)
+        alive = self._observe(st, job.get("pid"))
+        self._native(st, force=True)
+        if alive is True or (alive is None and proc_alive(job.get("pid"))):
             st.set_job(self.job_id, local_state="running")
-            st.enqueue(self.job_id, "transition",
-                       "tr-%s-running" % self.job_id,
-                       {"src": "starting", "to": "running",
-                        "runtime_session_id": job.get("session_id"),
-                        "pid": job["pid"], "proc_alive": True})
             self._follow_proc(job["pid"], job.get("session_id"), st)
             return
-        # Cas 2: session_id connue -> resume meme session Hermes
-        resume = job.get("session_id")
-        if resume:
-            LOG("resume session:", self.job_id, resume[:20])
-            self._spawn(st, resume=resume)
-            return
-        # Cas 3: etat running localement mais pas de session_id (premier echec avant capture)
-        # -> ne pas re-spawn betement, marquer recovery, attendre operateur
-        if job.get("local_state") == "running":
-            LOG("running local sans session_id, recovery:", self.job_id)
-            st.set_job(self.job_id, local_state="recovery")
-            return
-        # Cas 4: recovery explicite sans session -> attente operateur
-        if job.get("local_state") == "recovery" and not resume:
-            LOG("recovery sans session, attente operateur:", self.job_id)
-            return
-        # Cas 5: claimed (jamais execute) -> spawn normal
-        if job.get("local_state") == "claimed":
-            self._spawn(st, resume=None)
-            return
-        # Default: ne rien faire
-        LOG("etat local inattendu, ignore:", self.job_id, job.get("local_state"))
+        # Session ID alone never authorizes replaying a possibly completed action.
+        self._finish(st, job.get("pid"), job.get("session_id"), receipt.get("exit_code"))
+
+    def _receipt(self, st):
+        path = st.get_meta("receipt:" + self.job_id)
+        try:
+            return json.loads(Path(path).read_text()) if path else {}
+        except (OSError, ValueError):
+            return {}
 
     def _spawn(self, st, resume=None, prompt_text=None):
         job = st.get_job(self.job_id)
@@ -396,33 +504,64 @@ class Supervisor(threading.Thread):
                 prompt_text = ""
         # Passer via stdin (--query-file -) : pas de montage necessaire
         argv = list(HERMES_ARGV)
+        if argv[0] == "docker":
+            argv += ["--source", self._source()]
         if resume:
             argv += ["--resume", resume]
+        p = None
         try:
-            lf = open(log_path, "ab")
-        except OSError:
-            lf = subprocess.DEVNULL
-        try:
-            p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=lf,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
-            if prompt_text:
-                p.stdin.write(prompt_text.encode("utf-8"))
-            p.stdin.close()
+            # Persist a unique launch intent BEFORE process creation. Restart in
+            # this window reconciles the receipt; it never issues another spawn.
+            generation = int(st.get_meta("launch:" + self.job_id) or 0) + 1
+            st.set_meta("launch:" + self.job_id, str(generation))
+            stem = os.path.join(LOG_DIR, "%s-%s-%s" % (self.job_id, job["fencing"], generation))
+            input_path = stem + ".input"
+            atomic_write(input_path, prompt_text)
+            if DURABLE_LAUNCH:
+                receipt_path = stem + ".receipt.json"
+                descriptor = stem + ".launch.json"
+                runtime.atomic_json(descriptor, {"argv": argv, "prompt": input_path,
+                                                "log": log_path, "receipt": receipt_path})
+                st.set_meta("receipt:" + self.job_id, receipt_path)
+                launcher = subprocess.Popen([sys.executable, runtime.__file__, descriptor],
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, start_new_session=True)
+                st.set_meta("launcher:" + self.job_id, str(launcher.pid))
+                until = time.monotonic() + 10
+                while time.monotonic() < until:
+                    receipt = self._receipt(st)
+                    if receipt.get("pid"):
+                        pid = receipt["pid"]
+                        break
+                    if receipt.get("error") or launcher.poll() is not None:
+                        raise OSError("launcher failed")
+                    self.last_tick = time.monotonic()
+                    time.sleep(0.05)
+                else:
+                    raise OSError("launcher receipt timeout")
+                # Keep the handle for reaping; receipt survives a poller restart.
+                self.launcher = launcher
+            else:
+                with open(input_path, "rb") as pf, open(log_path, "ab") as lf:
+                    p = subprocess.Popen(argv, stdin=pf, stdout=lf,
+                                         stderr=subprocess.STDOUT, start_new_session=True)
+                pid = p.pid
         except OSError as e:
             st.enqueue(self.job_id, "transition", "tr-%s-failed" % self.job_id,
-                       {"src": "claimed", "to": "failed",
+                       {"src": "running" if resume else "starting", "to": "failed",
                         "error": "spawn impossible: %s" % type(e).__name__})
-            st.set_job(self.job_id, local_state="recovery")
+            st.set_job(self.job_id, local_state="done")
             return
         started = time.time()
-        st.set_job(self.job_id, pid=p.pid, proc_started_at=started,
+        st.set_job(self.job_id, pid=pid, proc_started_at=started,
                    local_state="running")
+        st.set_meta("client_identity:" + self.job_id, (runtime.process_info(pid) or {}).get("identity", ""))
         # Telemetrie A PLAT : le broker ne lit que pid/proc_alive/... au
         # premier niveau (v2.0 l'imbriquait sous "telemetry" -> ignoree).
         st.enqueue(self.job_id, "transition", "tr-%s-running" % self.job_id,
-                   {"src": "starting", "to": "running", "pid": p.pid,
+                   {"src": "starting", "to": "running", "pid": pid,
                     "proc_alive": True, "proc_started_at": started})
-        self._follow_proc(p.pid, None, st, popen=p)
+        self._follow_proc(pid, resume, st, popen=p)
 
     def _log_path(self):
         return os.path.join(LOG_DIR, self.job_id[:8] + ".log")
@@ -477,40 +616,32 @@ class Supervisor(threading.Thread):
 
     def _follow_proc(self, pid, session_id, st, popen=None):
         sid = session_id
+        unknown_since = None
         while True:
             if self.stop_ev.is_set():
-                return  # abandon : le broker ne veut plus de nos transitions
-            alive = (popen.poll() is None) if popen is not None else proc_alive(pid)
-            if not alive:
+                self._stop_process(st, pid, popen)
+                return  # stale fencing: stop actual runtime, publish nothing
+            alive = self._observe(st, pid, popen)
+            self._native(st)
+            sid = st.get_job(self.job_id).get("session_id") or sid
+            if alive is False:
                 break
+            if alive is None:
+                unknown_since = unknown_since or time.monotonic()
+                if time.monotonic() - unknown_since >= RECOVERY_S:
+                    self._finish(st, pid, sid, None)
+                    return
+            else:
+                unknown_since = None
             sid, _ = self._pump(st, pid, sid, True)
             if self.cancel_ev.is_set():
-                try:
-                    os.killpg(pid, signal.SIGTERM)
-                except OSError:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        pass
-                for _ in range(10):
-                    if (popen.poll() is not None) if popen is not None else not proc_alive(pid):
-                        break
-                    time.sleep(0.5)
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                if popen is not None:
-                    try:
-                        popen.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        pass
+                stopped = self._stop_process(st, pid, popen)
                 sid = self._drain(st, pid, sid)
                 st.enqueue(self.job_id, "transition",
                            "tr-%s-cancelled" % self.job_id,
-                           {"src": "running", "to": "cancelled",
+                           {"src": "running", "to": "cancelled" if stopped else "lost",
                             "runtime_session_id": sid, "pid": pid,
-                            "proc_alive": False,
+                            "proc_alive": False if stopped else None,
                             "result_summary": self._summary() or None,
                             "error": "annulation demandee par le broker"})
                 st.set_job(self.job_id, local_state="done", session_id=sid)
@@ -522,9 +653,74 @@ class Supervisor(threading.Thread):
                 exit_code = popen.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 exit_code = None
+        else:
+            # Give the durable launcher a bounded opportunity to fsync/reap.
+            until = time.monotonic() + 2
+            while time.monotonic() < until:
+                receipt = self._receipt(st)
+                if receipt.get("finished_at"):
+                    exit_code = receipt.get("exit_code")
+                    break
+                time.sleep(0.05)
+            launcher = getattr(self, "launcher", None)
+            if launcher:
+                launcher.poll()
+        if self.exit_code is not None:
+            exit_code = self.exit_code
+        self._finish(st, pid, sid, exit_code)
+
+    def _stop_process(self, st, pid, popen=None):
+        """Stop only a positively identified process group, including Docker's
+        host runtime PID (killing the docker client alone leaves Hermes alive)."""
+        saved = json.loads(st.get_meta("runtime:" + self.job_id) or "null")
+        target = saved["pid"] if saved else pid
+        identity = saved["identity"] if saved else st.get_meta("client_identity:" + self.job_id)
+        current = runtime.process_info(target)
+        if current and identity and current["identity"] == identity:
+            try:
+                if os.getpgid(target) != target:
+                    return False
+                os.killpg(target, signal.SIGTERM)
+                for _ in range(10):
+                    if not proc_alive(target):
+                        break
+                    self.last_tick = time.monotonic()
+                    time.sleep(0.5)
+                if proc_alive(target):
+                    os.killpg(target, signal.SIGKILL)
+            except OSError:
+                pass
+        elif proc_alive(target):
+            return False  # never signal a reused/unverified PID
+        if popen is not None:
+            try:
+                popen.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return False
+        return not proc_alive(target)
+
+    def _finish(self, st, pid, sid, exit_code):
+        # Drain bounded native pages before the terminal, including legacy quiet
+        # jobs whose client died while the container kept doing useful work.
+        for _ in range(20):
+            before = st.get_meta("native:" + self.job_id)
+            self._native(st, force=True)
+            if st.get_meta("native:" + self.job_id) == before:
+                break
+        sid = st.get_job(self.job_id).get("session_id") or sid
         sid = self._drain(st, pid, sid)
-        summary = self._summary()
-        tele = {"runtime_session_id": sid, "pid": pid, "proc_alive": False}
+        summary = self._summary() or st.get_meta("summary:" + self.job_id) or ""
+        tele = {"runtime_session_id": sid, "pid": self.snapshot.get("pid", pid),
+                "proc_alive": self.snapshot.get("proc_alive", False) if exit_code is None else False}
+        if exit_code is None:
+            job = st.get_job(self.job_id)
+            src = "starting" if job["local_state"] == "starting" else "running"
+            st.enqueue(self.job_id, "transition", "tr-%s-lost" % self.job_id,
+                       {"src": src, "to": "lost", "result_summary": summary or None,
+                        "error": "processus orphelin : sortie recuperee si disponible, code de sortie inconnu; aucune relance automatique",
+                        **tele})
+            st.set_job(self.job_id, local_state="done", session_id=sid)
+            return
         if exit_code == 0 and LEAKED_TOOL_CALL_RE.search(summary):
             key = "leak:" + self.job_id
             n = int(st.get_meta(key) or 0)
@@ -568,21 +764,24 @@ class Poller:
 
     def held(self):
         out = []
-        for j in self.store.active_jobs():
-            out.append({"job_id": j["job_id"], "fencing": j["fencing"],
-                        "pid": j.get("pid"),
-                        "proc_alive": bool(j.get("pid") and proc_alive(j["pid"]))})
+        for j in self.store.held_jobs():
+            sup = getattr(self, "supervisors", {}).get(j["job_id"])
+            item = {"job_id": j["job_id"], "fencing": j["fencing"]}
+            if j["local_state"] == "done":
+                item.update(proc_alive=False, supervisor_alive=True)  # bounded terminal delivery
+            elif sup:
+                item.update(sup.snapshot)
+                item["supervisor_alive"] = sup.is_alive() and time.monotonic() - sup.last_tick < SUPERVISOR_FRESH_S
+            elif j.get("pid") and not proc_alive(j["pid"]):
+                item.update(pid=j["pid"], proc_alive=False)
+            # A live docker client on boot proves neither runtime liveness nor
+            # runtime death. The supervisor resolves the engine identity next.
+            out.append(item)
         return out
 
     def held_payload(self):
         """held du heartbeat avec telemetrie a plat quand le pid est connu."""
-        out = []
-        for h in self.held():
-            item = {"job_id": h["job_id"], "fencing": h["fencing"]}
-            if h.get("pid"):
-                item.update(pid=h["pid"], proc_alive=h["proc_alive"])
-            out.append(item)
-        return out
+        return self.held()
 
     def write_health(self):
         active = self.store.active_jobs()
@@ -605,9 +804,7 @@ class Poller:
         if n:
             LOG("spool v1 importe:", n)
         held = self.held()
-        r = self.broker.hello(
-            INFO, [{"job_id": h["job_id"], "fencing": h["fencing"]}
-                   for h in held])
+        r = self.broker.hello(INFO, held)
         self.epoch = r["epoch"]
         atomic_write(EPOCH_FILE, str(self.epoch))
         self.store.set_meta("epoch", str(self.epoch))
@@ -620,28 +817,49 @@ class Poller:
         s = self.supervisors.get(job_id)
         if s and s.is_alive():
             return
+        job = self.store.get_job(job_id)
+        if not job or job["local_state"] in ("done", "abandoned"):
+            return
+        # A terminal may have been queued immediately before a crash, before
+        # local_state was committed. Publication owns this job now.
+        with self.store.lock:
+            pending = self.store.db.execute(
+                "SELECT payload FROM outbox WHERE job_id=? AND kind='transition'", (job_id,)
+            ).fetchall()
+        if any(json.loads(r[0]).get("to") in ("completed", "failed", "cancelled", "lost", "timeout") for r in pending):
+            self.store.set_job(job_id, local_state="done")
+            return
         s = Supervisor(self, job_id)
         self.supervisors[job_id] = s
         s.start()
 
     def flush_outbox(self):
-        for item in self.store.outbox_peek(20):
+        deadline = time.monotonic() + 2
+        for item in self.store.outbox_peek(100):
+            if time.monotonic() >= deadline:
+                break
             job = self.store.get_job(item["job_id"])
             if not job or job.get("local_state") == "abandoned":
                 self.store.outbox_del(item["seq"])
                 continue
-            fencing = job["fencing"]
+            fencing = item["fencing"]
+            if fencing != job["fencing"]:
+                self.store.outbox_del(item["seq"])
+                continue
             payload = json.loads(item["payload"])
             try:
                 if item["kind"] == "event":
-                    self.broker.event(self.epoch, item["job_id"], fencing,
-                                      item["event_id"], **payload)
+                    result = self.broker.event(self.epoch, item["job_id"], fencing,
+                                               item["event_id"], **payload)
+                    if result.get("ignored"):
+                        self._abandon(item["job_id"])
                 else:
                     rest = {k: v for k, v in payload.items()
                             if k not in ("src", "to")}
-                    self.broker.transition(self.epoch, item["job_id"], fencing,
-                                           payload.get("src", "claimed"),
-                                           payload["to"], **rest)
+                    result = self.broker.transition(self.epoch, item["job_id"], fencing,
+                                                    payload.get("src", "claimed"), payload["to"], **rest)
+                    if result.get("state") != payload["to"]:
+                        self._abandon(item["job_id"])
                 self.store.outbox_del(item["seq"])
                 self.last_broker_ok = time.time()
             except urllib.error.HTTPError as e:
@@ -650,16 +868,30 @@ class Poller:
                     body = e.read().decode()[:200]
                 except Exception:
                     pass
+                if e.code == 409 and "superseded" in body:
+                    raise SystemExit("runner session superseded")
+                if e.code == 409 and "state_conflict" in body:
+                    state = self.broker.post("job-state", {"epoch": self.epoch, "job_id": item["job_id"],
+                                                           "fencing": fencing})["state"]
+                    if state == payload.get("to") or (payload.get("to") == "starting" and state == "running"):
+                        self.store.outbox_del(item["seq"])
+                    elif state in ("claimed", "starting", "running") and payload.get("to") in ("failed", "lost", "cancelled"):
+                        payload["src"] = state
+                        if state == "claimed" and payload["to"] == "lost":
+                            payload["to"] = "failed"
+                        self.store.outbox_payload(item["seq"], payload)
+                        break  # preserve per-job event ordering on retry
+                    else:
+                        self._abandon(item["job_id"])
+                        self.store.outbox_del(item["seq"])
+                    continue
                 if e.code in (409, 404) and any(
-                        k in body for k in ("stale_fencing", "superseded",
-                                            "unknown_job", "state_conflict",
+                        k in body for k in ("stale_fencing",
+                                            "unknown_job",
                                             "invalid_transition")):
                     LOG("fencing refuse, abandon local:", item["job_id"],
                         body[:80])
-                    self.store.set_job(item["job_id"], local_state="abandoned")
-                    sup = self.supervisors.get(item["job_id"])
-                    if sup:
-                        sup.stop_ev.set()
+                    self._abandon(item["job_id"])
                     self.store.outbox_del(item["seq"])
                 else:
                     self.store.outbox_bump(item["seq"])
@@ -668,11 +900,22 @@ class Poller:
                 self.store.outbox_bump(item["seq"])
                 raise
 
+    def _abandon(self, job_id):
+        self.store.set_job(job_id, local_state="abandoned")
+        sup = self.supervisors.get(job_id)
+        if sup:
+            sup.stop_ev.set()
+
     def loop(self):
         self.boot()
         last_flush = 0
         while True:
             try:
+                for j in self.store.active_jobs():
+                    self.ensure_supervisor(j["job_id"])
+                # Publication is independent of heartbeat acceptance, including
+                # terminals left behind by a previous poller process.
+                self.flush_outbox()
                 hb = self.broker.heartbeat(self.epoch, self.held_payload())
                 self.last_broker_ok = time.time()
                 atomic_write(EPOCH_FILE, str(self.epoch))
@@ -726,9 +969,7 @@ class Poller:
                 self.write_health()
                 time.sleep(10)
                 try:
-                    held = [{"job_id": h["job_id"], "fencing": h["fencing"]}
-                            for h in self.held()]
-                    self.epoch = self.broker.hello(INFO, held)["epoch"]
+                    self.epoch = self.broker.hello(INFO, self.held_payload())["epoch"]
                     atomic_write(EPOCH_FILE, str(self.epoch))
                     self.store.set_meta("epoch", str(self.epoch))
                     self.last_broker_ok = time.time()
@@ -737,4 +978,8 @@ class Poller:
 
 
 if __name__ == "__main__":
-    Poller().loop()
+    import fcntl
+    os.makedirs(SPOOL, exist_ok=True)
+    with open(os.path.join(SPOOL, ".poller.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        Poller().loop()

@@ -311,6 +311,8 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_suspect_at REAL")
             if "stall_at" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
+            if "recovery_since" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN recovery_since REAL")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -396,6 +398,35 @@ class Store:
         )
 
     # ---------------------------------------------------------------- runners
+    def _execution_lease(self, db, row, tele=None, supervisor_alive=None, allow_recovery=False):
+        """Bound recovery independently of heartbeats, output and reconnects.
+
+        Missing telemetry never cancels a negative observation. Only positive
+        process evidence within the recovery window can restore a normal lease.
+        Old runners without instrumentation retain their existing protocol.
+        """
+        now = self.clock()
+        if row["state"] not in (P.STARTING, P.RUNNING):
+            return now + P.LEASE_S
+        since = row["recovery_since"]
+        if since is not None and now >= since + P.PROCESS_RECOVERY_S:
+            self._set_terminal(
+                db, row["id"], row["state"], P.LOST, "broker",
+                error="processus ou supervision indisponible : recovery expiree, issue inconnue, non relance",
+            )
+            return None
+        alive = tele.get("proc_alive") if tele else None
+        if alive == 0 or supervisor_alive is False:
+            # Upgrade also respects a previous explicit dead observation.
+            if since is None:
+                since = row["telemetry_at"] if row["proc_alive"] == 0 and row["telemetry_at"] else now
+        elif alive == 1 and supervisor_alive is not False and allow_recovery:
+            since = None
+        elif since is None and row["proc_alive"] == 0:
+            since = row["telemetry_at"] or now
+        db.execute("UPDATE jobs SET recovery_since=? WHERE id=?", (since, row["id"]))
+        return min(now + P.LEASE_S, since + P.PROCESS_RECOVERY_S) if since is not None else now + P.LEASE_S
+
     def _runner_epoch_ok(self, db, runner_id: str, epoch: int) -> None:
         row = db.execute("SELECT epoch FROM runners WHERE id=?", (runner_id,)).fetchone()
         if row is None:
@@ -416,7 +447,7 @@ class Store:
         runtimes = [r for r in info.get("runtimes", []) if isinstance(r, dict) and r.get("id") in P.RUNTIMES]
         workspaces = [w for w in info.get("workspaces", []) if isinstance(w, dict) and P.valid_id(w.get("id"))]
         max_parallel = max(1, min(int(info.get("max_parallel", 1)), 16))
-        held_map = {h.get("job_id"): int(h.get("fencing", -1)) for h in held if isinstance(h, dict)}
+        held_map = {h.get("job_id"): h for h in held if isinstance(h, dict)}
         with self._tx() as db:
             row = db.execute("SELECT epoch FROM runners WHERE id=?", (runner_id,)).fetchone()
             epoch = (int(row["epoch"]) if row else 0) + 1
@@ -438,15 +469,21 @@ class Store:
                 ),
             )
             active = db.execute(
-                "SELECT id, state, fencing FROM jobs WHERE runner_id=? AND state IN ('claimed','starting','running')",
+                "SELECT * FROM jobs WHERE runner_id=? AND state IN ('claimed','starting','running')",
                 (runner_id,),
             ).fetchall()
             for job in active:
-                if held_map.get(job["id"]) == int(job["fencing"]):
+                h = held_map.get(job["id"], {})
+                if int(h.get("fencing", -1)) == int(job["fencing"]):
+                    tele = self._telemetry_values(h)
+                    lease = self._execution_lease(db, job, tele, h.get("supervisor_alive"), allow_recovery=True)
+                    if lease is None:
+                        continue
                     db.execute(
                         "UPDATE jobs SET epoch=?, lease_expires=?, updated_at=? WHERE id=?",
-                        (epoch, now + P.LEASE_S, now, job["id"]),
+                        (epoch, lease, now, job["id"]),
                     )
+                    self._store_telemetry(db, job["id"], tele)
                     continue
                 self._emit(
                     db, job["id"], P.EV_RUNNER_DISCONNECT,
@@ -491,22 +528,36 @@ class Store:
                 job_id = h.get("job_id")
                 fencing = int(h.get("fencing", -1))
                 row = db.execute(
-                    "SELECT state, fencing, cancel_requested FROM jobs WHERE id=? AND runner_id=?",
+                    "SELECT * FROM jobs WHERE id=? AND runner_id=?",
                     (job_id, runner_id),
                 ).fetchone()
                 if row is None or int(row["fencing"]) != fencing or row["state"] not in P.ACTIVE:
                     unknown.append(str(job_id))  # le runner doit tuer ce processus
                     continue
-                db.execute(
-                    "UPDATE jobs SET lease_expires=?, epoch=? WHERE id=?", (now + P.LEASE_S, epoch, job_id)
-                )
+                tele = self._telemetry_values(h)
+                lease = self._execution_lease(db, row, tele, h.get("supervisor_alive"), allow_recovery=True)
+                if lease is None:
+                    unknown.append(str(job_id))
+                    continue
+                db.execute("UPDATE jobs SET lease_expires=?, epoch=? WHERE id=?", (lease, epoch, job_id))
                 if row["cancel_requested"]:
                     cancel.append(str(job_id))
                 # Télémétrie d'exécution (optionnelle, runners récents) : état du
                 # processus observé localement. Mapping unique (_telemetry_values) :
                 # absent = non observé (on ne touche à rien), jamais inventé.
-                self._store_telemetry(db, job_id, self._telemetry_values(h))
+                self._store_telemetry(db, job_id, tele)
         return {"cancel": cancel, "abandon": unknown}
+
+    def runner_job_state(self, runner_id: str, epoch: int, job_id: str, fencing: int) -> dict[str, Any]:
+        """Read-only fenced reconciliation, without prompt/output disclosure."""
+        with self._lock:
+            self._runner_epoch_ok(self._db, runner_id, epoch)
+            row = self._db.execute("SELECT runner_id,state,fencing,cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["runner_id"] != runner_id:
+                raise BrokerError("unknown_job", "job inconnu pour ce runner")
+            if int(row["fencing"]) != fencing:
+                raise BrokerError("stale_fencing", "fencing token périmé")
+            return {"state": row["state"], "cancel_requested": bool(row["cancel_requested"])}
 
     def runners(self) -> list[dict[str, Any]]:
         now = self.clock()
@@ -681,6 +732,9 @@ class Store:
             if row["state"] != src:
                 raise BrokerError("state_conflict", f"état actuel {row['state']}, attendu {src}")
             terminal = dst in P.TERMINAL
+            lease = None if terminal else self._execution_lease(db, row, tele)
+            if not terminal and lease is None:
+                return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
             # Requête fixe : un champ absent (None) conserve sa valeur via COALESCE.
             cur = db.execute(
                 """UPDATE jobs SET state=?, updated_at=?, last_event_at=?, lease_expires=?,
@@ -692,7 +746,7 @@ class Store:
                     dst,
                     now,
                     now,
-                    None if terminal else now + P.LEASE_S,
+                    lease,
                     now if dst == P.RUNNING else None,
                     now if terminal else None,
                     None if exit_code is None else int(exit_code),
@@ -777,6 +831,9 @@ class Store:
                 return {"duplicate": True, "cancel": bool(row["cancel_requested"])}
             if row["state"] not in P.ACTIVE:
                 return {"duplicate": False, "ignored": True, "cancel": False}
+            lease = self._execution_lease(db, row, tele)
+            if lease is None:
+                return {"duplicate": False, "ignored": True, "cancel": False}
             chunks, chars, truncated = int(row["output_chunks"]), int(row["output_chars"]), int(row["output_truncated"])
             prev_step = chars // P.OUTPUT_PROGRESS_STEP_CHARS
             got_output = False
@@ -804,7 +861,7 @@ class Store:
                     now,
                     now,
                     now if got_output else row["last_output_at"],
-                    now + P.LEASE_S,
+                    lease,
                     new_activity,
                     str(runtime_session_id)[:128] if runtime_session_id else None,
                     chunks,
@@ -929,6 +986,12 @@ class Store:
         now = self.clock()
         stats = {"requeued": 0, "lost": 0, "timeout_cancel": 0, "failed": 0, "stalled": 0, "suspected_stall": 0}
         with self._tx() as db:
+            for row in db.execute(
+                "SELECT * FROM jobs WHERE state IN ('starting','running') AND recovery_since IS NOT NULL "
+                "AND recovery_since + ? <= ?", (P.PROCESS_RECOVERY_S, now),
+            ).fetchall():
+                self._execution_lease(db, row)
+                stats["lost"] += 1
             for row in db.execute(
                 "SELECT id, state, attempt, cancel_requested FROM jobs WHERE state IN ('claimed','starting','running') AND lease_expires < ?",
                 (now,),

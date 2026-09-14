@@ -251,15 +251,30 @@ Le runtime `hermes` n'utilise pas `orch_runner` : il est servi sur vps-etude par
 publiés en events `output` ; télémétrie `pid`/`proc_alive` à plat).
 
 ```bash
-# deploiement (backup + remplacement atomique)
+# deploiement v2.2 (backup + remplacement atomique ; NE PAS oublier runtime_support.py,
+# importé par poller_v2.py depuis le même WorkingDirectory, ni le .service si changé)
 B=/var/backups/hermes-poller-$(date +%Y%m%d-%H%M%S); sudo mkdir -p $B
-sudo cp -a /var/lib/hermes-ops/orch-poller-v2/poller_v2.py $B/
+sudo cp -a /var/lib/hermes-ops/orch-poller-v2/poller_v2.py /var/lib/hermes-ops/orch-poller-v2/runtime_support.py $B/
+sudo cp -a /etc/systemd/system/hermes-orch-poller.service $B/ 2>/dev/null || true
 sudo install -o hermes-ops -g hermes-ops -m 644 poller_v2.py /var/lib/hermes-ops/orch-poller-v2/poller_v2.py.new
+sudo install -o hermes-ops -g hermes-ops -m 644 runtime_support.py /var/lib/hermes-ops/orch-poller-v2/runtime_support.py.new
 sudo mv /var/lib/hermes-ops/orch-poller-v2/poller_v2.py.new /var/lib/hermes-ops/orch-poller-v2/poller_v2.py
+sudo mv /var/lib/hermes-ops/orch-poller-v2/runtime_support.py.new /var/lib/hermes-ops/orch-poller-v2/runtime_support.py
+# si hermes-orch-poller.service modifié : copier + daemon-reload (KillMode=process requis
+# pour que les launchers durables survivent au restart et écrivent leur receipt)
 sudo systemctl restart hermes-orch-poller && journalctl -u hermes-orch-poller -n 3  # "hello ok"
 # rollback
-sudo cp -a $B/poller_v2.py /var/lib/hermes-ops/orch-poller-v2/ && sudo systemctl restart hermes-orch-poller
+sudo cp -a $B/poller_v2.py $B/runtime_support.py /var/lib/hermes-ops/orch-poller-v2/ && sudo systemctl restart hermes-orch-poller
 ```
+
+Broker v2.2 (même déploiement `src/`, migration additive) : colonne
+`jobs.recovery_since` (`ADD COLUMN` idempotent, NULL = pas de recovery) ;
+`PROCESS_RECOVERY_S=60` — première observation négative (`proc_alive=0` ou
+`supervisor_alive=false`) puis `lost` borné même si le heartbeat continue, seule
+une preuve positive fraîche referme la fenêtre ; transitions `starting/running ->
+lost` autorisées ; nouvel endpoint lecture fencée `/runner/v1/job-state` pour
+réconciliation déterministe (aucun prompt/sortie exposé). Rollback : ancien
+`src/` redéployé reste fonctionnel (colonne ignorée).
 
 Symptôme v2.0 corrigé en 2.1 : job bloqué `running` jusqu'au timeout avec
 `pid`/`runtime_session_id` null et `output_chars=0` alors que `runs/<job8>.log`

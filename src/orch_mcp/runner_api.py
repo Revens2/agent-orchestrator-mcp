@@ -124,6 +124,12 @@ def build_routes(store: Store, auth: RunnerAuth) -> list[Route]:
             store.heartbeat, runner_id, int(data.get("epoch", -1)), list(data.get("held") or [])
         )
 
+    async def job_state(runner_id: str, data: dict, _: Request) -> dict:
+        return await anyio.to_thread.run_sync(
+            store.runner_job_state, runner_id, int(data.get("epoch", -1)),
+            str(data.get("job_id")), int(data.get("fencing", -1)),
+        )
+
     async def claim(runner_id: str, data: dict, request: Request) -> dict:
         epoch = int(data.get("epoch", -1))
         slots = int(data.get("free_slots", 0))
@@ -190,6 +196,7 @@ def build_routes(store: Store, auth: RunnerAuth) -> list[Route]:
     return [
         Route(f"{base}/hello", handler(hello), methods=["POST"]),
         Route(f"{base}/heartbeat", handler(heartbeat), methods=["POST"]),
+        Route(f"{base}/job-state", handler(job_state), methods=["POST"]),
         Route(f"{base}/claim", handler(claim), methods=["POST"]),
         Route(f"{base}/event", handler(event), methods=["POST"]),
         Route(f"{base}/question", handler(question), methods=["POST"]),
