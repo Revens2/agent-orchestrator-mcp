@@ -80,6 +80,19 @@ HEARTBEAT_S = 5
 ONLINE_WINDOW_S = 30
 CLAIM_POLL_S = 25
 
+# --- reprise sur panne PC (v1, compatible : métadonnées + événements, pas de nouvel état)
+# Un job starting/running dont le bail expire n'est plus marqué `lost` aussitôt :
+# le broker le parque (`recovery_state='suspended'`, bail prolongé de RECOVERY_GRACE_S)
+# puis ne le déclare `lost` qu'à la seconde expiration. Le runner déclare au (re)hello
+# les jobs de son journal local (`recovering:true`) pour empêcher le `lost` immédiat
+# et les rattacher au nouvel epoch (même fencing). Aucune ré-exécution aveugle :
+# reprise de session du runtime si possible, sinon parking explicite `suspended`
+# (bail entretenu par heartbeat, décision humaine via cancel/retry).
+RECOVERY_GRACE_S = 4 * 3_600
+RECOVERING = "recovering"
+SUSPENDED = "suspended"
+RECOVERY_STATES = frozenset({RECOVERING, SUSPENDED})
+
 # --- supervision riche (v1, champs optionnels : protocole inchangé) ------------
 # Santé d'exécution calculée par le broker (job_get.execution_health).
 HEALTHY = "healthy"                        # activité/output récents
@@ -109,10 +122,15 @@ EV_CANCEL_REQUESTED = "cancel_requested"
 EV_TIMEOUT_MARKED = "timeout_marked"
 EV_SUSPECTED_STALL = "suspected_stall"
 EV_STALLED = "stalled"
+EV_RUNNER_RECOVERING = "runner_recovering"
+EV_RESUME_ATTEMPT = "resume_attempt"
+EV_RESUME_FAILED = "resume_failed"
+EV_JOB_SUSPENDED = "job_suspended"
 EVENT_KINDS = frozenset({
     EV_JOB_CLAIMED, EV_RUNTIME_SPAWNED, EV_PROCESS_RUNNING, EV_OUTPUT_PROGRESS,
     EV_ACTIVITY, EV_PROCESS_EXIT, EV_RUNNER_DISCONNECT, EV_LEASE_EXPIRED,
     EV_REQUEUED, EV_CANCEL_REQUESTED, EV_TIMEOUT_MARKED, EV_SUSPECTED_STALL, EV_STALLED,
+    EV_RUNNER_RECOVERING, EV_RESUME_ATTEMPT, EV_RESUME_FAILED, EV_JOB_SUSPENDED,
 })
 MAX_EVENTS_PER_JOB = 500
 OUTPUT_PROGRESS_STEP_CHARS = 65_536

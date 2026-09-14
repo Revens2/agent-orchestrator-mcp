@@ -26,6 +26,13 @@ Pour une phrase dédiée : générer une nouvelle empreinte PBKDF2 au format de 
 
 Limite assumée : le runner tourne dans la session de l'utilisateur (les runtimes utilisent
 l'authentification du profil). Session fermée = runner `offline`, les jobs restent `queued`.
+Un job `starting`/`running` coupé (réseau/batterie/reboot) n'est plus déclaré `lost` aussitôt :
+il est parqué (`recovery_state='suspended'`, bail prolongé de 4 h) puis repris au retour
+(session du runtime si possible, sinon parking explicite). `lost` seulement à grâce expirée.
+
+Journal local : `%USERPROFILE%\.orch-runner\recovery\<job_id>.json` (écriture atomique,
+fencing, runtime/mode/workspace, prompt + hash, session, PID, curseurs). Soldé à l'état
+terminal ; un fichier corrompu est mis en quarantaine (`.corrupt-*`), jamais de crash au boot.
 
 ## Ajouter un workspace
 
@@ -110,9 +117,16 @@ couches `broker_health`/`runner_health`/`runtime_process_health`) →
 - `agent_mission_retry` crée une NOUVELLE tentative (nouveau job) de la même mission,
   dans la limite `max_attempts`, sur décision explicite après examen du journal.
   Le serveur ne relance jamais seul, surtout pas une mission `workspace_write`.
-- `lost` = issue inconnue : `agent_job_get` + `agent_job_events` (`lease_expired`,
-  `runner_disconnect`) montrent la cause observable (runner offline ? processus mort ?).
-  Vérifier l'état réel du workspace avant tout retry.
+- `lost` = grâce de reprise expirée (4 h) sans rattachement, ou redémarrage sans journal :
+  `agent_job_get` (`recovery_state`, `resume_count`) + `agent_job_events` (`lease_expired`,
+  `runner_disconnect`, `job_suspended`, `runner_recovering`, `resume_attempt`) montrent la
+  cause observable. Vérifier l'état réel du workspace avant tout retry.
+- `suspended` (pas un état, `recovery_state`) = parking explicite : pas de processus, bail
+  entretenu par heartbeat, jamais relancé en silence. Ré-exécution fraîche autorisée seulement
+  pour `fake`/`read_only` ; les autres runtimes reprennent leur session (`--resume`/`--session`)
+  ou restent parqués jusqu'à décision humaine (`agent_job_cancel` ou `agent_mission_retry`,
+  qui crée un NOUVEAU job). Aucune mise à mort sur perte réseau : le processus continue
+  localement, la sortie est bufferisée et flushée au retour (`offline_kill_s` = seuil d'alerte).
 - Stalls : événement `suspected_stall` (silence ≥ 10 min, processus vivant) puis
   `stalled` (≥ 30 min). Notification seule : décider humainement (notify/cancel/resume
   via `agent_job_cancel` ou `agent_mission_retry`). Pas de télémétrie (vieux runner) =
@@ -145,9 +159,17 @@ L'arbre de processus est tué via le Job Object ; état final `cancelled`.
 - La migration DB est automatique et backward-compatible (`ALTER TABLE … ADD COLUMN` idempotent,
   nouvelles tables `IF NOT EXISTS`, NULL = non observé). Un ancien `src/` redéployé sur une DB
   migrée continue de fonctionner (colonnes ignorées) : c'est le chemin de rollback.
-- PC : `deploy\windows\install-runner.ps1` (arrête le runner, recopie, relance). Un job en cours sur le PC
-  pendant la mise à jour finit `lost` : mettre à jour hors activité (`agent_job_list state=running`).
-  Un vieux runner (sans télémétrie) reste compatible : champs à null, pas de stall détecté.
+- PC : `deploy\windows\install-runner.ps1` (arrête le runner, recopie, relance). Le journal
+  `recovery/` survit à la mise à jour : un job en cours est rattaché au nouvel epoch (même
+  fencing) puis repris (session) ou parqué — plus jamais `lost` immédiat. Mettre à jour hors
+  activité quand même (`agent_job_list state=running`) : la reprise d'un `workspace_write`
+  sans session reste un parking à décider humainement.
+  Un vieux runner (sans télémétrie, sans journal) reste compatible : champs à null, pas de
+  stall détecté, parking broker au lieu de `lost` immédiat (grâce 4 h).
+- Rollback runner : `install-runner.ps1 -Uninstall`, restaurer `runner.toml`/`status.json`
+  depuis `%USERPROFILE%\.orch-runner\backup-pre-recovery-*`, redéployer l'ancien `app/`.
+  Le vieux code ignore les colonnes `recovery_*` et le dossier `recovery/` (brin DB
+  compatible : `ALTER TABLE … ADD COLUMN` idempotent, ancien `src/` sur DB migrée = OK).
 
 ## Rollback
 
@@ -170,6 +192,7 @@ Les autres MCP (tasks, astra, calendar, github, vault) ne dépendent d'aucun com
 | `403` sur 8803 | origine hors 10.200.0.0/16 | passer par NetBird |
 | tâche `Ready` sans processus, résultat `0x80070002` | runner installé dans AppData virtualisé | réinstaller dans `%USERPROFILE%\.orch-runner` |
 | job `failed` `workspace_denied` | chemin changé, jonction, lecteur réseau | corriger `runner.toml`, relancer |
-| job `lost` | runner tué/redémarré ou PC isolé > 60 s pendant l'exécution | vérifier l'état du workspace puis relancer volontairement |
+| job `lost` | grâce de reprise expirée (4 h) sans rattachement | journal (`job_suspended` ? `resume_attempt` ?), état workspace, puis relance volontaire |
+| job `suspended` (`recovery_state`) | panne PC, runtime sans session résumable | `agent_job_get`/`agent_job_events`, puis cancel ou `agent_mission_retry` (nouveau job) |
 | `runtime_unavailable` | runtime désactivé, `--version` en échec, ou opencode `runtime_not_ready` (modèle/fournisseur) | `python -m orch_runner probe` ; changer `model` puis relancer |
 | `/orch/mcp` 401 dans ChatGPT | jeton OAuth expiré | reconnecter le connecteur |

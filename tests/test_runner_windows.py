@@ -314,7 +314,45 @@ def test_e2e_broker_restart_job_survives(tmp_path):
     broker.stop()
 
 
-def test_e2e_runner_restart_marks_lost_no_relaunch(tmp_path):
+def test_e2e_runner_restart_resumes_fake_job(tmp_path):
+    port = free_port()
+    broker = Broker(tmp_path / "orch.db", port)
+    r1 = make_runner(tmp_path, port)
+    start_runner(r1)
+    time.sleep(2)
+    job_id = submit(broker.store, "sleep 8\nprint 42\n")
+    wait_state(broker.store, job_id, {"running"})
+    # crash brutal du runner : le journal local survit, le broker parque (pas lost)
+    r1.stop()
+    with r1.lock:
+        victims = list(r1.workers.values())
+        for w in victims:
+            w.abandon_event.set()
+            if w.proc is not None:
+                w.proc.kill_tree()  # tuer AVANT close (close seul ne garantit rien en test)
+    for w in victims:  # attendre la mort réelle avant de relancer (sinon l'orphelin lent parque)
+        w.done.wait(timeout=30)
+        assert w.done.is_set()
+    with r1.lock:
+        for w in victims:
+            if w.proc is not None:
+                w.proc.close()
+    # le broker n'a pas encore parqué (bail 60 s) : le hello avec journal rattache
+    r2 = make_runner(tmp_path, port)
+    start_runner(r2)
+    job = wait_state(broker.store, job_id, P.TERMINAL, timeout=90)
+    assert job["state"] == "completed"  # fake = fixture idempotente : reprise contrôlée
+    assert broker.store.get_job(job_id)["attempt"] == 1  # même job, pas de nouveau claim
+    kinds = [e["kind"] for e in broker.store.read_events(job_id)["events"]]
+    assert "runner_recovering" in kinds
+    r2.stop()
+    broker.stop()
+
+
+def test_e2e_runner_restart_without_journal_parks_no_relaunch(tmp_path):
+    """Sans journal (vieux runner / journal supprimé) : parking explicite, jamais relancé."""
+    import shutil as _shutil
+
     port = free_port()
     broker = Broker(tmp_path / "orch.db", port)
     r1 = make_runner(tmp_path, port)
@@ -322,35 +360,49 @@ def test_e2e_runner_restart_marks_lost_no_relaunch(tmp_path):
     time.sleep(2)
     job_id = submit(broker.store, "sleep 60\n")
     wait_state(broker.store, job_id, {"running"})
-    # crash brutal du runner : ses Job Objects tuent les agents, puis un nouveau runner démarre
     r1.stop()
     with r1.lock:
-        for w in r1.workers.values():
+        victims = list(r1.workers.values())
+        for w in victims:
             w.abandon_event.set()
-            w.proc.close()
+            if w.proc is not None:
+                w.proc.kill_tree()
+    for w in victims:
+        w.done.wait(timeout=30)
+    with r1.lock:
+        for w in victims:
+            if w.proc is not None:
+                w.proc.close()
+    _shutil.rmtree(tmp_path / "home" / "recovery", ignore_errors=True)  # simule l'absence de journal
     r2 = make_runner(tmp_path, port)
     start_runner(r2)
-    job = wait_state(broker.store, job_id, P.TERMINAL, timeout=30)
-    assert job["state"] == "lost"
-    time.sleep(3)
+    end = time.time() + 20
+    parked = None
+    while time.time() < end:
+        parked = broker.store.get_job(job_id)
+        if parked["recovery_state"] == "suspended":
+            break
+        time.sleep(0.5)
+    assert parked is not None and parked["state"] == "running"
+    assert parked["recovery_state"] == "suspended"  # parqué, en attente de décision humaine
     assert broker.store.get_job(job_id)["attempt"] == 1  # jamais relancé
     r2.stop()
     broker.stop()
 
 
-def test_e2e_runner_offline_goes_offline_and_lost(tmp_path):
+def test_e2e_runner_offline_keeps_job_no_kill(tmp_path):
     port = free_port()
     broker = Broker(tmp_path / "orch.db", port)
     runner = make_runner(tmp_path, port, offline_kill_s=15)
     start_runner(runner)
     time.sleep(2)
-    job_id = submit(broker.store, "sleep 200\n")
+    job_id = submit(broker.store, "sleep 25\nprint 7\n")
     wait_state(broker.store, job_id, {"running"})
     broker.stop()
-    time.sleep(20)  # runner isolé > offline_kill_s -> abandon et kill local
-    assert not runner.workers
+    time.sleep(20)  # runner isolé > offline_kill_s : processus CONSERVÉ, sortie bufferisée
+    assert runner.workers  # plus de mise à mort sur perte réseau
     broker = Broker(tmp_path / "orch.db", port)
-    job = wait_state(broker.store, job_id, P.TERMINAL, timeout=90)
-    assert job["state"] == "lost"
+    job = wait_state(broker.store, job_id, P.TERMINAL, timeout=120)
+    assert job["state"] == "completed"  # reprise automatique au lieu de lost
     runner.stop()
     broker.stop()

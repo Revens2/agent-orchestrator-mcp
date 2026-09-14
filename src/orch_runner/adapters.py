@@ -73,6 +73,17 @@ class Adapter:
     def build(self, prompt: str, mode: str, cwd: str, tmpdir: Path) -> Launch:
         raise NotImplementedError
 
+    def resume(self, session_id: str, mode: str, cwd: str, tmpdir: Path) -> Launch | None:
+        """Reprise contrôlée d'une session après redémarrage du runner.
+
+        Retourne un Launch qui continue la session (historique conservé côté runtime),
+        ou None si le runtime ne sait pas résumer (alors le runner parque le job en
+        `suspended` : état récupérable explicite, jamais de ré-exécution aveugle
+        d'un `workspace_write`). Le prompt de reprise est un accusé borné, jamais
+        une ré-émission silencieuse du prompt d'origine.
+        """
+        return None
+
     def on_line(self, line: str) -> tuple[str | None, str | None]:
         """(texte lisible à remonter, activité courte)."""
         return line, None
@@ -146,6 +157,11 @@ class ClaudeCode(Adapter):
         if not r:
             return Outcome(False, text, f"exit code {exit_code}, aucun message result (fin non confirmée)")
         return Outcome(False, text, f"exit code {exit_code}, result {r.get('subtype')} is_error={r.get('is_error')}")
+
+    def resume(self, session_id, mode, cwd, tmpdir):
+        argv = [self.exe, "-p", "--output-format", "stream-json", "--verbose",
+                *self.MODE[self.policy][mode], "--resume", session_id]
+        return Launch(argv, _resume_notice(session_id))
 
 
 class Codex(Adapter):
@@ -306,6 +322,12 @@ class OpenCode(Adapter):
         ok = exit_code == 0 and error is None
         return Outcome(ok, self.last_text, None if ok else (f"exit code {exit_code}" + (f", {error}" if error else "")))
 
+    def resume(self, session_id, mode, cwd, tmpdir):
+        if mode not in self.MODE[self.policy]:
+            return None  # ex. workspace_write en politique guarded : parking, pas de relance
+        return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
+                       "--dir", cwd, "--session", session_id, "--", _resume_notice(session_id)], None)
+
 
 class Fake(Adapter):
     """Fixture de test : `python fake_agent.py`, script piloté par le prompt (stdin)."""
@@ -326,6 +348,15 @@ class Fake(Adapter):
         if line.startswith("SUMMARY:"):
             self.last_text = line[8:].strip()
         return line, line.strip()[:120] or None
+
+
+def _resume_notice(session_id: str) -> str:
+    return (
+        "[orchestrator] Runner restarted after PC reboot/network loss. "
+        f"Resume session {session_id}. Continue the interrupted task from its session history; "
+        "do not duplicate completed external effects (files already written, commits, sent requests). "
+        "If the session history is unavailable, stop and report state instead of restarting blindly."
+    )[:2000]
 
 
 ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, Codex, Agy, OpenCode, Fake)}

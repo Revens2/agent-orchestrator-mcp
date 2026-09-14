@@ -229,6 +229,12 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_suspect_at REAL")
             if "stall_at" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
+            if "recovery_state" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN recovery_state TEXT")
+            if "recovery_detail" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN recovery_detail TEXT")
+            if "resume_count" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -264,17 +270,34 @@ class Store:
     def hello(self, runner_id: str, info: dict[str, Any], held: list[dict[str, Any]]) -> int:
         """Ouvre une nouvelle session runner et réconcilie les jobs qu'il détenait.
 
-        `held` = jobs que le processus runner gère réellement en ce moment (après
-        un redémarrage : liste vide). Tout job actif du broker absent de `held` :
+        `held` = jobs que le processus runner gère réellement en ce moment, PLUS
+        les jobs de son journal local de reprise (`recovering:true`, même fencing)
+        après un redémarrage / une coupure. Tout job actif du broker absent de `held` :
         - claimed  -> queued (rien n'a été lancé, relance sûre) ;
-        - starting/running -> lost (issue inconnue, jamais relancé en silence).
-        Les jobs présents dans `held` restent attachés à la nouvelle session.
+        - starting/running jamais parqués -> `suspended` (bail prolongé de
+          RECOVERY_GRACE_S, jamais relancé en silence) ; déjà parqués et toujours
+          absents -> on conserve le parking sans prolonger (grâce bornée) ;
+        - grâce expirée (bail dépassé) -> `lost`.
+        Les jobs présents dans `held` restent attachés à la nouvelle session ;
+        `recovering:true` les marque `recovering` (reprise en cours).
         """
         now = self.clock()
         runtimes = [r for r in info.get("runtimes", []) if isinstance(r, dict) and r.get("id") in P.RUNTIMES]
         workspaces = [w for w in info.get("workspaces", []) if isinstance(w, dict) and P.valid_id(w.get("id"))]
         max_parallel = max(1, min(int(info.get("max_parallel", 1)), 16))
-        held_map = {h.get("job_id"): int(h.get("fencing", -1)) for h in held if isinstance(h, dict)}
+        held_map: dict[str, int] = {}
+        held_flags: dict[str, dict[str, bool]] = {}
+        for h in held:
+            if not isinstance(h, dict):
+                continue
+            try:
+                held_map[h.get("job_id")] = int(h.get("fencing", -1))
+            except (TypeError, ValueError):
+                continue
+            held_flags[h.get("job_id")] = {
+                "recovering": bool(h.get("recovering")),
+                "suspended": bool(h.get("suspended")),
+            }
         with self._tx() as db:
             row = db.execute("SELECT epoch FROM runners WHERE id=?", (runner_id,)).fetchone()
             epoch = (int(row["epoch"]) if row else 0) + 1
@@ -296,15 +319,24 @@ class Store:
                 ),
             )
             active = db.execute(
-                "SELECT id, state, fencing FROM jobs WHERE runner_id=? AND state IN ('claimed','starting','running')",
+                "SELECT id, state, fencing, recovery_state, lease_expires FROM jobs WHERE runner_id=? AND state IN ('claimed','starting','running')",
                 (runner_id,),
             ).fetchall()
             for job in active:
                 if held_map.get(job["id"]) == int(job["fencing"]):
-                    db.execute(
-                        "UPDATE jobs SET epoch=?, lease_expires=?, updated_at=? WHERE id=?",
-                        (epoch, now + P.LEASE_S, now, job["id"]),
-                    )
+                    flags = held_flags.get(job["id"], {})
+                    if flags.get("recovering") or flags.get("suspended"):
+                        rec = P.RECOVERING if flags.get("recovering") else P.SUSPENDED
+                        db.execute(
+                            "UPDATE jobs SET epoch=?, lease_expires=?, updated_at=?, recovery_state=?, resume_count=resume_count+? WHERE id=?",
+                            (epoch, now + P.LEASE_S, now, rec, 1 if rec == P.RECOVERING else 0, job["id"]),
+                        )
+                        self._emit(db, job["id"], P.EV_RUNNER_RECOVERING, f"runner reconnecté (epoch {epoch}) : reprise {rec}")
+                    else:
+                        db.execute(
+                            "UPDATE jobs SET epoch=?, lease_expires=?, updated_at=?, recovery_state=NULL, recovery_detail=NULL WHERE id=?",
+                            (epoch, now + P.LEASE_S, now, job["id"]),
+                        )
                     continue
                 self._emit(
                     db, job["id"], P.EV_RUNNER_DISCONNECT,
@@ -312,10 +344,17 @@ class Store:
                 )
                 if job["state"] == P.CLAIMED:
                     self._requeue(db, job["id"], "runner_restart")
-                else:
+                elif (job["lease_expires"] is not None and float(job["lease_expires"]) < now) and job["recovery_state"] in (P.RECOVERING, P.SUSPENDED):
                     self._set_terminal(
                         db, job["id"], job["state"], P.LOST, "broker",
-                        error="runner redémarré ou reconnecté sans ce job : issue inconnue, non relancé",
+                        error="grâce de reprise expirée sans rattachement : issue inconnue, non relancé",
+                    )
+                elif job["recovery_state"] in (P.RECOVERING, P.SUSPENDED):
+                    pass  # parking conservé sans prolongation : la grâce reste bornée
+                else:
+                    self._park_suspended(
+                        db, job["id"], job["state"],
+                        "runner redémarré ou reconnecté sans ce job : parqué en attente de reprise, non relancé",
                     )
             # Snapshot d'environnement par workspace (git, si le runner l'observe) :
             # cache broker rafraîchi au hello, jamais de secrets (branch/head/dirty seuls).
@@ -346,18 +385,38 @@ class Store:
             self._runner_epoch_ok(db, runner_id, epoch)
             db.execute("UPDATE runners SET last_seen=? WHERE id=?", (now, runner_id))
             for h in held:
+                if not isinstance(h, dict):
+                    continue
                 job_id = h.get("job_id")
-                fencing = int(h.get("fencing", -1))
+                try:
+                    fencing = int(h.get("fencing", -1))
+                except (TypeError, ValueError):
+                    unknown.append(str(job_id))
+                    continue
                 row = db.execute(
-                    "SELECT state, fencing, cancel_requested FROM jobs WHERE id=? AND runner_id=?",
+                    "SELECT state, fencing, cancel_requested, recovery_state FROM jobs WHERE id=? AND runner_id=?",
                     (job_id, runner_id),
                 ).fetchone()
                 if row is None or int(row["fencing"]) != fencing or row["state"] not in P.ACTIVE:
-                    unknown.append(str(job_id))  # le runner doit tuer ce processus
+                    unknown.append(str(job_id))  # le runner doit tuer ce processus / oublier ce parking
                     continue
-                db.execute(
-                    "UPDATE jobs SET lease_expires=?, epoch=? WHERE id=?", (now + P.LEASE_S, epoch, job_id)
-                )
+                if h.get("suspended"):
+                    db.execute(
+                        "UPDATE jobs SET lease_expires=?, epoch=?, recovery_state=?, recovery_detail=? WHERE id=?",
+                        (now + P.LEASE_S, epoch, P.SUSPENDED,
+                         P.clip(str(h.get("recovery_detail") or "parqué par le runner : reprise explicite requise"), 500),
+                         job_id),
+                    )
+                elif h.get("recovering"):
+                    db.execute(
+                        "UPDATE jobs SET lease_expires=?, epoch=?, recovery_state=? WHERE id=?",
+                        (now + P.LEASE_S, epoch, P.RECOVERING, job_id),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE jobs SET lease_expires=?, epoch=?, recovery_state=NULL, recovery_detail=NULL WHERE id=?",
+                        (now + P.LEASE_S, epoch, job_id),
+                    )
                 if row["cancel_requested"]:
                     cancel.append(str(job_id))
                 # Télémétrie d'exécution (optionnelle, runners récents) : état du
@@ -566,11 +625,15 @@ class Store:
                 raise BrokerError("state_conflict", f"état actuel {row['state']}, attendu {src}")
             terminal = dst in P.TERMINAL
             # Requête fixe : un champ absent (None) conserve sa valeur via COALESCE.
+            # Une transition terminale solde la reprise (recovery_state=NULL) mais garde
+            # resume_count comme historique ; une transition non terminale conserve l'état.
             cur = db.execute(
                 """UPDATE jobs SET state=?, updated_at=?, last_event_at=?, lease_expires=?,
                      started_at=COALESCE(?, started_at), finished_at=COALESCE(?, finished_at),
                      exit_code=COALESCE(?, exit_code), result_summary=COALESCE(?, result_summary),
-                     error=COALESCE(?, error), runtime_session_id=COALESCE(?, runtime_session_id)
+                     error=COALESCE(?, error), runtime_session_id=COALESCE(?, runtime_session_id),
+                     recovery_state=CASE WHEN ? THEN NULL ELSE recovery_state END,
+                     recovery_detail=CASE WHEN ? THEN NULL ELSE recovery_detail END
                    WHERE id=? AND state=? AND fencing=?""",
                 (
                     dst,
@@ -583,6 +646,8 @@ class Store:
                     None if result_summary is None else P.clip(redact(result_summary), P.MAX_SUMMARY_CHARS),
                     None if error is None else P.clip(redact(error), P.MAX_ERROR_CHARS),
                     None if runtime_session_id is None else str(runtime_session_id)[:128],
+                    1 if terminal else 0,
+                    1 if terminal else 0,
                     job_id,
                     src,
                     fencing,
@@ -769,13 +834,15 @@ class Store:
         """Bails expirés, timeouts durs et détection de stalls. Appelé périodiquement par le serveur.
 
         Politique sûre : la détection de stall ÉMET un événement (notify) ; elle ne
-        relance ni n'annule jamais seule. Un `lost` garde 'issue inconnue' avec les
+        relance ni n'annule jamais seule. Première expiration d'un bail starting/running
+        -> parking `suspended` (grâce RECOVERY_GRACE_S, non relancé) ; seconde expiration
+        (grâce dépassée) -> `lost`. Un `lost` garde 'issue inconnue' avec les
         couches broker/runner/process pour diagnostiquer la cause observable."""
         now = self.clock()
-        stats = {"requeued": 0, "lost": 0, "timeout_cancel": 0, "failed": 0, "stalled": 0, "suspected_stall": 0}
+        stats = {"requeued": 0, "lost": 0, "suspended": 0, "timeout_cancel": 0, "failed": 0, "stalled": 0, "suspected_stall": 0}
         with self._tx() as db:
             for row in db.execute(
-                "SELECT id, state, attempt, cancel_requested FROM jobs WHERE state IN ('claimed','starting','running') AND lease_expires < ?",
+                "SELECT id, state, attempt, cancel_requested, recovery_state FROM jobs WHERE state IN ('claimed','starting','running') AND lease_expires < ?",
                 (now,),
             ).fetchall():
                 self._emit(db, row["id"], P.EV_LEASE_EXPIRED, f"bail expiré en état {row['state']}")
@@ -789,12 +856,18 @@ class Store:
                         self._requeue(db, row["id"], "lease_expired")
                         self._emit(db, row["id"], P.EV_REQUEUED, "bail expiré avant lancement : remis en file")
                         stats["requeued"] += 1
-                else:
+                elif row["recovery_state"] in (P.RECOVERING, P.SUSPENDED):
                     self._set_terminal(
                         db, row["id"], row["state"], P.LOST, "reaper",
-                        error="bail expiré (runner muet) après lancement : issue inconnue, non relancé",
+                        error="grâce de reprise expirée (runner muet) : issue inconnue, non relancé",
                     )
                     stats["lost"] += 1
+                else:
+                    self._park_suspended(
+                        db, row["id"], row["state"],
+                        "bail expiré (runner muet) après lancement : parqué en attente de reprise, non relancé",
+                    )
+                    stats["suspended"] += 1
             # Stalls : processus vivant (télémétrie) + silence d'activité/output.
             # Edge-triggered via stall_suspect_at/stall_at (réarmés à la prochaine activité).
             for row in db.execute(
@@ -1010,6 +1083,19 @@ class Store:
         )
         self._log_transition(db, job_id, P.CLAIMED, P.QUEUED, f"broker:{reason}")
 
+    def _park_suspended(self, db, job_id: str, src: str, reason: str) -> None:
+        """Parking explicite : état conservé, bail prolongé de RECOVERY_GRACE_S,
+        jamais relancé. Grâce bornée : à la prochaine expiration -> `lost`."""
+        now = self.clock()
+        cur = db.execute(
+            """UPDATE jobs SET lease_expires=?, updated_at=?, last_event_at=?,
+                 recovery_state=?, recovery_detail=?
+               WHERE id=? AND state=?""",
+            (now + P.RECOVERY_GRACE_S, now, now, P.SUSPENDED, P.clip(reason, 500), job_id, src),
+        )
+        if cur.rowcount == 1:
+            self._emit(db, job_id, P.EV_JOB_SUSPENDED, reason)
+
     def _set_terminal(self, db, job_id: str, src: str, dst: str, actor: str, error: str | None = None) -> None:
         now = self.clock()
         cur = db.execute(
@@ -1058,6 +1144,9 @@ class Store:
             "output_chars": row["output_chars"],
             "output_truncated": bool(row["output_truncated"]),
             "attempt": row["attempt"],
+            "recovery_state": _col(row, "recovery_state"),
+            "recovery_detail": _col(row, "recovery_detail"),
+            "resume_count": int(_col(row, "resume_count") or 0),
             # --- supervision riche : état structuré d'exécution (null = non observé)
             "runner_last_seen_at": _iso(runner_last_seen),
             "runner_heartbeat_age_s": hb_age,
@@ -1232,6 +1321,13 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT COALESCE(MAX(seq), -1) AS m FROM job_events WHERE job_id=?", (job_id,)).fetchone()
             return int(row["m"])
+
+
+def _col(row: sqlite3.Row, name: str) -> Any:
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None  # base non migrée (vieux broker en rollback) : inconnu, pas inventé
 
 
 def _iso(ts: float | None) -> str | None:

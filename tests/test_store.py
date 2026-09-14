@@ -220,14 +220,33 @@ def test_double_connection_supersedes_old_session(env):
 
 
 def test_runner_restart_reconciles_without_relaunch(env):
-    store, _, epoch = env
+    store, clock, epoch = env
     start(store, prompt="a")
     start(store, prompt="b")
     c1, c2 = store.claim("pc", epoch, 2)
     run_to_running(store, epoch, c1)  # a running, b claimed
-    store.hello("pc", INFO, [])  # restart, rien détenu
-    assert store.get_job(c1["job_id"])["state"] == "lost"
+    store.hello("pc", INFO, [])  # restart, rien détenu : a parqué (pas lost), b requeued
+    assert store.get_job(c1["job_id"])["state"] == "running"
+    assert store.get_job(c1["job_id"])["recovery_state"] == "suspended"
     assert store.get_job(c2["job_id"])["state"] == "queued"
+    # Sans rattachement, le parking ne se prolonge pas : grâce expirée -> lost.
+    clock.t += P.RECOVERY_GRACE_S + 1
+    assert store.reap()["lost"] == 1
+    assert store.get_job(c1["job_id"])["state"] == "lost"
+
+
+def test_runner_restart_with_recovering_journal_reattaches(env):
+    store, _, epoch = env
+    start(store)
+    [c] = store.claim("pc", epoch, 1)
+    run_to_running(store, epoch, c)
+    e2 = store.hello("pc", INFO, [{"job_id": c["job_id"], "fencing": 1, "recovering": True}])
+    view = store.get_job(c["job_id"])
+    assert view["state"] == "running" and view["recovery_state"] == "recovering"
+    assert view["resume_count"] == 1
+    store.transition("pc", e2, c["job_id"], 1, "running", "completed", exit_code=0)
+    done = store.get_job(c["job_id"])
+    assert done["state"] == "completed" and done["recovery_state"] is None
 
 
 def test_reconnect_keeps_held_job(env):
@@ -240,12 +259,30 @@ def test_reconnect_keeps_held_job(env):
     assert store.get_job(c["job_id"])["state"] == "completed"
 
 
-def test_lease_expiry_after_start_is_lost_never_completed(env):
+def test_lease_expiry_parks_then_lost_after_grace(env):
     store, clock, epoch = env
     start(store)
     [c] = store.claim("pc", epoch, 1)
     run_to_running(store, epoch, c)
     clock.t += P.LEASE_S + 1
+    stats = store.reap()
+    assert stats["suspended"] == 1 and stats["lost"] == 0
+    parked = store.get_job(c["job_id"])
+    assert parked["state"] == "running" and parked["recovery_state"] == "suspended"
+    # Pendant la grâce, la reprise reste possible (même fencing, epoch rattaché).
+    e2 = store.hello("pc", INFO, [{"job_id": c["job_id"], "fencing": 1, "recovering": True}])
+    store.transition("pc", e2, c["job_id"], 1, "running", "completed", exit_code=0)
+    assert store.get_job(c["job_id"])["state"] == "completed"
+
+
+def test_lease_expiry_grace_expired_is_lost_never_completed(env):
+    store, clock, epoch = env
+    start(store)
+    [c] = store.claim("pc", epoch, 1)
+    run_to_running(store, epoch, c)
+    clock.t += P.LEASE_S + 1
+    assert store.reap()["suspended"] == 1
+    clock.t += P.RECOVERY_GRACE_S + 1
     assert store.reap()["lost"] == 1
     with pytest.raises(BrokerError):
         store.transition("pc", epoch, c["job_id"], 1, "running", "completed", exit_code=0)

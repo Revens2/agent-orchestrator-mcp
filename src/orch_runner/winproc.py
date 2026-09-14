@@ -81,6 +81,11 @@ if IS_WINDOWS:
     kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
     ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
     ntdll.NtResumeProcess.restype = ctypes.c_long
 
@@ -179,3 +184,55 @@ def is_fixed_drive(path: str) -> bool:
     if len(drive) != 2 or drive[1] != ":":
         return False
     return kernel32.GetDriveTypeW(drive + "\\") == DRIVE_FIXED
+
+
+def process_create_time(pid: int) -> float | None:
+    """Create time Windows (epoch) d'un PID, ou None si introuvable/inaccessible.
+
+    Sert à déjouer le recyclage de PID : un record de reprise n'est rattaché que si
+    le PID vivant a la même origine temporelle (tolérance dans `is_same_process`).
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    except Exception:  # noqa: BLE001 - best-effort
+        return None
+    if not handle:
+        return None
+    try:
+        class _FT(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+        creation, _exit, _kernel, _user = _FT(), _FT(), _FT(), _FT()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(_exit),
+                                        ctypes.byref(_kernel), ctypes.byref(_user)):
+            return None
+        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime  # 100 ns depuis 1601
+        epoch = ticks / 10_000_000 - 11_644_473_600
+        return float(epoch)
+    except Exception:  # noqa: BLE001 - best-effort
+        return None
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001, S110 - best-effort
+            pass
+
+
+def is_same_process(pid: int, expected_started_at: float | None, tolerance_s: float = 30.0) -> bool:
+    """Vrai si un processus vivant avec ce PID a démarré au moment attendu.
+
+    `expected_started_at` = time.time() enregistré au spawn (+ tolérance). Après un
+    reboot, aucun survivant : faux. En cas d'info indisponible : faux (jamais de
+    rattachement inventé).
+    """
+    if expected_started_at is None:
+        return False
+    actual = process_create_time(pid)
+    if actual is None:
+        return False
+    # process_create_time = horloge murale ; expected_started_at = time.time() au spawn.
+    # Le processus naît après l'enregistrement : actual >= expected - tolérance.
+    return abs(actual - float(expected_started_at)) <= tolerance_s and actual >= float(expected_started_at) - tolerance_s

@@ -120,7 +120,10 @@ def test_lost_keeps_unknown_issue_with_layers(env):
     [c] = store.claim("pc", epoch, 1)
     to_running(store, epoch, c)
     clock.t += P.LEASE_S + 1
-    assert store.reap()["lost"] == 1
+    assert store.reap()["suspended"] == 1  # d'abord parqué, jamais lost aussitôt
+    assert store.get_job(c["job_id"])["recovery_state"] == "suspended"
+    clock.t += P.RECOVERY_GRACE_S + 1
+    assert store.reap()["lost"] == 1  # grâce expirée sans reprise : lost
     view = store.get_job(c["job_id"])
     assert view["state"] == "lost"
     assert "inconnue" in (view["error"] or "")
@@ -192,9 +195,10 @@ def test_hello_reconcile_emits_runner_disconnect(env):
     start(store, prompt="a")
     [c] = store.claim("pc", epoch, 1)
     to_running(store, epoch, c)
-    store.hello("pc", INFO, [])  # restart : job perdu
+    store.hello("pc", INFO, [])  # restart : job parqué (suspended), pas lost
     kinds = [e["kind"] for e in store.read_events(c["job_id"])["events"]]
     assert P.EV_RUNNER_DISCONNECT in kinds
+    assert store.get_job(c["job_id"])["recovery_state"] == "suspended"
 
 
 def test_event_detail_redacted(env):
@@ -318,6 +322,10 @@ def test_mission_lost_becomes_incomplete_never_retried(env):
     [c] = store.claim("pc", epoch, 1)
     to_running(store, epoch, c)
     clock.t += P.LEASE_S + 1
+    assert store.reap()["suspended"] == 1
+    # Parqué : la mission reste executing (reprise encore possible, pas de retry auto).
+    assert store.get_mission(m["mission_id"])["state"] == "executing"
+    clock.t += P.RECOVERY_GRACE_S + 1
     assert store.reap()["lost"] == 1
     got = store.get_mission(m["mission_id"])
     assert got["state"] == "incomplete"  # cause inconnue : décision humaine requise
