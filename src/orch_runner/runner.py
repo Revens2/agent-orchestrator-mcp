@@ -386,13 +386,76 @@ class Runner:
         self.last_ok = time.monotonic()
         self.connected = False
         self._info_cache: dict[str, Any] | None = None
+        # runtime_id -> {"next": monotonic, "delay": s} : seuls les runtimes en échec y figurent.
+        self._retry: dict[str, dict[str, float]] = {}
+        self._refresh_thread: threading.Thread | None = None
 
     # ---------------------------------------------------------------- session
+    def _probe(self, rt_id: str) -> dict[str, Any]:
+        rt = self.config.runtimes[rt_id]
+        return ADAPTERS[rt_id](rt.exe, rt.extra, self.config.permission_policy).probe()
+
+    def _schedule_retry(self, rt_id: str, now: float) -> None:
+        prev = self._retry.get(rt_id)
+        lo, hi = self.config.runtime_refresh_min_s, max(self.config.runtime_refresh_min_s, self.config.runtime_refresh_max_s)
+        delay = float(lo) if prev is None else min(prev["delay"] * 2, float(hi))
+        self._retry[rt_id] = {"next": now + delay, "delay": delay}
+
+    def refresh_runtimes(self, now: float | None = None) -> bool:
+        """Re-probe les runtimes indisponibles dont l'échéance est passée. Si l'un
+        redevient disponible, met à jour l'info annoncée et force un hello. Les
+        runtimes disponibles ne sont jamais re-sondés. Retourne True si l'info a changé."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            due = [rt_id for rt_id, st in self._retry.items() if st["next"] <= now]
+        recovered: dict[str, dict[str, Any]] = {}
+        for rt_id in due:
+            try:
+                entry = self._probe(rt_id)
+            except Exception:  # noqa: BLE001 - un probe ne doit jamais tuer la boucle
+                entry = {"available": False}
+            with self.lock:
+                if entry.get("available"):
+                    self._retry.pop(rt_id, None)
+                    recovered[rt_id] = entry
+                else:
+                    self._schedule_retry(rt_id, now)
+                    log.info("runtime_still_unavailable id=%s next_in_s=%.0f", rt_id, self._retry[rt_id]["delay"])
+        if not recovered:
+            return False
+        with self.lock:
+            if self._info_cache is not None:
+                runtimes = [recovered.get(r.get("id"), r) for r in self._info_cache.get("runtimes", [])]
+                self._info_cache = {**self._info_cache, "runtimes": runtimes}
+        for rt_id in recovered:
+            log.info("runtime_recovered id=%s", rt_id)
+        self._resync.set()  # le hello suivant annonce la nouvelle info au broker
+        return True
+
+    def _maybe_refresh_runtimes(self) -> None:
+        """Appelé par le heartbeat : ne sonde rien lui-même ; lance au plus un
+        thread de refresh, seulement si un runtime en échec est arrivé à échéance."""
+        now = time.monotonic()
+        with self.lock:
+            if not any(st["next"] <= now for st in self._retry.values()):
+                return
+            if self._refresh_thread is not None and self._refresh_thread.is_alive():
+                return
+            self._refresh_thread = threading.Thread(target=self.refresh_runtimes, name="runtime-refresh", daemon=True)
+            self._refresh_thread.start()
+
     def info(self) -> dict[str, Any]:
         runtimes = []
+        now = time.monotonic()
         for rt_id, rt in self.config.runtimes.items():
             if rt.enabled and rt_id in ADAPTERS:
-                runtimes.append(ADAPTERS[rt_id](rt.exe, rt.extra, self.config.permission_policy).probe())
+                entry = self._probe(rt_id)
+                runtimes.append(entry)
+                with self.lock:
+                    if entry.get("available"):
+                        self._retry.pop(rt_id, None)
+                    else:
+                        self._schedule_retry(rt_id, now)
         workspaces = []
         env: dict[str, Any] = {}
         for ws in self.config.workspaces.values():
@@ -444,6 +507,7 @@ class Runner:
     # ------------------------------------------------------------------ loops
     def heartbeat_loop(self) -> None:
         while not self.stop_event.wait(P.HEARTBEAT_S):
+            self._maybe_refresh_runtimes()
             try:
                 if self._resync.is_set():
                     self.hello()

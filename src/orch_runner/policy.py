@@ -68,6 +68,9 @@ class Config:
     home: Path
     offline_kill_s: int = 120
     permission_policy: str = P.UNATTENDED
+    # Re-probe des seuls runtimes indisponibles (backoff exponentiel borné).
+    runtime_refresh_min_s: int = 60
+    runtime_refresh_max_s: int = 900
 
     @staticmethod
     def load(path: Path | None = None) -> Config:
@@ -106,6 +109,8 @@ class Config:
             home=home,
             offline_kill_s=int(raw.get("offline_kill_s", 120)),
             permission_policy=policy,
+            runtime_refresh_min_s=max(10, int(raw.get("runtime_refresh_min_s", 60))),
+            runtime_refresh_max_s=max(10, int(raw.get("runtime_refresh_max_s", 900))),
         )
 
 
