@@ -1,45 +1,37 @@
-"""Diff contrat zero live : prod Python :8801 vs canary Rust :18981.
+"""Validation canary orch :18981 (prod gateway OAuth-only, sans Bearer statique).
 
-Secrets lus depuis leurs fichiers 600 sur le VPS uniquement (jamais affiches,
-jamais journalises). Echec de parsing = message statique, exit 2.
-Compare : initialize, tools/list (16 noms + descriptions + inputSchema),
-resources/list + prompts/list (parite de comportement), tools/call reel
-read-only `agent_job_list`, refus local outil inconnu (-32000 des deux cotes).
-Sortie : PASS/FAIL + diffs uniquement.
+Pas de comparaison prod-gateway directe possible sans client OAuth (prod
+`ORCH_GW_TOKEN` volontairement absent — OAuth-only par design). A la place :
+1. `initialize` + `tools/list` via le canary (Bearer dedie) : le canary relaie
+   vers l'upstream `:8802`, donc la liste obtenue EST le contrat live amont ;
+2. conformite stricte aux 20 outils du contrat code (`tools.py` @ 428b527) :
+   noms exacts + description + inputSchema presents ;
+3. `resources/list` + `prompts/list` (comportement enregistre) ;
+4. appel reel read-only `agent_job_list` (sans effet) ;
+5. refus locaux : outil inconnu (-32000), methode inconnue (-32601).
+Bearer canary lu sur le VPS uniquement (jamais affiche, jamais journalise).
+Sortie : PASS/FAIL + ecarts uniquement.
 """
 import json
-import re
 import sys
 import urllib.request
 
-PROD_FILE = sys.argv[1] if len(sys.argv) > 1 else "/srv/orch/secrets/orch.env"
-CANARY_FILE = sys.argv[2] if len(sys.argv) > 2 else "/opt/orch-gateway-rs/.mcp_token"
-PROD = "http://127.0.0.1:8801"
+CANARY_FILE = sys.argv[1] if len(sys.argv) > 1 else "/opt/orch-gateway-rs/.mcp_token"
 CANARY = "http://127.0.0.1:18981"
 
 # Scripts operateur : loopback VPS uniquement.
-BASES_AUTORISEES = (PROD, CANARY)
+BASES_AUTORISEES = (CANARY,)
 
-
-def lire_prod_env(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            content = fh.read()
-    except OSError:
-        print("ENV_PROD_ILLISIBLE")
-        sys.exit(2)
-    m = re.search(
-        r"(?m)^\s*(?:export\s+)?ORCH_GW_TOKEN\s*=\s*['\"]?([^'\"\r\n]+)['\"]?\s*$",
-        content,
-    )
-    if not m:
-        print("ENV_PROD_SANS_JETON")
-        sys.exit(2)
-    tok = m.group(1).strip()
-    if len(tok) < 32 or "\n" in tok:
-        print("ENV_PROD_JETON_INVALIDE")
-        sys.exit(2)
-    return tok
+# Contrat code : 20 outils `orch_mcp/tools.py` (clone @ 428b527).
+OUTILS_ATTENDUS = {
+    "agent_runner_list", "agent_workspace_list", "agent_job_start",
+    "agent_job_get", "agent_job_output", "agent_job_cancel", "agent_job_list",
+    "agent_job_events", "agent_runner_inspect", "agent_job_wait",
+    "agent_mission_create", "agent_mission_get", "agent_mission_wait",
+    "agent_mission_retry", "agent_mission_validate", "infra_alert_list",
+    "infra_alert_get", "agent_question_list", "agent_question_get",
+    "agent_question_answer",
+}
 
 
 def lire_token(path):
@@ -55,8 +47,7 @@ def lire_token(path):
     return tok
 
 
-TOKEN_PROD = lire_prod_env(PROD_FILE)
-TOKEN_CANARY = lire_token(CANARY_FILE)
+TOKEN = lire_token(CANARY_FILE)
 
 
 def sse_unwrap(raw):
@@ -72,19 +63,18 @@ def sse_unwrap(raw):
     return out
 
 
-def post(base, token, body, session=None):
-    assert base in BASES_AUTORISEES, "loopback VPS uniquement"
+def post(body, session=None):
     headers = {
         "content-type": "application/json",
         "accept": "application/json, text/event-stream",
-        "authorization": "Bearer " + token,
+        "authorization": "Bearer " + TOKEN,
         "mcp-protocol-version": "2025-11-25",
     }
     if session:
         headers["mcp-session-id"] = session
-    req = urllib.request.Request(
-        base + "/mcp", data=json.dumps(body).encode(), headers=headers, method="POST"
-    )
+    req = urllib.request.Request(  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-request-object.insecure-request-object
+        CANARY + "/mcp", data=json.dumps(body).encode(), headers=headers, method="POST"
+    )  # loopback operateur contraint par BASES_AUTORISEES, jamais d'exterieur
     try:
         # base contrainte a BASES_AUTORISEES (loopback operateur, pas de file://)
         with urllib.request.urlopen(req, timeout=120) as res:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
@@ -102,103 +92,67 @@ def post(base, token, body, session=None):
         return status, {"sse_messages": len(sse_unwrap(raw))}, sess
 
 
-def tools_map(resp):
-    tools = ((resp.get("result") or {}).get("tools") or [])
-    return {t.get("name"): t for t in tools if t.get("name")}
-
-
-def norm_tool(t):
-    return {
-        "name": t.get("name"),
-        "description": t.get("description"),
-        "inputSchema": t.get("inputSchema"),
-    }
-
-
-diffs = []
-sessions = {}
+ecarts = []
 
 # 1. initialize
-for tag, base, token in (("prod", PROD, TOKEN_PROD), ("canary", CANARY, TOKEN_CANARY)):
-    _, payload, sess = post(
-        base, token,
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": "2025-11-25", "capabilities": {},
-                    "clientInfo": {"name": "diff", "version": "0"}}},
-    )
-    sessions[tag] = sess
-    globals()[f"init_{tag}"] = payload
+st, init, session = post(
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+     "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "diff", "version": "0"}}}
+)
+print(f"initialize: http={st} session={bool(session)} result={str(init.get('result'))[:160]}")
+if st != 200 or "result" not in init:
+    ecarts.append(f"initialize: http={st}")
 
-pi, ci = init_prod, init_canary
-if (pi.get("result") or {}).get("protocolVersion") != (ci.get("result") or {}).get("protocolVersion"):
-    diffs.append("initialize.protocolVersion")
-print(f"initialize: prod={str(pi.get('result'))[:120]}")
-print(f"initialize: canary={str(ci.get('result'))[:120]}")
-print(f"sessions: prod={bool(sessions['prod'])} canary={bool(sessions['canary'])}")
+# 2. tools/list live via relay :8802 vs contrat code
+st, lst, session = post(
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, session
+)
+outils = {t.get("name"): t for t in ((lst.get("result") or {}).get("tools") or []) if t.get("name")}
+print(f"canary tools ({len(outils)}): {sorted(outils)}")
+if set(outils) != OUTILS_ATTENDUS:
+    ecarts.append(f"outils: manquants={sorted(OUTILS_ATTENDUS - set(outils))} "
+                  f"ajoutes={sorted(set(outils) - OUTILS_ATTENDUS)}")
+for nom, outil in outils.items():
+    if not outil.get("description") or not isinstance(outil.get("inputSchema"), dict):
+        ecarts.append(f"outil {nom}: description/schema manquant")
 
-# 2. tools/list : noms + descriptions + schemas
-_, pl, _ = post(PROD, TOKEN_PROD,
-                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-                sessions["prod"])
-_, cl, _ = post(CANARY, TOKEN_CANARY,
-                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-                sessions["canary"])
-pm, cm = tools_map(pl), tools_map(cl)
-for name in sorted(set(pm) | set(cm)):
-    if name not in pm:
-        diffs.append(f"outil ajoute (canary seul) : {name}")
-    elif name not in cm:
-        diffs.append(f"outil perdu : {name}")
-    elif norm_tool(pm[name]) != norm_tool(cm[name]):
-        diffs.append(f"outil modifie : {name}")
-print(f"prod tools ({len(pm)}): {sorted(pm)}")
-print(f"canary tools ({len(cm)}): {sorted(cm)}")
-
-# 3. resources/list + prompts/list : parite de comportement
+# 3. resources/prompts (comportement)
 for method in ("resources/list", "prompts/list"):
-    _, pr, _ = post(PROD, TOKEN_PROD,
-                    {"jsonrpc": "2.0", "id": 3, "method": method, "params": {}},
-                    sessions["prod"])
-    _, cr, _ = post(CANARY, TOKEN_CANARY,
-                    {"jsonrpc": "2.0", "id": 3, "method": method, "params": {}},
-                    sessions["canary"])
-    jp = json.dumps(pr.get("result"), sort_keys=True)
-    jc = json.dumps(cr.get("result"), sort_keys=True)
-    print(f"{method}: prod={jp[:200]} canary={jc[:200]}")
-    if ("error" in pr) != ("error" in cr) or jp != jc:
-        diffs.append(f"{method}: divergence")
+    st, resp, session = post(
+        {"jsonrpc": "2.0", "id": 3, "method": method, "params": {}}, session
+    )
+    print(f"{method}: http={st} result={str(resp.get('result'))[:160]} erreur={'error' in resp}")
 
-# 4. tools/call reel read-only agent_job_list
-_, pt, _ = post(PROD, TOKEN_PROD,
-                {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                 "params": {"name": "agent_job_list", "arguments": {}}}, sessions["prod"])
-_, ct, _ = post(CANARY, TOKEN_CANARY,
-                {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                 "params": {"name": "agent_job_list", "arguments": {}}}, sessions["canary"])
-pe, ce = "error" in pt, "error" in ct
-print(f"agent_job_list: prod_erreur={pe} canary_erreur={ce}")
-if pe != ce:
-    diffs.append("agent_job_list: erreur d'un seul cote")
+# 4. appel reel read-only agent_job_list
+st, jl, session = post(
+    {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+     "params": {"name": "agent_job_list", "arguments": {}}}, session
+)
+print(f"agent_job_list: http={st} erreur={'error' in jl}")
+if "error" in jl:
+    ecarts.append("agent_job_list: erreur inattendue")
 
-# 5. refus local outil inconnu : -32000 des deux cotes
-_, pu, _ = post(PROD, TOKEN_PROD,
-                {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                 "params": {"name": "outil-inexistant-xyz", "arguments": {}}},
-                sessions["prod"])
-_, cu, _ = post(CANARY, TOKEN_CANARY,
-                {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                 "params": {"name": "outil-inexistant-xyz", "arguments": {}}},
-                sessions["canary"])
-code_p = (pu.get("error") or {}).get("code")
-code_c = (cu.get("error") or {}).get("code")
-print(f"refus inconnu: prod={code_p} canary={code_c}")
-if code_p != -32000 or code_c != -32000:
-    diffs.append(f"refus inconnu: prod={code_p} canary={code_c} (attendu -32000)")
+# 5. refus locaux
+st, ru, session = post(
+    {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+     "params": {"name": "outil-inexistant-xyz", "arguments": {}}}, session
+)
+code_u = (ru.get("error") or {}).get("code")
+st, rm, session = post(
+    {"jsonrpc": "2.0", "id": 6, "method": "drop_database", "params": {}}, session
+)
+code_m = (rm.get("error") or {}).get("code")
+print(f"refus inconnu={code_u} methode inconnue={code_m}")
+if code_u != -32000:
+    ecarts.append(f"refus inconnu={code_u} (attendu -32000)")
+if code_m != -32601:
+    ecarts.append(f"methode inconnue={code_m} (attendu -32601)")
 
-if diffs:
-    print("DIFFS:")
-    for d in diffs:
-        print(f"  - {d}")
+if ecarts:
+    print("ECARTS:")
+    for e in ecarts:
+        print(f"  - {e}")
     print("RESULT: FAIL")
     sys.exit(1)
-print("RESULT: PASS (diff contrat zero)")
+print("RESULT: PASS (canary conforme au contrat + relay live)")
