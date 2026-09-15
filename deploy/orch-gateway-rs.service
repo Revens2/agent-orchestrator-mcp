@@ -1,0 +1,43 @@
+[Unit]
+Description=Orch MCP facade Rust (canary, loopback 18981)
+After=network-online.target orch-gateway.service
+Wants=network-online.target
+
+[Service]
+# Canary : ne touche JAMAIS au service prod orch-gateway.service.
+# Bascule atomique GATEE (OAuth JWT meme famille + rotation = exploitant).
+User=orch-app
+Group=orch-app
+WorkingDirectory=/opt/orch-gateway-rs
+Environment=ORCH_GW_RS_ISSUER=https://mymcps.duckdns.org/oauth/orch
+Environment=ORCH_GW_RS_UPSTREAM=http://127.0.0.1:8802
+Environment=ORCH_GW_RS_PORT=18981
+Environment=ORCH_GW_RS_TOKEN_FILE=/opt/orch-gateway-rs/.mcp_token
+Environment="ORCH_GW_RS_TOKEN_SCOPES=orch:lecture orch:ecriture"
+ExecStart=/opt/orch-gateway-rs/orch-gateway-rs
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/orch-gateway-rs
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

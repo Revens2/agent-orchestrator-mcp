@@ -1,0 +1,38 @@
+[package]
+name = "orch-gateway-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+description = "Facade Rust orch-gateway : mcp-framework-rs + upstream Python orch-mcp fige"
+publish = false
+
+[workspace]
+
+[lib]
+name = "orch_gateway_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orch-gateway-rs"
+path = "src/main.rs"
+
+[dependencies]
+mcp-core = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "a0c35f6db66640a2022daa01a93cef24789343e1", version = "0.1.0" }
+mcp-http = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "a0c35f6db66640a2022daa01a93cef24789343e1", version = "0.1.0" }
+mcp-auth = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "a0c35f6db66640a2022daa01a93cef24789343e1", version = "0.1.0" }
+mcp-observe = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "a0c35f6db66640a2022daa01a93cef24789343e1", version = "0.1.0" }
+mcp-gateway = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "a0c35f6db66640a2022daa01a93cef24789343e1", version = "0.1.0" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8" }
+tracing = { version = "0.1" }
+serde = { version = "1" }
+serde_json = { version = "1" }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-manual-roots"] }
+zeroize = { version = "1" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8" }
+tower = { version = "0.5", features = ["full"] }
+serde_json = { version = "1" }
