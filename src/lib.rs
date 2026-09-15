@@ -202,6 +202,15 @@ fn build_router_full(
     let file = mount
         .filter(|m| !m.etat_path.trim().is_empty())
         .map(|m| Arc::new(FileStore::new(&m.etat_path)));
+    if let Some(f) = &file {
+        // Fail-closed par requête si illisible (le magasin naît à la première
+        // émission Python) ; le Bearer statique reste disponible.
+        if std::fs::metadata(f.etat_path()).is_ok() {
+            tracing::info!("pont fichier OAuth (read-only) monte");
+        } else {
+            tracing::warn!("pont fichier OAuth illisible au boot (fail-closed par requete)");
+        }
+    }
     let chained = Arc::new(ChainedResolver::new(Arc::clone(&store), file));
     let oauth_state = OAuthState {
         config: Arc::new(cfg.oauth.clone()),
