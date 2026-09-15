@@ -44,7 +44,7 @@ les workspaces sont annoncés au `hello`. Un chemin invalide est ignoré (log `w
 - `[runtimes.<id>] enabled = true`, `exe = '<chemin absolu .exe>'` (les shims `.cmd` sont refusés).
 - Nouveau runtime : classe `Adapter` dans `src/orch_runner/adapters.py` (argv, transport du prompt,
   mapping des modes, parsing de fin), id ajouté à `orch_protocol.RUNTIMES` et au `Literal` de
-  `orch_mcp/tools.py`, tests `ORCH_REAL=<id> pytest tests/test_real_runtimes.py`.
+  `orch_mcp/tools.py`, tests `ORCH_REAL=<id> pytest tests/test_real_runtimes.py` (pour `claude-code` et `codex` qui consomment du quota payant, `ORCH_ALLOW_PAID=1` est obligatoire).
 
 ## Politique de permissions (locale au runner)
 
