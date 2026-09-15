@@ -136,16 +136,34 @@ def hermes_argv_for_slot(slot):
     return argv
 
 
+_PROFILE_OK = {}  # slot -> True (cache process-local, profils quasi-statiques)
+
+
 def slot_profile_ready(slot):
     """Le profil du slot existe-t-il cote conteneur ?
 
-    Hors docker (tests) : toujours vrai. Si le profil manque en prod, le
-    spawn attend l'operateur au lieu de faire echouer le job."""
+    Hors docker (tests) : toujours vrai. Verifie via `docker exec ... test -d`
+    (le spool hote /srv/hermes/data n'est pas lisible par hermes-ops, un
+    isdir() hote serait un faux negatif permanent). Resultat mis en cache ;
+    un echec de verification differe le spawn (sens sur : retry, jamais de
+    job tue) au lieu de faire echouer le job."""
     if HERMES_ARGV[0] != "docker":
         return True
     if not slot or slot not in PROFILE_POOL:
         return True
-    return os.path.isdir("/srv/hermes/data/profiles/" + slot)
+    if _PROFILE_OK.get(slot):
+        return True
+    try:
+        r = subprocess.run(["docker", "exec", "hermes", "test", "-d",
+                            "/opt/data/profiles/" + slot],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if r.returncode == 0:
+        _PROFILE_OK[slot] = True
+        return True
+    return False
 
 
 def LOG(*a):

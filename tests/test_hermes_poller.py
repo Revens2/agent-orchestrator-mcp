@@ -241,6 +241,31 @@ def test_argv_pins_dedicated_profile(pv2, monkeypatch):
     assert pv2.profile_home_for_slot(None) == "/opt/data"
 
 
+def test_slot_profile_ready_checks_container(pv2, tmp_path, monkeypatch):
+    """Controle profil cote conteneur (le spool hote est illisible)."""
+    monkeypatch.setattr(pv2, "HERMES_ARGV",
+                        ["docker", "exec", "-i", "hermes", "hermes", "chat"])
+    calls = []
+
+    class _R:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        assert argv[-1].startswith("/opt/data/profiles/orch-slot-")
+        return _R(0)
+
+    monkeypatch.setattr(pv2.subprocess, "run", fake_run)
+    pv2._PROFILE_OK.clear()
+    assert pv2.slot_profile_ready("orch-slot-03") is True
+    assert pv2.slot_profile_ready("orch-slot-03") is True  # cache : 1 seul appel
+    assert len(calls) == 1
+    monkeypatch.setattr(pv2.subprocess, "run", lambda *a, **k: _R(1))
+    pv2._PROFILE_OK.clear()
+    assert pv2.slot_profile_ready("orch-slot-04") is False  # differe, ne tue pas
+
+
 def test_two_concurrent_jobs_get_distinct_slots(pv2, tmp_path):
     """Deux jobs simultanes : slots distincts, logs separes, slots liberes."""
     st, a = _claimed_ws(pv2, tmp_path, "job-A-isole", mode="read_only")
