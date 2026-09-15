@@ -344,6 +344,92 @@ class OpenCode(Adapter):
         return Outcome(ok, self.last_text, None if ok else (f"exit code {exit_code}" + (f", {error}" if error else "")))
 
 
+class ClaudeDesktop(Adapter):
+    """Claude Desktop (application MSIX) pilotée via UIA par `claude_desktop_bridge.py`.
+
+    - `exe` = interpréteur Python (le bridge est un module, comme `fake`) ;
+    - prompt transporté par FICHIER (`--prompt-file`, jamais interpolé en argv) ;
+    - `read_only` UNIQUEMENT : aucun confinement au workspace n'est démontrable
+      (l'app partage le profil/l'historique de l'utilisateur) ;
+    - le bridge vérifie le package MSIX, le processus Desktop (CLI exclue), la
+      fenêtre visible et le profil attendu, sérialise l'UI (verrou fichier) et
+      écrit `last_message.txt` (même convention que `codex`).
+    """
+
+    id = "claude-desktop"
+    modes: tuple[str, ...] = ("read_only",)
+
+    def __init__(self, exe, extra=None, policy=P.UNATTENDED):
+        super().__init__(exe or sys.executable, extra, policy)
+        self._bridge = str(Path(__file__).with_name("claude_desktop_bridge.py"))
+
+    def _profile(self) -> str:
+        return str(self.extra.get("profile") or os.environ.get("ORCH_CLAUDE_DESKTOP_PROFILE", "Caroline"))
+
+    def probe(self) -> dict[str, Any]:
+        info: dict[str, Any] = {"id": self.id, "available": False, "modes": list(self.modes)}
+        if not os.path.isfile(self._bridge):
+            info["reason"] = "bridge introuvable"
+            return info
+        if not (os.path.isabs(self.exe) and self.exe.lower().endswith(".exe") and os.path.isfile(self.exe)):
+            info["reason"] = "exécutable absent ou non .exe"
+            return info
+        try:
+            out = subprocess.run(
+                [self.exe, self._bridge, "--verify-only", "--profile", self._profile()],
+                capture_output=True, text=True, timeout=int(self.extra.get("verify_timeout_s", 90)),
+                creationflags=0x08000000, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL,
+            )
+            tail = ((out.stdout or "") + (out.stderr or "")).strip().splitlines()
+            info["version"] = tail[-1][:120] if tail else ""
+            info["available"] = out.returncode == 0
+            if out.returncode != 0:
+                info["reason"] = (tail[-1] if tail else "verify_failed")[:200]
+        except Exception as exc:  # noqa: BLE001
+            info["reason"] = type(exc).__name__
+        return info
+
+    def build(self, prompt, mode, cwd, tmpdir):
+        if mode not in self.modes:
+            raise ValueError("claude-desktop : seul read_only est supporté (confinement Desktop au workspace non démontrable)")
+        prompt_file = Path(tmpdir) / "prompt.txt"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        argv = [self.exe, self._bridge, "--prompt-file", str(prompt_file), "--out-dir", str(tmpdir), "--profile", self._profile()]
+        if self.extra.get("timeout_s"):
+            argv += ["--timeout-s", str(int(self.extra["timeout_s"]))]
+        return Launch(argv, None)
+
+    def on_line(self, line):
+        data = _json(line)
+        if data is None:
+            if line.startswith("SUMMARY:"):
+                self.last_text = line[8:].strip()
+            return line, None
+        kind = data.get("type")
+        text = data.get("text") if isinstance(data.get("text"), str) else ""
+        if kind == "result":
+            self.last_text = text
+            return text + "\n", text[:120] or "result"
+        if kind == "activity":
+            return None, text[:120] or "activity"
+        if kind == "error":
+            return f"[error] {text}\n", f"error: {text[:100]}"
+        return None, kind[:120] if isinstance(kind, str) else None
+
+    def finish(self, exit_code, tmpdir):
+        last = Path(tmpdir) / "last_message.txt"
+        summary = last.read_text(encoding="utf-8", errors="replace").strip() if last.exists() else self.last_text
+        summary = (summary or "")[:8000] or None
+        ok = exit_code == 0 and bool(summary)
+        if ok:
+            return Outcome(True, summary, None)
+        err = f"exit code {exit_code}" if exit_code else "réponse vide"
+        if summary:
+            err += " (sortie partielle conservée)"
+        return Outcome(False, summary, err)
+
+
 class Fake(Adapter):
     """Fixture de test : `python fake_agent.py`, script piloté par le prompt (stdin)."""
 
@@ -365,4 +451,4 @@ class Fake(Adapter):
         return line, line.strip()[:120] or None
 
 
-ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, Codex, Agy, OpenCode, Fake)}
+ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, Codex, Agy, OpenCode, Fake, ClaudeDesktop)}

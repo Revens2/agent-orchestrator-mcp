@@ -610,6 +610,13 @@ class Store:
             raise BrokerError("invalid_workspace", "workspace_id invalide (identifiant d'allowlist attendu, pas un chemin)")
         if mode not in P.MODES:
             raise BrokerError("invalid_mode", f"mode inconnu ; autorisés : {', '.join(P.MODES)}")
+        allowed_modes = P.RUNTIME_MODES.get(runtime)
+        if allowed_modes is not None and mode not in allowed_modes:
+            raise BrokerError(
+                "mode_denied",
+                f"runtime {runtime} : mode {mode} non supporté (confinement workspace non démontrable) ; "
+                f"autorisés : {', '.join(allowed_modes)}",
+            )
         if not isinstance(prompt, str) or not prompt.strip():
             raise BrokerError("invalid_prompt", "prompt vide")
         if "\x00" in prompt or len(prompt) > P.MAX_PROMPT_CHARS:

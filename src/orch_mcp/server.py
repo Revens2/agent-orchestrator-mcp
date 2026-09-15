@@ -32,7 +32,8 @@ log = logging.getLogger("orch_mcp")
 
 INSTRUCTIONS = (
     "Orchestrateur d'agents IA personnels (≠ MCP Astra). Lance de vrais agents existants "
-    "(Claude Code, Codex, Antigravity, OpenCode) sur le PC Windows autorisé, dans des workspaces "
+    "(Claude Code, Codex, Antigravity, OpenCode, Claude Desktop — ce dernier read_only uniquement) "
+    "sur le PC Windows autorisé, dans des workspaces "
     "allowlistés. Flux : agent_runner_list -> agent_workspace_list -> agent_job_start (asynchrone, "
     "contrat de suivi : rappeler agent_job_wait jusqu'à terminal=true dans le même tour) "
     "-> agent_job_get/output/events jusqu'à un état terminal. Missions : agent_mission_create -> "

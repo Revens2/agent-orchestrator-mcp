@@ -68,6 +68,7 @@ workspace reste le verrou le plus fort.
 | codex | stdin | `-s read-only -c approval_policy="never"` | `-s danger-full-access -c approval_policy="never"` | `-s workspace-write -c approval_policy="never"` | sandbox + approbation toujours explicites (jamais `config.toml`) |
 | agy | `--print=` | `--mode plan --sandbox` | `--mode accept-edits --dangerously-skip-permissions` | `--mode accept-edits --sandbox` | workspace via `--add-dir` + prompt : pas de confinement strict du dossier |
 | opencode | argv après `--` | `--agent plan` | `--agent build --auto` | refusé | `-m` épinglé par `model` ; `--auto` n'honore que les `deny` explicites de la config opencode |
+| claude-desktop | fichier `--prompt-file` | bridge UIA `claude_desktop_bridge.py` (profil vérifié, UI sérialisée) | refusé | refusé | read_only seul (confinement workspace non démontrable) ; vole le focus pendant le job |
 
 ### OpenCode
 
@@ -266,6 +267,63 @@ sudo systemctl restart hermes-orch-poller && journalctl -u hermes-orch-poller -n
 # rollback
 sudo cp -a $B/poller_v2.py $B/runtime_support.py /var/lib/hermes-ops/orch-poller-v2/ && sudo systemctl restart hermes-orch-poller
 ```
+
+## Runtime Claude Desktop (claude-desktop)
+
+Pilote l'application Claude Desktop Windows (MSIX, éditeur Anthropic — constaté
+`Claude 1.52386.6.0`, profil `Caroline · Pro`) via `src/orch_runner/claude_desktop_bridge.py`,
+distinct du runtime CLI `claude-code`. Cascade reprise d'`osauto` (projet local
+`C:\Users\Juliann\Desktop\ui controle`) : `powershell` → `UIA`
+(`.NET UIAutomationClient`, brique Module 2 / Option B) → sondes d'effet de bord
+(stabilité de la conversation + `IsHungAppWindow`, Module 3) → vision exclue.
+AUCUN clic à coordonnées fixes : entrée ciblée par AutomationId/Name
+(ValuePattern.SetValue, repli presse-papiers + Ctrl+V), envoi par InvokePattern
+du bouton Send (repli Entrée), fenêtre résolue par EnumWindows + GetWindowText.
+
+Garanties du bridge (vérifiées avant tout pilotage, échec fermé sinon) :
+- package MSIX (nom ~Claude, éditeur ~Anthropic) + processus `Claude.exe` issu
+  de `WindowsApps` (la CLI `claude-code` est exclue) + fenêtre visible ;
+- profil attendu (`profile`, défaut `$ORCH_CLAUDE_DESKTOP_PROFILE` sinon
+  `"Caroline"`) présent dans l'arbre UIA — écart = `profile_mismatch`, le compte
+  Desktop n'est JAMAIS modifié ni basculé ;
+- sérialisation : verrou `%TEMP%\orch-claude-desktop.lock` (attente bornée
+  `lock_timeout_s` 300 s → `ui_busy`), un seul pilote UI à la fois ;
+- résultat texte : diff de conversation → `<tmpdir>/last_message.txt` + NDJSON
+  `{"type": "result"}` consommé par l'adapter (résumé ≤8000 car. pour le broker).
+
+Confinement : l'app partage profil/historique utilisateur, aucun confinement au
+workspace démontrable → `read_only` UNIQUEMENT (`P.RUNTIME_MODES` refusé côté
+broker `mode_denied`, `ValueError` côté adapter). Le prompt neutre E2E laisse
+une trace dans l'historique Desktop (assumé, comme toute conversation).
+
+Contrat MCP : `RuntimeT` += `claude-desktop` (`src/orch_mcp/tools.py`,
+descriptions `agent_runner_list`/`agent_job_start`, `INSTRUCTIONS` de
+`src/orch_mcp/server.py`) ; filtres `agent_job_list(runtime=…)` et missions
+hérités. Le schéma MCP expose le nouveau Literal : **si le client MCP ChatGPT
+met en cache le schéma, le reconnecter** (connector à ré-authentifier) pour voir
+`claude-desktop` ; en attendant, l'E2E reste prouvable par le chemin
+broker/MCP local (`python -m pytest`, `agent_job_start` direct).
+
+Activation prudente (ne JAMAIS redémarrer le runner tant que des jobs actifs
+tourneraient — tués par le restart) :
+1. backup : `%USERPROFILE%\.orch-runner\runner.toml` → `runner.toml.bak-<date>` ;
+2. ajouter `[runtimes.claude-desktop]` (voir `deploy/windows/runner.toml.example`,
+   `enabled = true`, `exe` = python) ; valider à froid :
+   `venv\Scripts\python.exe src\orch_runner\claude_desktop_bridge.py --verify-only` ;
+3. si `status.json` montre des jobs actifs : STAGER seulement, puis activation
+   différée sûre après leur fin (`Stop-ScheduledTask orch-runner;
+   Start-ScheduledTask orch-runner`) ; sinon redémarrer la tâche ;
+4. contrôle : `agent_runner_list` / `probe` annonce `claude-desktop`
+   (`available=true`, `modes=["read_only"]`), puis E2E neutre
+   (`agent_job_start` read_only, prompt « Reply with exactly: … »).
+Rollback : `enabled = false` (ou restaurer le `.bak`) + redémarrage tâche.
+
+Dépannage : `claude_desktop_not_installed` (package absent), `not_running`
+(Desktop fermé — le lancer), `no_window` (fenêtre masquée), `profile_mismatch`
+(mauvais compte : ne rien basculer, corriger `profile`), `ui_busy` (job
+concurrent, attendre), `input_not_found` (UI remodelée : ré-inspecter),
+`response_timeout` (réponse non stabilisée), `hung` (relancer l'app).
+Limite assumée : le pilotage vole le focus de la session interactive.
 
 Broker v2.2 (même déploiement `src/`, migration additive) : colonne
 `jobs.recovery_since` (`ADD COLUMN` idempotent, NULL = pas de recovery) ;
