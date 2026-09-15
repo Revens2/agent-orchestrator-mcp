@@ -198,7 +198,14 @@ def test_text_tool_call_resumes_session_then_completes(pv2, tmp_path, monkeypatc
     argvs = _spy_argvs(pv2, monkeypatch)
     st, jid = _claimed(pv2, tmp_path)
     _run(pv2.Supervisor(_Poller(st), jid))
-    assert len(argvs) == 2 and argvs[1][-2:] == ["--resume", SID]
+    assert len(argvs) == 2  # generation initiale + 1 relance bornee
+    if pv2.DURABLE_LAUNCH:
+        descs = sorted(Path(pv2.LOG_DIR).glob("*.launch.json"))
+        assert len(descs) == 2
+        resume_argv = json.loads(descs[1].read_text())["argv"]
+    else:
+        resume_argv = argvs[1]
+    assert resume_argv[-2:] == ["--resume", SID]
     trans = [p for k, p in _outbox(st) if k == "transition"]
     assert [p["to"] for p in trans] == ["starting", "running", "completed"]
     assert trans[-1]["result_summary"].endswith("PONG_OK")
@@ -213,6 +220,152 @@ def test_persistent_text_tool_call_fails_after_bounded_retries(pv2, tmp_path, mo
     last = [p for k, p in _outbox(st) if k == "transition"][-1]
     assert last["to"] == "failed" and "texte" in last["error"]
     assert st.get_job(jid)["local_state"] == "done"
+
+
+def _claimed_ws(mod, tmp_path, job_id, workspace="vps-etude", mode="read_only",
+                prompt="Réponds uniquement PONG_OK"):
+    st = mod.Store(str(tmp_path / "poller.db"))
+    st.upsert_job(job_id, 1, 1, "claimed", prompt_path=st.store_prompt(job_id, prompt),
+                  workspace_id=workspace, mode=mode)
+    return st, job_id
+
+
+def test_argv_pins_dedicated_profile(pv2, monkeypatch):
+    """L'argv docker ancre le profil dedie du slot avant `chat`."""
+    monkeypatch.setattr(pv2, "HERMES_ARGV",
+                        ["docker", "exec", "-i", "hermes", "hermes", "chat",
+                         "--query-file", "-", "-Q"])
+    argv = pv2.hermes_argv_for_slot("orch-slot-03")
+    assert argv[argv.index("hermes", 4) + 1:argv.index("chat")] == ["-p", "orch-slot-03"]
+    assert pv2.profile_home_for_slot("orch-slot-03") == "/opt/data/profiles/orch-slot-03"
+    assert pv2.profile_home_for_slot(None) == "/opt/data"
+
+
+def test_two_concurrent_jobs_get_distinct_slots(pv2, tmp_path):
+    """Deux jobs simultanes : slots distincts, logs separes, slots liberes."""
+    st, a = _claimed_ws(pv2, tmp_path, "job-A-isole", mode="read_only")
+    st.upsert_job("job-B-isole", 1, 1, "claimed",
+                  prompt_path=st.store_prompt("job-B-isole", "Réponds uniquement PONG_OK"),
+                  workspace_id="vps-etude", mode="read_only")
+    ta = threading.Thread(target=pv2.Supervisor(_Poller(st), a).run, daemon=True)
+    tb = threading.Thread(target=pv2.Supervisor(_Poller(st), "job-B-isole").run, daemon=True)
+    ta.start()
+    tb.start()
+    ta.join(20)
+    tb.join(20)
+    assert not ta.is_alive() and not tb.is_alive()
+    assert st.get_job(a)["local_state"] == "done"
+    assert st.get_job("job-B-isole")["local_state"] == "done"
+    # Slots liberes seulement a la fin (release on done) : plus rien d'alloue.
+    assert st.slot_map() == {}
+    assert len(st.free_slots()) == len(pv2.PROFILE_POOL)
+    logs = sorted(os.listdir(pv2.LOG_DIR))
+    assert any(x.startswith("job-A-is") for x in logs)
+    assert any(x.startswith("job-B-is") for x in logs)
+
+
+def test_workspace_write_serialized_same_workspace(pv2, tmp_path, monkeypatch):
+    """Deux writes meme workspace : jamais ensemble, le second attend en claimed."""
+    monkeypatch.setenv("FAKE_SLEEP", "3")
+    st, a = _claimed_ws(pv2, tmp_path, "job-W1", mode="workspace_write")
+    st.upsert_job("job-W2", 1, 1, "claimed",
+                  prompt_path=st.store_prompt("job-W2", "Réponds uniquement PONG_OK"),
+                  workspace_id="vps-etude", mode="workspace_write")
+    poller = pv2.Poller.__new__(pv2.Poller)
+    poller.store = st
+    poller.supervisors = {}
+    ta = threading.Thread(target=pv2.Supervisor(poller, a).run, daemon=True)
+    ta.start()
+    time.sleep(1.5)  # A tourne (slot pris)
+    assert st.get_slot(a) is not None
+    ok_b, why_b = st.gate("job-W2")
+    assert not ok_b and why_b.startswith("workspace_write-verrouille")
+    poller.ensure_supervisor("job-W2")  # ne doit rien spawner
+    assert "job-W2" not in poller.supervisors
+    assert st.get_job("job-W2").get("pid") is None
+    assert st.get_job("job-W2")["local_state"] == "claimed"  # lease tenu par held
+    ta.join(15)
+    assert st.get_job(a)["local_state"] == "done"
+    ok_b, _ = st.gate("job-W2")
+    assert ok_b  # verrou leve : le second peut partir
+    _run(pv2.Supervisor(poller, "job-W2"))
+    assert st.get_job("job-W2")["local_state"] == "done"
+
+
+def test_read_only_same_workspace_stays_concurrent(pv2, tmp_path, monkeypatch):
+    """Deux read_only meme workspace : concurrence autorisee."""
+    monkeypatch.setenv("FAKE_SLEEP", "2")
+    st, a = _claimed_ws(pv2, tmp_path, "job-R1", mode="read_only")
+    st.upsert_job("job-R2", 1, 1, "claimed",
+                  prompt_path=st.store_prompt("job-R2", "Réponds uniquement PONG_OK"),
+                  workspace_id="vps-etude", mode="read_only")
+    sa = pv2.Supervisor(_Poller(st), a)
+    sb = pv2.Supervisor(_Poller(st), "job-R2")
+    ta = threading.Thread(target=sa.run, daemon=True)
+    tb = threading.Thread(target=sb.run, daemon=True)
+    ta.start()
+    time.sleep(1.0)
+    tb.start()
+    time.sleep(0.5)
+    # Les deux tiennent un slot DIFFERENT en meme temps.
+    assert st.get_slot(a) is not None and st.get_slot("job-R2") is not None
+    assert st.get_slot(a) != st.get_slot("job-R2")
+    ta.join(15)
+    tb.join(15)
+    assert st.get_job(a)["local_state"] == "done"
+    assert st.get_job("job-R2")["local_state"] == "done"
+
+
+def test_cancel_one_leaves_other_running(pv2, tmp_path, monkeypatch):
+    """Cancel d'un job : l'autre poursuit et termine normalement."""
+    monkeypatch.setenv("FAKE_SLEEP", "60")
+    st, a = _claimed_ws(pv2, tmp_path, "job-C1", mode="read_only")
+    st.upsert_job("job-C2", 1, 1, "claimed",
+                  prompt_path=st.store_prompt("job-C2", "Réponds uniquement PONG_OK"),
+                  workspace_id="vps-etude", mode="read_only")
+    sa = pv2.Supervisor(_Poller(st), a)
+    sb = pv2.Supervisor(_Poller(st), "job-C2")
+    ta = threading.Thread(target=sa.run, daemon=True)
+    tb = threading.Thread(target=sb.run, daemon=True)
+    ta.start()
+    tb.start()
+    time.sleep(1.5)
+    sa.cancel_ev.set()  # cancel broker -> seulement A
+    ta.join(15)
+    assert not ta.is_alive() and tb.is_alive()
+    assert st.get_job(a)["local_state"] == "done"
+    assert st.get_slot(a) is None  # slot de A libere
+    assert st.get_slot("job-C2") is not None  # B garde le sien
+    sb.cancel_ev.set()
+    tb.join(15)
+    assert st.get_job("job-C2")["local_state"] == "done"
+    assert st.slot_map() == {}
+
+
+def test_restart_keeps_slot_no_double_spawn(pv2, tmp_path, monkeypatch):
+    """Restart/recovery : meme slot, pas de second spawn (generation inchangee)."""
+    monkeypatch.setenv("FAKE_SLEEP", "4")
+    st, jid = _claimed_ws(pv2, tmp_path, "job-restart-1", mode="read_only")
+    sup = pv2.Supervisor(_Poller(st), jid)
+    t = threading.Thread(target=sup.run, daemon=True)
+    t.start()
+    time.sleep(1.5)
+    slot_before = st.get_slot(jid)
+    assert slot_before is not None
+    gen_before = st.get_meta("launch:" + jid)
+    # Simule un restart du poller : nouveau handle Store sur la meme DB.
+    st2 = pv2.Store(str(tmp_path / "poller.db"))
+    assert st2.get_slot(jid) == slot_before  # allocation conservee
+    assert st2.gate(jid) == (True, "slot-conserve")
+    sup2 = pv2.Supervisor(_Poller(st2), jid)
+    t2 = threading.Thread(target=sup2.run, daemon=True)
+    t2.start()  # recovery : reattache, ne respawn pas
+    t.join(15)
+    t2.join(15)
+    assert st2.get_meta("launch:" + jid) == gen_before  # aucun double spawn
+    done = [p for k, p in _outbox(st2) if k == "transition" and p.get("to") == "completed"]
+    assert len(done) == 1  # terminal idempotent malgre deux observateurs
+    assert st2.get_job(jid)["local_state"] == "done"
 
 
 def test_heartbeat_held_never_invents_liveness(pv2, tmp_path):
@@ -302,3 +455,51 @@ def test_e2e_contract_with_real_broker_api(pv2, tmp_path):
     assert row["state"] == "completed" and row["exit_code"] == 0
     assert row["result_summary"] == "PONG_OK" and row["runtime_session_id"] == SID
     assert row["proc_pid"] and row["output_chars"] > 0
+
+
+def test_e2e_two_jobs_real_broker_isolated_slots(pv2, tmp_path):
+    """Matrice E2E : 2 jobs claimés ensemble -> slots distincts, 2 completed."""
+    token = "k" * 48
+    broker = BrokerStore(tmp_path / "broker.db")
+    digests = parse_tokens(f"hermes-vps:{hashlib.sha256(token.encode()).hexdigest()}")
+    client = TestClient(Starlette(routes=build_routes(broker, RunnerAuth(digests, ["10.0.0.0/8"]))))
+
+    class HttpBroker(pv2.Broker):
+        def post(self, path, body):
+            r = client.post(f"/runner/v1/{path}", json={"protocol_version": P.PROTOCOL_VERSION, **body},
+                            headers={"authorization": f"Bearer {token}", "x-real-ip": "10.0.0.2"})
+            assert r.status_code == 200, r.text
+            return r.json()
+
+    poller = pv2.Poller.__new__(pv2.Poller)
+    poller.store = pv2.Store(str(tmp_path / "poller.db"))
+    poller.broker = HttpBroker(token)
+    poller.supervisors = {}
+    poller.epoch = poller.broker.hello(pv2.INFO, [])["epoch"]
+    for i in range(2):
+        broker.create_job("hermes-vps", "hermes", "vps-etude",
+                          "Réponds uniquement PONG_OK %d" % i, "read_only")
+    claimed = poller.broker.claim(poller.epoch, 2, wait_s=0)["jobs"]
+    assert len(claimed) == 2
+    for job in claimed:
+        poller.store.upsert_job(job["job_id"], job["fencing"], poller.epoch, "claimed",
+                                prompt_path=poller.store.store_prompt(job["job_id"], job["prompt"]),
+                                workspace_id=job.get("workspace_id"),
+                                mode=job.get("mode") or "read_only")
+    threads = []
+    for job in claimed:
+        t = threading.Thread(target=pv2.Supervisor(poller, job["job_id"]).run, daemon=True)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(20)
+        assert not t.is_alive()
+    slots = [poller.store.get_slot(j["job_id"]) for j in claimed]
+    # Slots liberes apres done ; pendant l'execution ils etaient distincts
+    # (prouve par test_read_only_same_workspace_stays_concurrent).
+    poller.flush_outbox()
+    assert poller.store.outbox_depth() == 0
+    rows = broker._db.execute("SELECT id, state FROM jobs").fetchall()
+    assert sorted(r[1] for r in rows) == ["completed", "completed"]
+    assert poller.store.slot_map() == {}
+    assert slots == [None, None]  # releases post-done, pas de fuite

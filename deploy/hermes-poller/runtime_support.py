@@ -133,7 +133,7 @@ print(json.dumps({"session_id": sid, "ended_at": session["ended_at"], "messages"
 '''
 
 
-def native_snapshot(job, source, cursor):
+def native_snapshot(job, source, cursor, hermes_home="/opt/data"):
     prompt = ""
     if not job.get("session_id") and job.get("prompt_path"):
         prompt = Path(job["prompt_path"]).read_text()
@@ -141,7 +141,8 @@ def native_snapshot(job, source, cursor):
              "started_at": job.get("proc_started_at") or job["created_at"],
              "prompt": prompt, "cursor": cursor}
     result = subprocess.run(
-        ["docker", "exec", "-i", "hermes", "python3", "-c", NATIVE_QUERY],
+        ["docker", "exec", "-i", "-e", "HERMES_HOME=" + hermes_home,
+         "hermes", "python3", "-c", NATIVE_QUERY],
         input=json.dumps(query), capture_output=True, text=True, timeout=6,
     )
     if result.returncode:

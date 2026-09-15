@@ -280,6 +280,35 @@ Symptôme v2.0 corrigé en 2.1 : job bloqué `running` jusqu'au timeout avec
 `pid`/`runtime_session_id` null et `output_chars=0` alors que `runs/<job8>.log`
 contient la réponse (enfant zombie vu vivant par `os.kill(pid, 0)`).
 
+### v2.3 : multi-instance sûr (`max_parallel=10` démontré)
+
+Un job = un profil Hermes dédié = un `HERMES_HOME` isolé. Pool `orch-slot-00` …
+`orch-slot-09` (provision : `sudo bash deploy/hermes-poller/provision-profiles.sh` ;
+`--clone` reprend config/`.env`/skills, `state.db`/sessions/mémoires séparés —
+prouvé live le 2026-09-15 : `hermes -p <slot> chat` n'écrit que dans son profil).
+Invocation : `docker exec -i hermes hermes -p <slot> chat … --source orch-<job>`.
+
+- Affectation persistée en SQLite (table `slots`, migration auto) : restart/
+  recovery réutilise la même identité (`slot-conserve`), jamais de double spawn
+  (génération de lancement + receipt durable inchangés) ; libération seulement
+  quand le job passe `done`/`abandoned`.
+- Admission côté runner (`Store.gate`) : `workspace_write` identique sérialisé
+  (premier réclamé premier servi, les suivants attendent en `claimed`, lease
+  renouvelé par heartbeat) ; `read_only` concurrent. Pas de verrou broker :
+  garanti pour le runner unique `hermes-vps`.
+- `runtime_support.native_snapshot` lit le `state.db` du profil du slot
+  (`HERMES_HOME` passé au `docker exec`) ; jobs pré-2.3 en recovery → `default`.
+- `health.json` : `version`, `slots` ({job: slot}), `gated` (attente + motif).
+
+Déploiement v2.3 (ne tue aucun job : launchers + receipts survivent, recovery
+rattache) : backup 2 fichiers + DB, copie atomique, restart, santé `health.json`
+(`version: hermes-poller/2.3`). Rollback : restaurer les 2 fichiers + restart
+(colonnes/table `slots` ignorées par l'ancien code) ; profils conservés
+(inertes sans la 2.3) ou supprimés un par un.
+
+Limite assumée : sérialisation `workspace_write` locale au runner. Avec 2+
+runners sur le même workspace, il faudrait un verrou côté broker (`store.claim`).
+
 ## Logs
 
 - VPS : `journalctl -u orch-mcp -u orch-gateway` (transitions `job_transition job_id=…`, `runner_connected`,

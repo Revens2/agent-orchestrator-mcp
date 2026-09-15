@@ -1,5 +1,10 @@
 """Poller Hermes v2 pour l'orchestrateur (runner hermes-vps) — durable.
 
+v2.3 : multi-instance sur. Pool de profils Hermes dedies (un slot = un
+profil = un HERMES_HOME isole), affectation persistee en SQLite, porte
+d'admission (workspace_write serialise par workspace, read_only concurrent).
+Voir PROFILE_POOL/gate(). Garanties v2.x inchangees ci-dessous.
+
 Cause racine v1 (82 lignes : claim + JSON non-atomique + held memoire seule
 + heartbeat aveugle + aucune execution supervisee + cancel jete) :
 - journal local SQLite (WAL) : jobs, outbox, meta. Transactions + fsync,
@@ -34,7 +39,15 @@ import urllib.error
 
 import re
 
-import runtime_support as runtime
+try:
+    import runtime_support as runtime
+except ImportError:  # tests (spec_from_file_location) ou CWD inattendu
+    import importlib.util as _ilu
+    _rs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "runtime_support.py")
+    _rs_spec = _ilu.spec_from_file_location("runtime_support", _rs_path)
+    runtime = _ilu.module_from_spec(_rs_spec)
+    _rs_spec.loader.exec_module(runtime)
 
 BASE = os.environ.get("ORCH_BROKER_BASE", "http://127.0.0.1:8803")
 if not BASE.startswith(("http://", "https://")):
@@ -49,8 +62,21 @@ PROMPT_DIR = os.path.join(SPOOL, "prompts")
 LOG_DIR = os.path.join(SPOOL, "runs")
 
 RUNNER_ID = "hermes-vps"
-VERSION = "hermes-poller/2.2"
+VERSION = "hermes-poller/2.3"
 MAX_PARALLEL = 10
+# Isolation multi-job (2.3) : un profil Hermes dedie par job simultane.
+# Chaque slot du pool correspond a un profil `orch-slot-NN` (provisionne
+# par `hermes profile create <slot> --clone`) donc a un HERMES_HOME
+# distinct (/opt/data/profiles/<slot>) : sessions, memoires et checkpoints
+# ne sont jamais partages entre deux jobs simultanes. L'affectation est
+# persistee en SQLite (table slots) : restart/recovery reutilise la meme
+# identite, jamais de double spawn. Mecanisme verifie localement le
+# 2026-09-15 : `hermes -p <slot> chat` isole state.db/sessions ; --clone
+# reprend .env/SOUL/skills (auth OK, preuve PROOF_OK).
+POOL_SIZE = 10  # == MAX_PARALLEL : un slot par job simultane possible
+PROFILE_POOL = ["orch-slot-%02d" % i for i in range(POOL_SIZE)]
+PROFILE_HOME = "/opt/data/profiles/%s"  # chemin VU DU CONTENEUR hermes
+DEFAULT_HOME = "/opt/data"  # profil default (jobs pre-2.3 en recovery)
 INFO = {"version": VERSION, "max_parallel": MAX_PARALLEL,
         "runtimes": [{"id": "hermes", "available": True,
                       "modes": ["read_only", "workspace_write"],
@@ -88,6 +114,40 @@ LEAK_NUDGE = (
     "natifs, jamais de balises XML dans ta reponse, puis termine la mission.")
 
 
+def profile_home_for_slot(slot):
+    """HERMES_HOME (vu du conteneur) isole pour un slot, default sinon."""
+    if slot and slot in PROFILE_POOL:
+        return PROFILE_HOME % slot
+    return DEFAULT_HOME
+
+
+def hermes_argv_for_slot(slot):
+    """HERMES_ARGV ancre sur le profil dedie du slot (`-p <slot>`).
+
+    Hors docker (tests FAKE) : argv inchange, l'isolation est portee par
+    le slot persiste + les logs/session separes."""
+    argv = list(HERMES_ARGV)
+    if argv[0] == "docker" and slot and slot in PROFILE_POOL:
+        try:
+            chat_at = argv.index("chat")
+        except ValueError:
+            chat_at = len(argv)
+        argv[chat_at:chat_at] = ["-p", slot]
+    return argv
+
+
+def slot_profile_ready(slot):
+    """Le profil du slot existe-t-il cote conteneur ?
+
+    Hors docker (tests) : toujours vrai. Si le profil manque en prod, le
+    spawn attend l'operateur au lieu de faire echouer le job."""
+    if HERMES_ARGV[0] != "docker":
+        return True
+    if not slot or slot not in PROFILE_POOL:
+        return True
+    return os.path.isdir("/srv/hermes/data/profiles/" + slot)
+
+
 def LOG(*a):
     print(*a, flush=True)
 
@@ -114,6 +174,9 @@ class Store:
       kind TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, fencing INTEGER);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS slots(
+      slot TEXT PRIMARY KEY, job_id TEXT UNIQUE, workspace_id TEXT,
+      mode TEXT, updated_at REAL);
     """
 
     def __init__(self, path=DB_PATH):
@@ -132,6 +195,12 @@ class Store:
             if "fencing" not in cols:
                 self.db.execute("ALTER TABLE outbox ADD COLUMN fencing INTEGER")
                 self.db.execute("UPDATE outbox SET fencing=(SELECT fencing FROM local_jobs WHERE local_jobs.job_id=outbox.job_id)")
+            lj = {r[1] for r in self.db.execute("PRAGMA table_info(local_jobs)")}
+            # Colonnes en dur (jamais d'entree externe) : semgrep-safe.
+            if "workspace_id" not in lj:
+                self.db.execute("ALTER TABLE local_jobs ADD COLUMN workspace_id TEXT")
+            if "mode" not in lj:
+                self.db.execute("ALTER TABLE local_jobs ADD COLUMN mode TEXT")
             self.db.commit()
             self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('init','1')")
             self.db.commit()
@@ -178,22 +247,25 @@ class Store:
             now = time.time()
             self.db.execute(
                 "INSERT INTO local_jobs(job_id,fencing,epoch,local_state,session_id,"
-                "pid,proc_started_at,prompt_path,created_at,updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET"
+                "pid,proc_started_at,prompt_path,workspace_id,mode,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET"
                 " fencing=excluded.fencing, epoch=COALESCE(excluded.epoch,epoch),"
                 " local_state=excluded.local_state,"
                 " session_id=COALESCE(excluded.session_id,session_id),"
                 " pid=COALESCE(excluded.pid,pid),"
                 " proc_started_at=COALESCE(excluded.proc_started_at,proc_started_at),"
                 " prompt_path=COALESCE(excluded.prompt_path,prompt_path),"
+                " workspace_id=COALESCE(excluded.workspace_id,workspace_id),"
+                " mode=COALESCE(excluded.mode,mode),"
                 " updated_at=excluded.updated_at",
                 (job_id, fencing, epoch, local_state, kw.get("session_id"),
                  kw.get("pid"), kw.get("proc_started_at"), kw.get("prompt_path"),
+                 kw.get("workspace_id"), kw.get("mode"),
                  now, now))
             self.db.commit()
 
     JOB_COLUMNS = ("fencing", "epoch", "local_state", "session_id", "pid",
-                   "proc_started_at", "prompt_path")
+                   "proc_started_at", "prompt_path", "workspace_id", "mode")
 
     def set_job(self, job_id, **kw):
         bad = set(kw) - set(self.JOB_COLUMNS)
@@ -205,6 +277,11 @@ class Store:
             # colonnes whitelistees ci-dessus, valeurs parametrees
             self.db.execute("UPDATE local_jobs SET " + sets + " WHERE job_id=?",  # nosemgrep
                             (*(kw[c] for c in cols), time.time(), job_id))
+            if kw.get("local_state") in ("done", "abandoned"):
+                # Identite liberee SEULEMENT quand le job est reellement
+                # termine/abandonne : aucun spawn futur ne reutilisera ce
+                # slot par erreur, et un job actif ne le perd jamais.
+                self.db.execute("DELETE FROM slots WHERE job_id=?", (job_id,))
             self.db.commit()
 
     def get_job(self, job_id):
@@ -306,6 +383,105 @@ class Store:
         atomic_write(path, prompt)
         return path
 
+    # --- Isolation multi-instance (2.3) : pool de profils + admission ---
+    TERMINAL_LOCAL = ("done", "abandoned")
+
+    def get_slot(self, job_id):
+        with self.lock:
+            r = self.db.execute("SELECT slot FROM slots WHERE job_id=?",
+                                (job_id,)).fetchone()
+            return r[0] if r else None
+
+    def slot_map(self):
+        """Affectations actuelles {job_id: slot}, lignes orphelines purgees."""
+        with self.lock:
+            act = {j["job_id"] for j in self._active_locked()}
+            rows = self.db.execute("SELECT slot, job_id FROM slots").fetchall()
+            out = {}
+            for slot, jid in rows:
+                if jid in act:
+                    out[jid] = slot
+                else:
+                    self.db.execute("DELETE FROM slots WHERE slot=?", (slot,))
+            self.db.commit()
+            return out
+
+    def _active_locked(self):
+        self.db.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in self.db.execute(
+                "SELECT * FROM local_jobs WHERE local_state NOT IN "
+                "('done','abandoned') ORDER BY created_at").fetchall()]
+        finally:
+            self.db.row_factory = None
+
+    def free_slots(self):
+        """Slots du pool non tenus par un job actif (liste, [] = sature)."""
+        with self.lock:
+            act = {j["job_id"] for j in self._active_locked()}
+            used = {row[0] for row in
+                    self.db.execute("SELECT slot, job_id FROM slots").fetchall()
+                    if row[1] in act}
+            return [s for s in PROFILE_POOL if s not in used]
+
+    def alloc_slot(self, job_id, workspace_id=None, mode=None):
+        """Affecte un slot libre au job (idempotent, persiste). None si plein."""
+        with self.lock:
+            r = self.db.execute("SELECT slot FROM slots WHERE job_id=?",
+                                (job_id,)).fetchone()
+            if r:
+                return r[0]
+            act = {j["job_id"] for j in self._active_locked()}
+            used = set()
+            for (slot, jid) in self.db.execute("SELECT slot, job_id FROM slots").fetchall():
+                if jid in act:
+                    used.add(slot)
+                else:
+                    self.db.execute("DELETE FROM slots WHERE slot=?", (slot,))
+            for slot in PROFILE_POOL:
+                if slot not in used:
+                    self.db.execute(
+                        "INSERT INTO slots(slot,job_id,workspace_id,mode,updated_at)"
+                        " VALUES(?,?,?,?,?)",
+                        (slot, job_id, workspace_id, mode, time.time()))
+                    self.db.commit()
+                    return slot
+            return None
+
+    @staticmethod
+    def is_write(job):
+        return (job.get("mode") or "read_only") == "workspace_write"
+
+    def gate(self, job_id):
+        """Admissible au spawn ? (verrou workspace_write + slot disponible).
+
+        - `workspace_write` sur un meme workspace : serialise (premier
+          reclame premier servi, les suivants attendent en `claimed`, lease
+          renouvele par heartbeat, jamais de double ecriture simultanee).
+        - `read_only` : toujours concurrent (si slot libre).
+        - Le job qui detient deja un slot reste admissible (recovery).
+        Retourne (admissible: bool, motif: str)."""
+        job = self.get_job(job_id)
+        if not job or job["local_state"] in self.TERMINAL_LOCAL:
+            return False, "terminal"
+        if self.get_slot(job_id):
+            return True, "slot-conserve"
+        if self.is_write(job):
+            ws = job.get("workspace_id") or ""
+            with self.lock:
+                act = self._active_locked()
+            rivals = [j for j in act
+                      if j["job_id"] != job_id and self.is_write(j)
+                      and (j.get("workspace_id") or "") == ws]
+            if rivals:
+                first = min(rivals + [job],
+                            key=lambda j: (j.get("created_at") or 0, j["job_id"]))
+                if first["job_id"] != job_id:
+                    return False, "workspace_write-verrouille-par-%s" % first["job_id"][:8]
+        if not self.free_slots():
+            return False, "pool-sature"
+        return True, "ok"
+
 
 class Broker:
     def __init__(self, token):
@@ -384,7 +560,9 @@ class Supervisor(threading.Thread):
         key = "native:" + self.job_id
         cursor = int(st.get_meta(key) or 0)
         try:
-            snap = runtime.native_snapshot(st.get_job(self.job_id), self._source(), cursor)
+            snap = runtime.native_snapshot(
+                st.get_job(self.job_id), self._source(), cursor,
+                hermes_home=profile_home_for_slot(st.get_slot(self.job_id)))
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return  # absence of native evidence is not evidence of progress
         if not snap:
@@ -475,6 +653,10 @@ class Supervisor(threading.Thread):
             self._follow_proc(job["pid"], job.get("session_id"), st)
             return
         # Session ID alone never authorizes replaying a possibly completed action.
+        # Recovery bornee (986394b) : sans preuve positive, sortie terminale
+        # explicite, jamais de relance aveugle. La reprise --resume reste
+        # possible uniquement dans un run supervise actif (relance bornee
+        # appel-outil-en-texte, meme slot/profil).
         self._finish(st, job.get("pid"), job.get("session_id"), receipt.get("exit_code"))
 
     def _receipt(self, st):
@@ -486,6 +668,25 @@ class Supervisor(threading.Thread):
 
     def _spawn(self, st, resume=None, prompt_text=None):
         job = st.get_job(self.job_id)
+        # Porte d'admission 2.3 : verrou workspace_write + slot du pool.
+        # Le slot conserve (recovery/resume) passe toujours ; sinon gate puis
+        # allocation persistee. Job non admissible -> reste `claimed`, lease
+        # renouvele par heartbeat, la boucle du poller reessaie. Jamais de
+        # spawn partage : un Hermes = un profil = un job.
+        slot = st.get_slot(self.job_id)
+        if not slot:
+            ok, why = st.gate(self.job_id)
+            if not ok:
+                LOG("spawn differe:", self.job_id[:8], why)
+                return
+            slot = st.alloc_slot(self.job_id, job.get("workspace_id"),
+                                 job.get("mode"))
+            if not slot:
+                LOG("spawn differe:", self.job_id[:8], "pool-sature")
+                return
+        if not slot_profile_ready(slot):
+            LOG("spawn differe:", self.job_id[:8], "profil manquant:", slot)
+            return
         prompt_path = job.get("prompt_path") or ""
         os.makedirs(LOG_DIR, exist_ok=True)
         log_path = os.path.join(LOG_DIR, self.job_id[:8] + ".log")
@@ -502,8 +703,10 @@ class Supervisor(threading.Thread):
                     prompt_text = pf.read()
             except OSError:
                 prompt_text = ""
-        # Passer via stdin (--query-file -) : pas de montage necessaire
-        argv = list(HERMES_ARGV)
+        # Passer via stdin (--query-file -) : pas de montage necessaire.
+        # Identite isolee 2.3 : le profil dedie du slot (`-p`), donc un
+        # HERMES_HOME (sessions/memoires) jamais partage entre jobs.
+        argv = hermes_argv_for_slot(slot)
         if argv[0] == "docker":
             argv += ["--source", self._source()]
         if resume:
@@ -786,12 +989,20 @@ class Poller:
     def write_health(self):
         active = self.store.active_jobs()
         try:
+            gated = []
+            for j in active:
+                if not j.get("pid"):
+                    ok, why = self.store.gate(j["job_id"])
+                    if not ok:
+                        gated.append({"job_id": j["job_id"], "motif": why})
             atomic_write(HEALTH_FILE, json.dumps({
-                "runner": RUNNER_ID, "epoch": self.epoch,
+                "runner": RUNNER_ID, "version": VERSION, "epoch": self.epoch,
                 "held": [j["job_id"] for j in active],
                 "local_active_job": active[0]["job_id"] if active else None,
                 "local_session": (active[0].get("session_id")
                                   if active else None),
+                "slots": self.store.slot_map(),
+                "gated": gated,
                 "outbox_depth": self.store.outbox_depth(),
                 "recovery_count": int(self.store.get_meta("recovery_count") or 0),
                 "last_broker_success": self.last_broker_ok,
@@ -803,6 +1014,8 @@ class Poller:
         n = self.store.import_spool_v1()
         if n:
             LOG("spool v1 importe:", n)
+        purged = self.store.slot_map()  # purge les affectations orphelines
+        LOG("slots repris:", purged)
         held = self.held()
         r = self.broker.hello(INFO, held)
         self.epoch = r["epoch"]
@@ -828,6 +1041,13 @@ class Poller:
             ).fetchall()
         if any(json.loads(r[0]).get("to") in ("completed", "failed", "cancelled", "lost", "timeout") for r in pending):
             self.store.set_job(job_id, local_state="done")
+            return
+        # Porte d'admission 2.3 : pas de thread/spawn tant que le job n'est
+        # pas admissible (verrou workspace_write ou pool sature). Le job
+        # reste `claimed` dans held -> lease renouvele, reprise au prochain
+        # tour. Les jobs en recovery (slot conserve) passent toujours.
+        ok, _why = self.store.gate(job_id)
+        if not ok:
             return
         s = Supervisor(self, job_id)
         self.supervisors[job_id] = s
@@ -947,7 +1167,8 @@ class Poller:
                     except Exception as e:
                         LOG("flush differe:", type(e).__name__)
                     last_flush = time.time()
-                free_slots = MAX_PARALLEL - len(self.store.active_jobs())
+                free_slots = min(MAX_PARALLEL - len(self.store.active_jobs()),
+                                 len(self.store.free_slots()))
                 if free_slots > 0:
                     for job in self.broker.claim(
                             self.epoch, free_slots).get("jobs", []):
@@ -955,7 +1176,9 @@ class Poller:
                         prompt_path = self.store.store_prompt(
                             jid, job.get("prompt") or "")
                         self.store.upsert_job(jid, job["fencing"], self.epoch,
-                                              "claimed", prompt_path=prompt_path)
+                                              "claimed", prompt_path=prompt_path,
+                                              workspace_id=job.get("workspace_id"),
+                                              mode=job.get("mode") or "read_only")
                         self.store.enqueue(
                             jid, "event", "hermes-park-%s" % jid,
                             {"activity": "Job pris en compte par Hermes, "

@@ -82,6 +82,8 @@ src/orch_mcp/        broker SQLite, API runner, outils MCP, serveur
 src/orch_gateway/    passerelle OAuth (dérivée de tasks_gateway)
 src/orch_runner/     runner Windows (Job Object, politique, adapters, démon)
 deploy/              systemd, nginx, install.sh, rollback.sh, windows/install-runner.ps1
+deploy/hermes-poller/ poller Hermes vps-etude (profils isoles pooles, v2.3+ ;
+                     cf. docs/OPERATIONS.md, section Runner Hermes)
 docs/OPERATIONS.md   exploitation
 tests/               unitaires, E2E runner↔broker HTTP, runtimes réels (ORCH_REAL=…)
 ```
