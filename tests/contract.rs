@@ -197,6 +197,67 @@ async fn methode_inconnue_32601_avant_upstream() {
     assert_eq!(v["error"]["code"], -32601);
 }
 
+/// Pont fichier : une session Python existante (synthetique) passe le
+/// middleware ; un opaque inconnu reste 401.
+#[tokio::test]
+async fn pont_fichier_session_existante_passe_middleware() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use orch_gateway_rs::{build_router_with_filestore, ServiceConfig};
+    use tower::ServiceExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "orch-pont-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let etat = dir.join("etat.json");
+    let tok = "synthetique-orch-pont-01234567890001";
+    let doc = serde_json::json!({
+        "demandes": {}, "codes": {},
+        "acces": { tok: {
+            "jeton": tok, "client_id": "client-synth",
+            "scopes": ["orch:lecture"], "resource": serde_json::Value::Null,
+            "expire_a": 9_999_999_999i64 } },
+        "rafraichissements": {},
+    });
+    std::fs::write(&etat, doc.to_string()).unwrap();
+    let app = build_router_with_filestore(
+        ServiceConfig {
+            upstream: "http://127.0.0.1:9".to_string(),
+            static_token: "x".repeat(32),
+            static_token_scopes: vec![READ_SCOPE.to_string()],
+            oauth: oauth_cfg(),
+            max_body_bytes: 1024 * 1024,
+        },
+        Some(mcp_gateway::router::FileStoreMount {
+            etat_path: etat.to_string_lossy().to_string(),
+            expected_resource: None,
+        }),
+    )
+    .expect("gateway de test");
+    // Methode inconnue : le refus local -32601 prouve l'auth OK (pas 401).
+    let body = r#"{"jsonrpc":"2.0","id":7,"method":"drop_database","params":{}}"#;
+    let res = app
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {tok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], -32601);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn cle_dupliquee_32600_avant_upstream() {
     use axum::body::Body;

@@ -18,11 +18,11 @@ name = "orch-gateway-rs"
 path = "src/main.rs"
 
 [dependencies]
-mcp-core = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "ccc06573ecfb775295702303aac6e2c4dae22098", version = "0.2.0" }
-mcp-http = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "ccc06573ecfb775295702303aac6e2c4dae22098", version = "0.2.0" }
-mcp-auth = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "ccc06573ecfb775295702303aac6e2c4dae22098", version = "0.2.0" }
-mcp-observe = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "ccc06573ecfb775295702303aac6e2c4dae22098", version = "0.2.0" }
-mcp-gateway = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "ccc06573ecfb775295702303aac6e2c4dae22098", version = "0.2.0" }
+mcp-core = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "df943a629a0379fdaff45278377f9ffcab3c08f4", version = "0.3.0" }
+mcp-http = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "df943a629a0379fdaff45278377f9ffcab3c08f4", version = "0.3.0" }
+mcp-auth = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "df943a629a0379fdaff45278377f9ffcab3c08f4", version = "0.3.0" }
+mcp-observe = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "df943a629a0379fdaff45278377f9ffcab3c08f4", version = "0.3.0" }
+mcp-gateway = { git = "https://github.com/Revens2/mcp-framework-rs", rev = "df943a629a0379fdaff45278377f9ffcab3c08f4", version = "0.3.0" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8" }
 tracing = { version = "0.1" }

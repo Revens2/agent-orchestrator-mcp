@@ -12,6 +12,9 @@
 //!   (defaut `/opt/orch-gateway-rs/.mcp_token`) — fail-closed,
 //! * `ORCH_GW_RS_TOKEN_SCOPES` (defaut lecture+ecriture, quoté dans l'unit),
 //! * `ORCH_GW_RS_CONSENT_HASH` (empreinte PBKDF2, vide = consentement refuse).
+//! * `ORCH_GW_RS_OAUTH_ETAT` (defaut `/srv/orch/data/oauth/etat.json` :
+//!   pont READ-ONLY vers le magasin Python, sessions existantes sans
+//!   re-consentement ; vide = pont desactive).
 
 use mcp_auth::oauth::OAuthConfig;
 use orch_gateway_rs::{
@@ -61,6 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         unsafe { std::env::set_var("ORCH_GW_RS_UPSTREAM", "http://127.0.0.1:8802") };
     }
+    // Pont fichier OAuth (transition) : Python = AS/control-plane, Rust =
+    // data-plane. Meme utilisateur UNIX que le Python (fichiers 0600).
+    if std::env::var("ORCH_GW_RS_OAUTH_ETAT")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        unsafe { std::env::set_var("ORCH_GW_RS_OAUTH_ETAT", "/srv/orch/data/oauth/etat.json") };
+    }
     // Lecon lot 2 : sans SCOPES explicites, le defaut install ne donne que la
     // lecture. Le canary parite exige lecture+ecriture.
     if std::env::var("ORCH_GW_RS_TOKEN_SCOPES")
@@ -90,22 +102,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let port = env.port;
     let upstream_log = env.upstream.clone();
-    let app = orch_gateway_rs::build_router(orch_gateway_rs::ServiceConfig {
-        upstream: env.upstream,
-        static_token: env.static_token,
-        static_token_scopes: env.token_scopes,
-        oauth: OAuthConfig {
-            issuer: env.issuer,
-            resource_url: RESOURCE_URL.to_string(),
-            resource_name: RESOURCE_NAME.to_string(),
-            default_scope: READ_SCOPE.to_string(),
-            valid_scopes: vec![READ_SCOPE.to_string(), WRITE_SCOPE.to_string()],
-            extra_submit_scopes: vec![WRITE_SCOPE.to_string()],
-            consent_hash: env.consent_hash,
-            static_client_id: orch_gateway_rs::STATIC_CLIENT_ID.to_string(),
+    let mount = mcp_gateway::config::filestore_mount(&env);
+    let app = orch_gateway_rs::build_router_with_filestore(
+        orch_gateway_rs::ServiceConfig {
+            upstream: env.upstream,
+            static_token: env.static_token,
+            static_token_scopes: env.token_scopes,
+            oauth: OAuthConfig {
+                issuer: env.issuer,
+                resource_url: RESOURCE_URL.to_string(),
+                resource_name: RESOURCE_NAME.to_string(),
+                default_scope: READ_SCOPE.to_string(),
+                valid_scopes: vec![READ_SCOPE.to_string(), WRITE_SCOPE.to_string()],
+                extra_submit_scopes: vec![WRITE_SCOPE.to_string()],
+                consent_hash: env.consent_hash,
+                static_client_id: orch_gateway_rs::STATIC_CLIENT_ID.to_string(),
+            },
+            max_body_bytes: mcp_http::hardening::DEFAULT_MAX_BODY_BYTES,
         },
-        max_body_bytes: mcp_http::hardening::DEFAULT_MAX_BODY_BYTES,
-    })?;
+        mount,
+    )?;
     let _ = PRM_ALIAS;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(

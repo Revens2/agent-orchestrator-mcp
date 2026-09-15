@@ -36,6 +36,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Router};
 
 use mcp_auth::bearer::{extract_bearer, json_response, AccessTokenResolver, StaticBearer};
+use mcp_auth::filestore::{ChainedResolver, FileStore};
 use mcp_auth::oauth::{
     auth_router, protected_resource_router, MemoryStore, OAuthConfig, OAuthState,
 };
@@ -121,7 +122,7 @@ pub struct ServiceConfig {
 #[derive(Clone)]
 struct AuthState {
     static_bearer: StaticBearer,
-    resolver: Arc<MemoryStore>,
+    resolver: Arc<ChainedResolver>,
     required_scopes: Vec<String>,
     prm_url: String,
 }
@@ -177,11 +178,34 @@ async fn acteur_middleware(
 }
 
 /// Assemble le routeur complet : sante + OAuth + PRM (+ alias) + `/mcp` + 404.
+/// Assemble le routeur complet. Sans pont fichier (comportement v0.2).
 pub fn build_router(cfg: ServiceConfig) -> Result<Router, mcp_core::error::Error> {
+    build_router_full(cfg, None)
+}
+
+/// Assemble le routeur avec pont fichier optionnel (sessions OAuth Python
+/// existantes acceptées sans re-consentement ; `None` = comme
+/// [`build_router`]). Ne touche ni à l'upstream ni au Python (drift `main`
+/// préservé : le Python reste control-plane et source de vérité).
+pub fn build_router_with_filestore(
+    cfg: ServiceConfig,
+    mount: Option<mcp_gateway::router::FileStoreMount>,
+) -> Result<Router, mcp_core::error::Error> {
+    build_router_full(cfg, mount)
+}
+
+fn build_router_full(
+    cfg: ServiceConfig,
+    mount: Option<mcp_gateway::router::FileStoreMount>,
+) -> Result<Router, mcp_core::error::Error> {
     let store = Arc::new(MemoryStore::default());
+    let file = mount
+        .filter(|m| !m.etat_path.trim().is_empty())
+        .map(|m| Arc::new(FileStore::new(&m.etat_path)));
+    let chained = Arc::new(ChainedResolver::new(Arc::clone(&store), file));
     let oauth_state = OAuthState {
         config: Arc::new(cfg.oauth.clone()),
-        store: Arc::clone(&store),
+        store,
     };
     let auth_state = AuthState {
         static_bearer: StaticBearer::new(
@@ -189,7 +213,7 @@ pub fn build_router(cfg: ServiceConfig) -> Result<Router, mcp_core::error::Error
             STATIC_CLIENT_ID,
             &cfg.static_token_scopes,
         ),
-        resolver: store,
+        resolver: chained,
         required_scopes: vec![READ_SCOPE.to_string()],
         prm_url: PRM_URL.to_string(),
     };

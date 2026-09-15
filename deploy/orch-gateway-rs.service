@@ -14,6 +14,9 @@ Environment=ORCH_GW_RS_UPSTREAM=http://127.0.0.1:8802
 Environment=ORCH_GW_RS_PORT=18981
 Environment=ORCH_GW_RS_TOKEN_FILE=/opt/orch-gateway-rs/.mcp_token
 Environment="ORCH_GW_RS_TOKEN_SCOPES=orch:lecture orch:ecriture"
+# Pont fichier OAuth (transition, read-only) : sessions Python existantes
+# acceptees sans re-consentement. Meme User que le Python (0600).
+Environment=ORCH_GW_RS_OAUTH_ETAT=/srv/orch/data/oauth/etat.json
 ExecStart=/opt/orch-gateway-rs/orch-gateway-rs
 Restart=always
 RestartSec=3
