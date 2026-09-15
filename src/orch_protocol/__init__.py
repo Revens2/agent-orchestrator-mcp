@@ -61,8 +61,16 @@ def transition_allowed(src: str, dst: str) -> bool:
 
 
 # --- runtimes / modes ----------------------------------------------------
-RUNTIMES = ("claude-code", "codex", "agy", "opencode", "fake", "hermes")
+RUNTIMES = ("claude-code", "codex", "agy", "opencode", "fake", "hermes", "claude-desktop")
 MODES = ("read_only", "workspace_write")
+# Modes supportés par runtime (avant intersection avec la config du workspace).
+# `claude-desktop` pilote l'application Claude Desktop (MSIX) via UIA : le prompt
+# est transmis à l'UI, aucun confinement du processus au workspace n'est démontrable
+# (l'app partage l'historique/le profil de l'utilisateur) → read_only uniquement.
+# Toute demande workspace_write est refusée (broker : mode_denied ; runner : mode_denied).
+RUNTIME_MODES: dict[str, tuple[str, ...]] = {
+    "claude-desktop": ("read_only",),
+}
 # politique locale du runner (jamais fournie par le broker/MCP)
 UNATTENDED, GUARDED = "unattended", "guarded"
 PERMISSION_POLICIES = (UNATTENDED, GUARDED)

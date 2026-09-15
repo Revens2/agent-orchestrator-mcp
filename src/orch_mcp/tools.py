@@ -15,7 +15,7 @@ from pydantic import Field
 import orch_protocol as P
 from orch_mcp.store import BrokerError, Store, follow_for_job
 
-RuntimeT = Literal["claude-code", "codex", "agy", "opencode", "fake", "hermes"]
+RuntimeT = Literal["claude-code", "codex", "agy", "opencode", "fake", "hermes", "claude-desktop"]
 ModeT = Literal["read_only", "workspace_write"]
 StateT = Literal["queued", "claimed", "starting", "running", "completed", "failed", "timeout", "cancelled", "lost"]
 AlertSourceT = Literal["etude", "nexus"]
@@ -41,8 +41,9 @@ def register(mcp, store: Store) -> None:
         description=(
             "Liste les PC runners de l'orchestrateur d'agents IA personnel, leur présence réelle "
             "(online si heartbeat < 30 s, sinon offline), les runtimes d'agents disponibles "
-            "(claude-code, codex, agy, opencode) et le nombre de jobs actifs. À appeler avant "
-            "agent_job_start."
+            "(claude-code, codex, agy, opencode, claude-desktop) et le nombre de jobs actifs. "
+            "À appeler avant agent_job_start. Note : claude-desktop pilote l'application Claude "
+            "Desktop (profil vérifié, accès UI sérialisé) et n'accepte que read_only."
         ),
     )
     async def agent_runner_list() -> dict:
@@ -75,7 +76,7 @@ def register(mcp, store: Store) -> None:
     @mcp.tool(
         name="agent_job_start",
         description=(
-            "Lance un agent IA existant (Claude Code, Codex, Antigravity/agy ou OpenCode) sur le PC "
+            "Lance un agent IA existant (Claude Code, Codex, Antigravity/agy, OpenCode ou Claude Desktop) sur le PC "
             "personnel autorisé, dans un workspace allowlisté, avec un prompt. Retourne IMMÉDIATEMENT "
             "un job asynchrone (job_id, state=queued) SANS attendre la fin, PLUS un bloc de suivi "
             "machine-lisible (must_follow, terminal, should_continue, next_tool=agent_job_wait, "
@@ -91,7 +92,9 @@ def register(mcp, store: Store) -> None:
             "explicitement. Ne dites JAMAIS « lancé, repromptez-moi quand il a fini » : l'expérience "
             "normale est un seul message utilisateur puis une seule réponse finale avec le résultat. "
             "Ce n'est pas un shell : aucune commande n'est exécutée, le prompt est transmis tel quel "
-            "à l'agent. Fournissez idempotency_key pour qu'un retry ne crée pas un second job. "
+            "à l'agent. claude-desktop pilote l'application Claude Desktop (profil vérifié, accès UI "
+            "sérialisé) et n'accepte que read_only (workspace_write refusé : confinement non démontrable). "
+            "Fournissez idempotency_key pour qu'un retry ne crée pas un second job. "
             + STATE_HELP
         ),
     )
