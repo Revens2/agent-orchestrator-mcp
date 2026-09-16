@@ -23,8 +23,10 @@ Garanties exigées par le broker :
   format consommé par l'adapter (résumé borné exploitable par le broker).
 
 Confinement : l'application Desktop partage le profil/l'historique de
-l'utilisateur, aucun confinement au workspace n'est démontrable → le runtime
-n'annonce QUE `read_only` (refus broker + runner en `workspace_write`).
+l'utilisateur, aucun confinement au workspace n'est démontrable → le bridge
+ne fait QUE du texte (prompt -> réponse). L'écriture `workspace_write` passe
+par la voie patch confinée côté adapter (`desktop_patch.py`, appliquée par le
+runner, jamais par le Desktop).
 
 Usage (appelé par l'adapter, jamais à la main en prod) :
     python claude_desktop_bridge.py --prompt-file P.txt --out-dir D [--profile Caroline]

@@ -1,9 +1,13 @@
-"""Runtime `claude-desktop` : contrat (protocole/MCP), adapter, bridge, garde read_only.
+"""Runtime `claude-desktop` : contrat (protocole/MCP), adapter, bridge, voie patch.
 
 Le Desktop partage le profil/l'historique de l'utilisateur : aucun confinement
-au workspace n'est démontrable → `read_only` uniquement, refusé partout ailleurs
-(broker `mode_denied`, adapter `ValueError`). Aucun test n'écrit dans le clone
-partagé ni ne touche au compte Desktop (vérification en lecture seule).
+du processus au workspace n'est démontrable. Donc :
+- `read_only` = réponse texte seule (aucune écriture) ;
+- `workspace_write` = VOIE PATCH CONFINÉE (broker : accepté ; runner : le
+  Desktop propose des diffs unifiés, `desktop_patch.py` les applique bornés au
+  workspace — le Desktop n'a aucun accès disque/shell).
+Aucun test n'écrit dans le clone partagé ni ne touche au compte Desktop
+(vérification en lecture seule, sauf tmp_path jetables pour l'applier).
 """
 
 import json
@@ -15,7 +19,7 @@ import pytest
 
 import orch_protocol as P
 from orch_mcp import tools as mcp_tools
-from orch_mcp.store import BrokerError, Store
+from orch_mcp.store import Store
 from orch_runner import adapters as A
 from orch_runner import claude_desktop_bridge as B
 
@@ -24,21 +28,21 @@ PY = sys.executable
 
 
 # ------------------------------------------------------------------ contrat
-def test_protocol_registers_runtime_read_only():
+def test_protocol_registers_runtime_patch_confined_modes():
     assert "claude-desktop" in P.RUNTIMES
-    assert P.RUNTIME_MODES["claude-desktop"] == ("read_only",)
+    assert P.RUNTIME_MODES["claude-desktop"] == ("read_only", "workspace_write")
 
 
 def test_mcp_runtime_literal_includes_desktop():
     assert "claude-desktop" in typing.get_args(mcp_tools.RuntimeT)
 
 
-def test_adapter_registered_read_only_only():
+def test_adapter_registered_with_confined_patch_write():
     assert A.ADAPTERS["claude-desktop"] is A.ClaudeDesktop
     ad = A.ClaudeDesktop(PY, None)
-    assert ad.modes == ("read_only",)
+    assert ad.modes == ("read_only", "workspace_write")
     with pytest.raises(ValueError):
-        ad.build("prompt", "workspace_write", CWD, Path("C:/tmp"))
+        ad.build("prompt", "shell_exec", CWD, Path("C:/tmp"))
 
 
 def test_adapter_build_never_interpolates_prompt(tmp_path):
@@ -102,16 +106,14 @@ def test_broker_accepts_read_only(store):
     assert created and job["state"] == "queued"
 
 
-def test_broker_refuses_workspace_write_for_desktop(store):
-    with pytest.raises(BrokerError) as exc:
-        store.create_job("pc", "claude-desktop", "demo", "Bonjour.", "workspace_write")
-    assert exc.value.code == "mode_denied"
+def test_broker_accepts_workspace_write_patch_confined(store):
+    job, created = store.create_job("pc", "claude-desktop", "demo", "Bonjour.", "workspace_write")
+    assert created and job["state"] == "queued" and job["mode"] == "workspace_write"
 
 
-def test_broker_refuses_workspace_write_for_mission(store):
-    with pytest.raises(BrokerError) as exc:
-        store.create_mission("objectif", ["ok"], 1, "pc", "claude-desktop", "demo", "workspace_write")
-    assert exc.value.code == "mode_denied"
+def test_broker_accepts_workspace_write_for_mission(store):
+    m = store.create_mission("objectif", ["ok"], 1, "pc", "claude-desktop", "demo", "workspace_write")
+    assert m["state"] == P.MISSION_EXECUTING
 
 
 # ---------------------------------------------------------------- bridge ---
