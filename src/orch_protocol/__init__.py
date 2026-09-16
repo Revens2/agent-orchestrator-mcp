@@ -66,10 +66,12 @@ MODES = ("read_only", "workspace_write")
 # Modes supportés par runtime (avant intersection avec la config du workspace).
 # `claude-desktop` pilote l'application Claude Desktop (MSIX) via UIA : le prompt
 # est transmis à l'UI, aucun confinement du processus au workspace n'est démontrable
-# (l'app partage l'historique/le profil de l'utilisateur) → read_only uniquement.
-# Toute demande workspace_write est refusée (broker : mode_denied ; runner : mode_denied).
+# (l'app partage l'historique/le profil de l'utilisateur). `read_only` = réponse
+# texte seule. `workspace_write` = VOIE PATCH CONFINÉE : le Desktop propose des
+# diffs unifiés, le RUNNER les applique bornés au workspace (desktop_patch.py) ;
+# le Desktop n'a aucun accès disque direct, aucune commande n'est exécutée.
 RUNTIME_MODES: dict[str, tuple[str, ...]] = {
-    "claude-desktop": ("read_only",),
+    "claude-desktop": ("read_only", "workspace_write"),
 }
 # politique locale du runner (jamais fournie par le broker/MCP)
 UNATTENDED, GUARDED = "unattended", "guarded"

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import orch_protocol as P
+from orch_runner import desktop_patch as DP
 
 
 @dataclass
@@ -349,19 +350,42 @@ class ClaudeDesktop(Adapter):
 
     - `exe` = interpréteur Python (le bridge est un module, comme `fake`) ;
     - prompt transporté par FICHIER (`--prompt-file`, jamais interpolé en argv) ;
-    - `read_only` UNIQUEMENT : aucun confinement au workspace n'est démontrable
-      (l'app partage le profil/l'historique de l'utilisateur) ;
+    - `read_only` : réponse texte seule (aucune écriture) ;
+    - `workspace_write` : VOIE PATCH CONFINÉE — le Desktop ne touche jamais au
+      disque. Il propose des diffs unifiés en blocs ```diff, et le RUNNER les
+      applique bornés au workspace (`desktop_patch.py` : chemins relatifs
+      seuls, `.git`/symlinks/`..`/absolus refusés, contexte exact exigé,
+      écriture atomique, tout-échec = rien appliqué). Le Desktop ne peut ni
+      exécuter de commande ni lire les fichiers : le prompt doit contenir le
+      contexte nécessaire (contenu des fichiers visés, fourni par l'appelant
+      après une passe `read_only`, ou passé explicitement).
     - le bridge vérifie le package MSIX, le processus Desktop (CLI exclue), la
       fenêtre visible et le profil attendu, sérialise l'UI (verrou fichier) et
       écrit `last_message.txt` (même convention que `codex`).
     """
 
     id = "claude-desktop"
-    modes: tuple[str, ...] = ("read_only",)
+    modes: tuple[str, ...] = ("read_only", "workspace_write")
+
+    # Cadrage patch : transmis AU Desktop dans le prompt (le Desktop n'a aucun
+    # accès disque : il propose, le runner dispose).
+    PATCH_HEADER = (
+        "[orchestrator] Tu modifies des fichiers du workspace : {cwd}\n"
+        "Tu n'as AUCUN accès au disque : propose UNIQUEMENT des patchs unified diff, "
+        "un bloc ```diff par fichier, chemins RELATIFS à la racine du workspace "
+        "(jamais d'absolu, jamais de `..`, jamais `.git/`) :\n"
+        "```diff\n--- a/chemin/relatif\n+++ b/chemin/relatif\n@@ -a,b +c,d @@\n"
+        " contexte\n-ligne supprimée\n+ligne ajoutée\n```\n"
+        "Fichier à créer : `--- /dev/null`. Fichier à supprimer : `+++ /dev/null`. "
+        "Le contexte doit recopier EXACTEMENT le contenu actuel fourni ci-dessous. "
+        "Aucune commande shell, aucun accès hors workspace. Explication courte hors blocs autorisée.\n\n"
+    )
 
     def __init__(self, exe, extra=None, policy=P.UNATTENDED):
         super().__init__(exe or sys.executable, extra, policy)
         self._bridge = str(Path(__file__).with_name("claude_desktop_bridge.py"))
+        self._workspace_cwd: str | None = None
+        self._patch_mode = False
 
     def _profile(self) -> str:
         return str(self.extra.get("profile") or os.environ.get("ORCH_CLAUDE_DESKTOP_PROFILE", "Caroline"))
@@ -392,9 +416,12 @@ class ClaudeDesktop(Adapter):
 
     def build(self, prompt, mode, cwd, tmpdir):
         if mode not in self.modes:
-            raise ValueError("claude-desktop : seul read_only est supporté (confinement Desktop au workspace non démontrable)")
+            raise ValueError(f"claude-desktop : mode {mode} non supporté (attendus : {', '.join(self.modes)})")
+        self._workspace_cwd = cwd
+        self._patch_mode = mode == "workspace_write"
+        framed = self.PATCH_HEADER.format(cwd=cwd) + prompt if self._patch_mode else prompt
         prompt_file = Path(tmpdir) / "prompt.txt"
-        prompt_file.write_text(prompt, encoding="utf-8")
+        prompt_file.write_text(framed, encoding="utf-8")
         argv = [self.exe, self._bridge, "--prompt-file", str(prompt_file), "--out-dir", str(tmpdir), "--profile", self._profile()]
         if self.extra.get("timeout_s"):
             argv += ["--timeout-s", str(int(self.extra["timeout_s"]))]
@@ -419,15 +446,34 @@ class ClaudeDesktop(Adapter):
 
     def finish(self, exit_code, tmpdir):
         last = Path(tmpdir) / "last_message.txt"
-        summary = last.read_text(encoding="utf-8", errors="replace").strip() if last.exists() else self.last_text
-        summary = (summary or "")[:8000] or None
-        ok = exit_code == 0 and bool(summary)
-        if ok:
-            return Outcome(True, summary, None)
-        err = f"exit code {exit_code}" if exit_code else "réponse vide"
-        if summary:
-            err += " (sortie partielle conservée)"
-        return Outcome(False, summary, err)
+        response = last.read_text(encoding="utf-8", errors="replace").strip() if last.exists() else (self.last_text or "")
+        response = (response or "")[:DP.MAX_PATCH_CHARS] or None
+        summary = (response or "")[:8000] or None
+        if not self._patch_mode:
+            ok = exit_code == 0 and bool(summary)
+            if ok:
+                return Outcome(True, summary, None)
+            err = f"exit code {exit_code}" if exit_code else "réponse vide"
+            if summary:
+                err += " (sortie partielle conservée)"
+            return Outcome(False, summary, err)
+        # Voie patch confinée : le bridge a échoué => rien à appliquer.
+        if exit_code != 0:
+            err = f"exit code {exit_code} (bridge : patchs non appliqués)"
+            if summary:
+                err += " (sortie partielle conservée)"
+            return Outcome(False, summary, err)
+        if not response:
+            return Outcome(False, None, "réponse vide (aucun patch à appliquer)")
+        if self._workspace_cwd is None:
+            return Outcome(False, summary, "workspace inconnu (patchs non appliqués)")
+        try:
+            report, detail = DP.response_to_workspace(self._workspace_cwd, response)
+        except DP.PatchError as exc:
+            return Outcome(False, summary, f"{exc.code}: {exc.message}")
+        applied = f"patch appliqué ({detail})"
+        body = f"{applied}\n---\n{summary}"[:8000]
+        return Outcome(True, body, None)
 
 
 class Fake(Adapter):

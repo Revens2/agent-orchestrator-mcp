@@ -68,7 +68,7 @@ workspace reste le verrou le plus fort.
 | codex | stdin | `-s read-only -c approval_policy="never"` | `-s danger-full-access -c approval_policy="never"` | `-s workspace-write -c approval_policy="never"` | sandbox + approbation toujours explicites (jamais `config.toml`) |
 | agy | `--print=` | `--mode plan --sandbox` | `--mode accept-edits --dangerously-skip-permissions` | `--mode accept-edits --sandbox` | workspace via `--add-dir` + prompt : pas de confinement strict du dossier |
 | opencode | argv après `--` | `--agent plan` | `--agent build --auto` | refusé | `-m` épinglé par `model` ; `--auto` n'honore que les `deny` explicites de la config opencode |
-| claude-desktop | fichier `--prompt-file` | bridge UIA `claude_desktop_bridge.py` (profil vérifié, UI sérialisée) | refusé | refusé | read_only seul (confinement workspace non démontrable) ; vole le focus pendant le job |
+| claude-desktop | fichier `--prompt-file` | bridge UIA `claude_desktop_bridge.py` (profil vérifié, UI sérialisée) | réponse seule | patchs ```diff proposés par le Desktop, appliqués par le runner bornés au workspace (`desktop_patch.py`) | Desktop sans accès disque ni shell ; vole le focus pendant le job |
 
 ### OpenCode
 
@@ -292,9 +292,23 @@ Garanties du bridge (vérifiées avant tout pilotage, échec fermé sinon) :
   `{"type": "result"}` consommé par l'adapter (résumé ≤8000 car. pour le broker).
 
 Confinement : l'app partage profil/historique utilisateur, aucun confinement au
-workspace démontrable → `read_only` UNIQUEMENT (`P.RUNTIME_MODES` refusé côté
-broker `mode_denied`, `ValueError` côté adapter). Le prompt neutre E2E laisse
-une trace dans l'historique Desktop (assumé, comme toute conversation).
+workspace démontrable → le Desktop n'a JAMAIS d'accès disque ni shell. Deux modes :
+- `read_only` : réponse texte seule (aucune écriture) ;
+- `workspace_write` : VOIE PATCH CONFINÉE. L'adapter cadre le prompt (instructions
+  patch + `cwd` du workspace) et transmet au Desktop via le bridge (comme en
+  `read_only`) ; la réponse est relue par le RUNNER qui extrait les blocs
+  ```diff, les valide et les applique lui-même, bornés au workspace
+  (`src/orch_runner/desktop_patch.py`) : chemins relatifs seuls (absolu, `..`,
+  UNC/lecteur, `.git/`, symlinks refusés — tout-échec = rien appliqué),
+  contexte des hunks vérifié exactement (sinon `context_mismatch`, fichier
+  intact), bornes (10 blocs, 32 fichiers, 1 Mo total / 500 Ko par fichier),
+  écriture atomique (tmp + replace). Aucune commande n'est exécutée.
+Le Desktop ne pouvant pas lire les fichiers, le prompt `workspace_write` doit
+contenir le contexte nécessaire : passer par une exploration `read_only`
+d'abord (ou coller le contenu des fichiers visés), puis envoyer le patch-job
+avec ce contenu. Un job sans bloc ```diff exploitable échoue `no_patch`
+(réponse conservée en `result_summary`, rien écrit). Lancer un localhost /
+serveur reste manuel (ou un autre runtime) : le patch ne fait que des fichiers.
 
 Contrat MCP : `RuntimeT` += `claude-desktop` (`src/orch_mcp/tools.py`,
 descriptions `agent_runner_list`/`agent_job_start`, `INSTRUCTIONS` de

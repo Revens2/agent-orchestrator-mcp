@@ -30,9 +30,11 @@ model = "opencode/muse-spark-1.3-contributor-free"   # épinglé : ne dépend pa
 
 [runtimes.claude-desktop]
 # Pilote l'application Claude Desktop (MSIX, éditeur Anthropic) via UIA (.NET
-# UIAutomationClient, sans clic à coordonnées fixes). read_only UNIQUEMENT :
-# aucun confinement au workspace n'est démontrable (profil/historique partagés).
+# UIAutomationClient, sans clic à coordonnées fixes).
 # `exe` = interpréteur Python (le bridge est un module, comme `fake`).
+# Deux modes : `read_only` (réponse seule) et `workspace_write` par VOIE PATCH
+# CONFINÉE (le Desktop propose des diffs, le runner les applique bornés au
+# workspace — jamais d'accès disque/shell pour le Desktop, voir OPERATIONS.md).
 # Désactivé par défaut : activer seulement sur le PC qui héberge le Desktop,
 # après vérification du profil (jamais de bascule de compte automatique).
 enabled = false
@@ -55,3 +57,12 @@ description = "Workspace de test E2E de l'orchestrateur (fixtures jetables)"
 path = 'C:\Users\<user>\orch-workspaces\agent-orchestrator-mcp'
 modes = ["read_only"]
 description = "Clone réel Revens2/agent-orchestrator-mcp (lecture par défaut)"
+
+# Exemple : projet local modifiable via claude-desktop (voie patch confinée).
+# Le Desktop propose des diffs, le runner les applique bornés à CE dossier ;
+# le Desktop n'a aucun accès disque/shell. N'ajouter "workspace_write" que sur
+# des dossiers de travail dédiés (jamais un disque entier ni un dossier système).
+# [workspaces.watchy]
+# path = 'C:\projet\Watchy\Watchy'
+# modes = ["read_only", "workspace_write"]
+# description = "Watchy : dev local via Claude Desktop (patchs confinés) + localhost manuel"

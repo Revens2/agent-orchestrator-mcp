@@ -43,7 +43,8 @@ def register(mcp, store: Store) -> None:
             "(online si heartbeat < 30 s, sinon offline), les runtimes d'agents disponibles "
             "(claude-code, codex, agy, opencode, claude-desktop) et le nombre de jobs actifs. "
             "À appeler avant agent_job_start. Note : claude-desktop pilote l'application Claude "
-            "Desktop (profil vérifié, accès UI sérialisé) et n'accepte que read_only."
+            "Desktop (profil vérifié, accès UI sérialisé) : read_only = réponse seule, "
+            "workspace_write = patchs proposés par le Desktop et appliqués par le runner, bornés au workspace."
         ),
     )
     async def agent_runner_list() -> dict:
@@ -93,7 +94,8 @@ def register(mcp, store: Store) -> None:
             "normale est un seul message utilisateur puis une seule réponse finale avec le résultat. "
             "Ce n'est pas un shell : aucune commande n'est exécutée, le prompt est transmis tel quel "
             "à l'agent. claude-desktop pilote l'application Claude Desktop (profil vérifié, accès UI "
-            "sérialisé) et n'accepte que read_only (workspace_write refusé : confinement non démontrable). "
+            "sérialisé) : read_only = réponse seule ; workspace_write = voie patch confinée (le Desktop "
+            "propose des diffs unifiés, le runner les applique bornés au workspace, sans exécuter de commande). "
             "Fournissez idempotency_key pour qu'un retry ne crée pas un second job. "
             + STATE_HELP
         ),
