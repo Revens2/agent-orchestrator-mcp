@@ -5,6 +5,13 @@ Authentification : `Authorization: Bearer <jeton runner>` comparé en temps cons
 jeton en clair côté VPS. Défense en profondeur : l'IP d'origine posée par nginx
 (`X-Real-IP`) doit appartenir à `ORCH_RUNNER_CIDRS` (overlay NetBird).
 Le runner_id est dérivé du jeton : un client ne peut pas se déclarer autre machine.
+
+Recovery uniquement : `ORCH_RUNNER_SOURCE_BINDINGS` peut temporairement remapper
+UNE identité déjà authentifiée selon sa source, sous la forme
+`base_runner_id@ip=target_runner_id`. Le bearer token valide reste obligatoire ;
+une IP seule n'authentifie jamais un runner. Ce mécanisme sert à séparer deux
+machines ayant accidentellement reçu le même token, puis doit être retiré après
+rotation vers des jetons distincts.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import os
 from typing import Any
 
 import anyio
@@ -53,10 +61,54 @@ def parse_tokens(raw: str) -> dict[str, str]:
     return out
 
 
+def parse_source_bindings(raw: str) -> dict[tuple[str, str], str]:
+    """Parse les aliases de recovery `base_runner_id@ip=target_runner_id`.
+
+    La clé contient l'identité issue DU TOKEN puis l'IP source normalisée. Un
+    binding ne peut donc jamais transformer une simple IP en authentification.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        lhs, sep, target = item.partition("=")
+        base, at, addr_raw = lhs.partition("@")
+        base, target, addr_raw = base.strip(), target.strip(), addr_raw.strip()
+        if not sep or not at or not P.valid_id(base) or not P.valid_id(target):
+            raise RuntimeError(
+                "ORCH_RUNNER_SOURCE_BINDINGS invalide (base_runner_id@ip=target_runner_id)"
+            )
+        try:
+            addr = ipaddress.ip_address(addr_raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                "ORCH_RUNNER_SOURCE_BINDINGS invalide (IP source invalide)"
+            ) from exc
+        key = (base, str(addr))
+        if key in out and out[key] != target:
+            raise RuntimeError("ORCH_RUNNER_SOURCE_BINDINGS conflit pour la même source")
+        out[key] = target
+    return out
+
+
 class RunnerAuth:
-    def __init__(self, token_digests: dict[str, str], cidrs: list[str]) -> None:
+    def __init__(
+        self,
+        token_digests: dict[str, str],
+        cidrs: list[str],
+        source_bindings: dict[tuple[str, str], str] | None = None,
+    ) -> None:
         self.digests = token_digests
         self.networks = [ipaddress.ip_network(c.strip()) for c in cidrs if c.strip()]
+        # Le serveur historique ne passait que deux arguments. Lire l'env ici
+        # garde cette compatibilité tout en faisant échouer le démarrage si une
+        # configuration de recovery est invalide.
+        self.source_bindings = (
+            parse_source_bindings(os.environ.get("ORCH_RUNNER_SOURCE_BINDINGS", ""))
+            if source_bindings is None
+            else dict(source_bindings)
+        )
 
     def identify(self, request: Request) -> str:
         real_ip = request.headers.get("x-real-ip", "")
@@ -71,10 +123,17 @@ class RunnerAuth:
         if scheme.lower() != "bearer" or len(token) < 32:
             raise BrokerError("unauthorized", "jeton runner requis")
         digest = hashlib.sha256(token.strip().encode()).hexdigest()
+        base_runner_id: str | None = None
         for known, runner_id in self.digests.items():
             if hmac.compare_digest(known, digest):
-                return runner_id
-        raise BrokerError("unauthorized", "jeton runner invalide")
+                base_runner_id = runner_id
+                break
+        if base_runner_id is None:
+            raise BrokerError("unauthorized", "jeton runner invalide")
+        # Recovery strict : le token décide d'abord de l'identité de base ; la
+        # source ne peut qu'appliquer un alias explicitement configuré POUR
+        # cette identité authentifiée.
+        return self.source_bindings.get((base_runner_id, str(addr)), base_runner_id)
 
 
 def _error(exc: BrokerError) -> JSONResponse:
