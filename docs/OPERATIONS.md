@@ -86,6 +86,16 @@ python -m orch_runner gen-token --force     # nouveau jeton DPAPI + nouvelle emp
 VPS : remplacer l'empreinte dans `ORCH_RUNNER_TOKENS`, `sudo systemctl restart orch-mcp`.
 Révocation immédiate : retirer l'entrée et redémarrer orch-mcp (le runner reçoit 401).
 
+## Second runner pc-fixe (i5-14600KF / RTX 4070)
+
+Enrôlement additif quand pc-fixe sera joignable sur NetBird : voir
+[docs/PC_FIXE_ENROLLMENT.md](PC_FIXE_ENROLLMENT.md). Résumé :
+`deploy/windows/pc-fixe/enroll-pc-fixe.ps1` **sur pc-fixe** (config + jeton DPAPI,
+refuse de toucher un autre runner ou des jobs actifs), puis **sur vps-etude**
+`sudo bash deploy/add-runner-token.sh 'pc-fixe:<sha256hex>'` (idempotent, autres
+entrées dont `main-windows-pc` préservées, backup, restart orch-mcp + `/health`).
+Ne jamais régénérer le jeton du portable tant que ses jobs tournent.
+
 ## Santé
 
 ```bash

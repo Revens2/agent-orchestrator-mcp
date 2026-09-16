@@ -1,0 +1,62 @@
+# %USERPROFILE%\.orch-runner\runner.toml — config du SECOND runner `pc-fixe`
+# (PC fixe i5-14600KF / RTX 4070), hors Git, aucun secret ici.
+#
+# À copier SUR pc-fixe UNIQUEMENT, jamais sur le portable (`main-windows-pc`) :
+#   deploy\windows\enroll-pc-fixe.ps1  (substitue <user>, génère le jeton DPAPI)
+# Le jeton est généré sur pc-fixe (`python -m orch_runner gen-token`) : seule son
+# empreinte `pc-fixe:<sha256hex>` est déclarée côté VPS (ORCH_RUNNER_TOKENS,
+# voir deploy/add-runner-token.sh + docs/PC_FIXE_ENROLLMENT.md).
+runner_id = "pc-fixe"
+broker_url = "http://10.200.114.203:8803"
+# i5-14600KF (14C/20T) : 4 jobs parallèles par défaut, réglable 2..6 selon charge.
+max_parallel = 4
+offline_kill_s = 120
+
+# unattended (défaut) : workspace_write sans aucune demande d'autorisation (shell compris).
+# guarded : éditions seules, le reste refusé sans prompt ; opencode read_only uniquement.
+# read_only reste lecture seule dans les deux cas. Changer puis relancer la tâche orch-runner.
+default_permission_policy = "unattended"
+
+[runtimes.claude-code]
+enabled = true
+exe = 'C:\Users\<user>\.local\bin\claude.exe'
+
+[runtimes.codex]
+enabled = true
+exe = 'C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe'
+
+[runtimes.agy]
+enabled = true
+exe = 'C:\Users\<user>\AppData\Local\Microsoft\WinGet\Packages\Google.AntigravityCLI_Microsoft.Winget.Source_8wekyb3d8bbwe\agy.exe'
+
+[runtimes.opencode]
+enabled = true
+exe = 'C:\Users\<user>\AppData\Local\Microsoft\WinGet\Packages\SST.opencode_Microsoft.Winget.Source_8wekyb3d8bbwe\opencode.exe'
+model = "opencode/muse-spark-1.3-contributor-free"   # épinglé : ne dépend pas du défaut global opencode
+# probe_generation = true    # génération "Reply OK." au démarrage ; échec => available=false
+# probe_timeout_s = 120
+
+[runtimes.claude-desktop]
+# Désactivé par défaut : le Desktop vit sur le portable, pas sur pc-fixe.
+# Ne l'activer que si Claude Desktop est installé ET utilisé sur pc-fixe
+# (profil vérifié, jamais de bascule de compte automatique).
+enabled = false
+exe = 'C:\Users\<user>\AppData\Local\Programs\Python\Python311\python.exe'
+# profile = "Caroline"       # défaut : $ORCH_CLAUDE_DESKTOP_PROFILE sinon "Caroline"
+# timeout_s = 3000           # borne interne du bridge (le runner tue à timeout_s du job)
+# verify_timeout_s = 90      # borne du probe --verify-only au (re)démarrage du runner
+
+[workspaces.e2e]
+path = 'C:\Users\<user>\orch-workspaces\e2e'
+modes = ["read_only", "workspace_write"]
+description = "Workspace de test E2E de l'orchestrateur (fixtures jetables)"
+
+# Clone réel du dépôt agent-orchestrator-mcp sur pc-fixe : workspace explicite,
+# borné au seul sous-dossier du clone (jamais orch-workspaces entier ni le disque).
+# read_only par défaut (lecture / audit) ; ajouter "workspace_write" seulement si
+# un agent doit modifier ce clone. Sans cette section, tout accès hors cwd (e2e)
+# est refusé (opencode : refus type external_directory).
+[workspaces.agent-orchestrator-mcp]
+path = 'C:\Users\<user>\orch-workspaces\agent-orchestrator-mcp'
+modes = ["read_only"]
+description = "Clone réel Revens2/agent-orchestrator-mcp (lecture par défaut)"
