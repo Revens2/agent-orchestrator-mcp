@@ -36,10 +36,14 @@ INSTRUCTIONS = (
     "read_only = réponse seule, workspace_write = patchs confinés appliqués par le runner) "
     "sur le PC Windows autorisé, dans des workspaces "
     "allowlistés. Flux : agent_runner_list -> agent_workspace_list -> agent_job_start (asynchrone, "
-    "contrat de suivi : rappeler agent_job_wait jusqu'à terminal=true dans le même tour) "
+    "contrat de suivi actif court : 2 agent_job_wait dans le même tour, puis detached=true => "
+    "reprendre plus tard via agent_job_get) "
     "-> agent_job_get/output/events jusqu'à un état terminal. Missions : agent_mission_create -> "
-    "agent_mission_wait en boucle -> agent_mission_validate (completed exit 0 ≠ validated). "
-    "Un timeout de wait non terminal impose de rappeler, jamais de répondre. Pas de shell distant : seul un prompt est transmis."
+    "2 agent_mission_wait max -> si detached, reprendre via agent_mission_get -> agent_mission_validate "
+    "(completed exit 0 ≠ validated). "
+    "Un wait non terminal avec waits_done<2 impose de rappeler ; avec detached=true, répondre puis "
+    "reprendre plus tard. Pas de shell distant : seul un prompt est transmis. "
+    "Notification Telegram de fin (runners allowlistés) via outbox, sans secret."
 )
 
 
@@ -74,6 +78,14 @@ def build_app(store: Store, runner_auth: RunnerAuth, reaper_interval_s: float = 
                 if any(stats.values()):
                     log.info("reaper %s", stats)
                 state["last_reap"] = time.time()
+                try:
+                    from orch_mcp.notifications import dispatch_due as _dispatch_due
+
+                    nstats = await anyio.to_thread.run_sync(_dispatch_due, store)
+                    if nstats.get("due"):
+                        log.info("notify_reaper %s", nstats)
+                except Exception:
+                    log.exception("notify_reaper_error")
                 if time.time() - state["last_purge"] > 3600:
                     log.info("purge %s", await anyio.to_thread.run_sync(store.purge))
                     state["last_purge"] = time.time()

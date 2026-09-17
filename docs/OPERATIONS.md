@@ -107,16 +107,23 @@ timeout_s=25, since_seq=…)` sur la tentative courante) + `agent_job_get`
 `runtime_process_health`) → `agent_job_events(job_id, after_seq)` pour le
 journal → à la fin du job : `agent_mission_validate(mission_id, verdict)`.
 
-CONTRAT DE SUIVI (non négociable, sauf `fire_and_forget=true` explicite) :
+CONTRAT DE SUIVI (anti-timeout ChatGPT : suivi actif court de 2 waits, puis
+reprise détachée — sauf `fire_and_forget=true` explicite, distinct) :
 chaque retour de `agent_job_start` / `agent_mission_create` / `agent_job_wait` /
 `agent_mission_wait` porte un bloc machine-lisible (`must_follow`, `terminal`,
-`should_continue`, `next_tool`, `wait_timeout_s`, `until=terminal`,
-`since_seq`/`last_event_seq`). Tant que `terminal=false` — Y COMPRIS
-`woke_by=timeout` — le caller DOIT rappeler `agent_job_wait` /
-`agent_mission_wait` avec `since_seq=last_event_seq` dans le MÊME tour, sans
-répondre à l'utilisateur. Un timeout pendant que le process continue n'est
-jamais une fin. Répondre uniquement après résultat terminal / validation.
-Seuls vrais arrêts : question `waiting_for_user` ouverte
+`detached`, `should_continue`, `next_tool`, `wait_timeout_s`, `until=terminal`,
+`since_seq`/`last_event_seq`, `waits_done`, `resume_hint` si détaché).
+Passez `waits_done` (0 au 1er wait, puis 1) : tant que `detached=false` et
+`terminal=false`, rappelez `agent_job_wait` / `agent_mission_wait` avec
+`since_seq=last_event_seq` dans le MÊME tour. Après 2 waits, si toujours non
+terminal, le broker répond `detached=true` (`terminal=false`,
+`should_continue=false`, `must_follow=false`, `next_tool=agent_job_get` /
+`agent_mission_get`, curseur conservé + `resume_hint`) : répondez alors à
+l'utilisateur et reprenez plus tard via `agent_job_get` / `agent_mission_get`
+puis `agent_job_wait` / `agent_mission_wait(since_seq=last_event_seq)`.
+Un wait non terminal n'est jamais une fin, détaché ou non. Répondre avec le
+résultat uniquement après terminal / validation.
+Seuls vrais arrêts actifs : question `waiting_for_user` ouverte
 (`agent_question_list`), entrée utilisateur réellement requise, ou job
 `failed`/`timeout`/`cancelled`/`lost` à remonter explicitement.
 
@@ -137,10 +144,13 @@ Seuls vrais arrêts : question `waiting_for_user` ouverte
   sortie : un job qui produit de la sortie a toujours sa télémétrie (`telemetry_age_s`
   donne l'âge de la dernière observation ; `telemetry_at=null` + champs null =
   runner sans instrumentation, jamais une panne).
-- `agent_job_wait` évite le polling agressif pendant un tour actif (≤ 60 s). Réveil
+-   `agent_job_wait` évite le polling agressif pendant un tour actif (≤ 60 s). Réveil
   immédiat (sans attendre le timeout) si le job est déjà terminal (`woke_by=terminal`)
   ou si des événements non vus existent (`last_seq > since_seq` → `woke_by=event`).
-  Quand le tour ChatGPT est fini, reprendre plus tard avec `agent_job_get` + `after_seq`.
+  Budget actif : 2 waits par tour (`waits_done=0 puis 1`) ; au-delà, si toujours non
+  terminal, `detached=true` + `resume_hint` (reprise via `agent_job_get` /
+  `agent_mission_get` puis wait avec `since_seq=last_event_seq`). Quand le tour
+  ChatGPT est fini, reprendre plus tard avec `agent_job_get` + `after_seq`.
 - `agent_runner_inspect` : versions/capacités des runtimes, workspaces allowlistés,
   git par workspace (`branch`/`head`/`dirty`, null si non observé), jobs actifs enrichis.
   Jamais de secrets, jamais de dump d'environnement (`current_command_sanitized`
@@ -192,6 +202,38 @@ Côté Nexus, les scripts installés (`nexus_alert_spool.sh` 700,
 `/root/nexus-alerts-bak-*`) correspondent à la branche NEXUS
 `feat/alerts-unified-spool` (non mergée : le merge déclenche le full deploy
 prod CI → relecture utilisateur requise avant merge).
+
+## Notification Telegram de fin (jobs `completed`)
+
+Outbox SQLite `completion_notifications` (schéma additif, rollback = ancien
+`src/` qui ignore la table) : sur transition runner **acceptée** `running ->
+completed` pour un runner allowlisté (`ORCH_NOTIFY_RUNNERS`, défaut
+`main-windows-pc,pc-fixe`), le broker enqueue atomiquement **une** ligne
+`(job_id, kind=job_completed)` dans la **même transaction** — aucun appel
+externe dans la transaction ni dans la route (le `sender` ne bloque jamais le
+runner). `failed`/`timeout`/`cancelled`/`lost` n'envoient jamais de notif
+success ; replay runner idempotent (`INSERT OR IGNORE`).
+
+Dispatcher côté `orch-mcp`/reaper (`src/orch_mcp/notifications.py`,
+`dispatch_due()` appelé à chaque tour reaper) : lit les dues (`pending`,
+`next_attempt_at <= now`), construit un message **strictement whitelisté**
+(runner/runtime/workspace/titre/durée/job8/état mission ; `completed ≠ mission
+validée` si le job appartient à une mission), puis appelle le sender
+configurable (`ORCH_NOTIFY_SENDER`, défaut `/usr/local/bin/send_telegram.sh`,
+`[sender, message]`, timeout borné `ORCH_NOTIFY_TIMEOUT_S` défaut 15 s).
+Succès → `sent` ; échec → retry exponentiel borné (60 s, 120 s, … plafonné 1 h,
+`ORCH_NOTIFY_MAX_ATTEMPTS` défaut 8) puis `failed`. L'outbox persiste au
+restart (reprise automatique). Ne jamais envoyer prompt/output/
+`result_summary`/`error`/secrets (le titre vient de `display_title`,
+fallback si secret apparent).
+
+```bash
+# variables (voir deploy/orch.env.example) :
+# ORCH_NOTIFY_RUNNERS=main-windows-pc,pc-fixe
+# ORCH_NOTIFY_SENDER=/usr/local/bin/send_telegram.sh
+# ORCH_NOTIFY_TIMEOUT_S=15
+# ORCH_NOTIFY_MAX_ATTEMPTS=8
+```
 
 ## Titres de conversations
 

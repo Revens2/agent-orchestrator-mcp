@@ -157,6 +157,35 @@ MAX_CRITERION_CHARS = 500
 WAIT_DEFAULT_S = 25
 WAIT_MAX_S = 60
 
+# --- suivi actif court + reprise détachée (anti-timeout ChatGPT) --------------
+# Le contrat historique exigeait une boucle wait-until-terminal dans le MÊME
+# tour ChatGPT, ce qui faisait expirer les tours sur jobs longs. Budget actif :
+# 2 waits ; au-delà, si toujours non terminal, le broker répond `detached=true`
+# (terminal=false, should_continue=false, must_follow=false) avec un curseur
+# de reprise (since_seq/last_event_seq) et un resume_hint. Le caller répond à
+# l'utilisateur puis reprend plus tard via agent_job_get/agent_mission_get +
+# agent_job_wait/agent_mission_wait. `fire_and_forget` reste distinct
+# (detached=false, sans reprise attendue). Terminal/needs_validation inchangés.
+FOLLOW_MAX_WAITS = 2
+DETACHED_NEXT_JOB = "agent_job_get"
+DETACHED_NEXT_MISSION = "agent_mission_get"
+
+# --- notifications de fin (Telegram, opt-in runners) -------------------------
+# Outbox SQLite additive (rollback = ancien src ignore la table). Enqueue
+# atomique sur transition runner acceptée -> completed pour les runners
+# allowlistés ; aucun appel externe dans la transaction/route. Le dispatcher
+# (reaper orch-mcp) construit un message strictement whitelisté et appelle un
+# sender configurable avec timeout borné + retry exponentiel borné.
+NOTIFY_KIND_COMPLETED = "job_completed"
+NOTIFY_RUNNERS_DEFAULT = ("main-windows-pc", "pc-fixe")
+NOTIFY_SENDER_DEFAULT = "/usr/local/bin/send_telegram.sh"
+NOTIFY_TIMEOUT_S = 15
+NOTIFY_MAX_ATTEMPTS = 8
+NOTIFY_STATUS_PENDING = "pending"
+NOTIFY_STATUS_SENT = "sent"
+NOTIFY_STATUS_FAILED = "failed"
+NOTIFY_STATUSES = (NOTIFY_STATUS_PENDING, NOTIFY_STATUS_SENT, NOTIFY_STATUS_FAILED)
+
 # --- session corrompue (reprise OpenCode : nouvelle session + handoff) -------
 # Signatures EXACTES (sous-chaînes littérales, jamais un simple mot "error").
 # `failed to load plugin` est observé en production (opencode.log) ; les autres

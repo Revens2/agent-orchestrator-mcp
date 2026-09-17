@@ -29,23 +29,41 @@ from orch_protocol.redact import redact
 log = logging.getLogger("orch.store")
 
 # ------------------------------------------------- contrat de suivi (follow-through)
-# Un timeout de wait pendant que le job continue N'EST PAS une raison de répondre
-# à l'utilisateur : le caller DOIT rappeler l'attente. Ces blocs machine-lisibles
-# rendent la boucle explicite (testée) au lieu de reposer sur une phrase doc.
+# Budget actif court (anti-timeout ChatGPT) : 2 waits dans le MÊME tour, puis
+# reprise détachée. Ces blocs machine-lisibles rendent la boucle explicite
+# (testée) au lieu de reposer sur une phrase doc.
 FOLLOW_UNTIL = "terminal"
 FOLLOW_WAIT_S = 25
 FOLLOW_NEXT_WAIT = "agent_job_wait"
 FOLLOW_NEXT_DONE = "agent_job_get"
 
 
+def detached_hint_job(job_id: str, last_event_seq: int) -> str:
+    return (
+        f"job toujours actif après {P.FOLLOW_MAX_WAITS} waits : répondez à l'utilisateur "
+        f"puis reprenez plus tard avec {P.DETACHED_NEXT_JOB}(job_id={job_id[:8]}…) "
+        f"et agent_job_wait(since_seq={int(last_event_seq)}) ; ce n'est pas une fin."
+    )
+
+
+def detached_hint_mission(mission_id: str, last_event_seq: int) -> str:
+    return (
+        f"tentative toujours active après {P.FOLLOW_MAX_WAITS} waits : répondez à l'utilisateur "
+        f"puis reprenez plus tard avec {P.DETACHED_NEXT_MISSION}(mission_id={mission_id[:8]}…) "
+        f"et agent_mission_wait(since_seq={int(last_event_seq)}) ; ce n'est pas une fin."
+    )
+
+
 def follow_for_job(state: str, last_event_seq: int, wait_timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any]:
     """Bloc de suivi pour un job non terminal : quoi appeler, avec quel curseur,
-    jusqu'à quoi. `terminal=True` => le job ne bougera plus (inspecter/valider)."""
+    jusqu'à quoi. `terminal=True` => le job ne bougera plus (inspecter/valider).
+    `detached=False` ici (création) ; la reprise détachée naît côté wait."""
     terminal = state in P.TERMINAL
     return {
         "must_follow": not terminal,
         "terminal": terminal,
         "should_continue": not terminal,
+        "detached": False,
         "next_tool": FOLLOW_NEXT_DONE if terminal else FOLLOW_NEXT_WAIT,
         "wait_timeout_s": int(wait_timeout_s),
         "until": FOLLOW_UNTIL,
@@ -53,19 +71,62 @@ def follow_for_job(state: str, last_event_seq: int, wait_timeout_s: float = P.WA
     }
 
 
-def follow_for_wait(state: str, woke_by: str, last_event_seq: int) -> dict[str, Any]:
-    """Bloc de suivi pour un retour de wait : `woke_by=timeout` + non terminal
-    => rappeler `agent_job_wait` IMMÉDIATEMENT (même tour), pas de réponse user."""
+def follow_for_wait(
+    state: str, woke_by: str, last_event_seq: int, waits_done: int = 0,
+    job_id: str = "", mission_id: str = "", for_mission: bool = False,
+) -> dict[str, Any]:
+    """Bloc de suivi pour un retour de wait.
+
+    Budget actif : 2 waits dans le même tour. Tant que `waits_done < 2` et non
+    terminal => rappeler `agent_job_wait`/`agent_mission_wait` IMMÉDIATEMENT
+    (même tour). Au-delà (`waits_done >= 2`) et toujours non terminal =>
+    `detached=True` (terminal=false, should_continue=false, must_follow=false),
+    `next_tool=agent_job_get`/`agent_mission_get`, curseur conservé +
+    `resume_hint`. Terminal/needs_validation inchangés (jamais detached).
+    `fire_and_forget` reste distinct (detached=false, sans resume_hint).
+    """
     terminal = state in P.TERMINAL
+    waits_done = max(0, int(waits_done))
+    if not terminal and waits_done >= P.FOLLOW_MAX_WAITS:
+        seq = int(last_event_seq)
+        if for_mission:
+            return {
+                "must_follow": False,
+                "terminal": False,
+                "should_continue": False,
+                "detached": True,
+                "next_tool": P.DETACHED_NEXT_MISSION,
+                "wait_timeout_s": FOLLOW_WAIT_S,
+                "until": FOLLOW_UNTIL,
+                "since_seq": seq,
+                "woke_by": woke_by,
+                "waits_done": waits_done,
+                "resume_hint": detached_hint_mission(mission_id or job_id, seq),
+            }
+        return {
+            "must_follow": False,
+            "terminal": False,
+            "should_continue": False,
+            "detached": True,
+            "next_tool": P.DETACHED_NEXT_JOB,
+            "wait_timeout_s": FOLLOW_WAIT_S,
+            "until": FOLLOW_UNTIL,
+            "since_seq": seq,
+            "woke_by": woke_by,
+            "waits_done": waits_done,
+            "resume_hint": detached_hint_job(job_id, seq),
+        }
     return {
         "must_follow": not terminal,
         "terminal": terminal,
         "should_continue": not terminal,
+        "detached": False,
         "next_tool": FOLLOW_NEXT_DONE if terminal else FOLLOW_NEXT_WAIT,
         "wait_timeout_s": FOLLOW_WAIT_S,
         "until": FOLLOW_UNTIL,
         "since_seq": int(last_event_seq),
         "woke_by": woke_by,
+        "waits_done": waits_done,
     }
 
 SCHEMA = """
@@ -218,6 +279,27 @@ CREATE TABLE IF NOT EXISTS pending_questions (
 );
 CREATE INDEX IF NOT EXISTS pending_questions_due ON pending_questions(status, notified_at, created_at);
 CREATE INDEX IF NOT EXISTS pending_questions_fp ON pending_questions(fingerprint, status);
+-- Notifications de fin (Telegram) : outbox durable, enqueue atomique sur
+-- transition runner acceptée -> completed (runners allowlistés). Aucun appel
+-- externe dans la transaction/route : le dispatcher (reaper orch-mcp) lit les
+-- dues, envoie via sender configurable, retry exponentiel borné.
+-- SCHEMA rejoué à chaque init (IF NOT EXISTS) : bases existantes gagnent la
+-- table sans migration ; rollback = redéployer l'ancien src (table ignorée).
+CREATE TABLE IF NOT EXISTS completion_notifications (
+  job_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'job_completed',
+  runner_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at REAL NOT NULL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  sent_at REAL,
+  last_error TEXT,
+  PRIMARY KEY (job_id, kind)
+);
+CREATE INDEX IF NOT EXISTS completion_notifications_due
+  ON completion_notifications(status, next_attempt_at, created_at);
 """
 
 MAX_CLAIM_ATTEMPTS = 3
@@ -240,7 +322,12 @@ class Retention:
 
 
 class Store:
-    def __init__(self, path: str | Path, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        clock: Callable[[], float] = time.time,
+        notify_runners: set[str] | frozenset[str] | None = None,
+    ) -> None:
         self.path = str(path)
         self.clock = clock
         self._lock = threading.RLock()
@@ -250,6 +337,19 @@ class Store:
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(SCHEMA)
         self._migrate()
+        if notify_runners is None:
+            import os as _os
+
+            raw = _os.environ.get("ORCH_NOTIFY_RUNNERS", ",".join(P.NOTIFY_RUNNERS_DEFAULT))
+            self.notify_runners: frozenset[str] = frozenset(
+                s.strip() for s in raw.split(",") if s.strip()
+            ) or frozenset(P.NOTIFY_RUNNERS_DEFAULT)
+        else:
+            self.notify_runners = frozenset(notify_runners)
+
+    def completion_notify_enabled(self, runner_id: str) -> bool:
+        """Runner allowlisté pour la notification de fin (défaut main-windows-pc,pc-fixe)."""
+        return runner_id in self.notify_runners
 
     # ------------------------------------------------------------------ utils
     def close(self) -> None:
@@ -784,6 +884,10 @@ class Store:
                     # nouveau job = nouvelle session + handoff, pas de transcript).
                     self._emit(db, job_id, P.EV_SESSION_CORRUPTED, error[:500])
                 self._mission_on_job_terminal(db, job_id, dst)
+                if dst == P.COMPLETED and self.completion_notify_enabled(runner_id):
+                    # Outbox Telegram : enqueue atomique UNIQUE (job_id, kind),
+                    # aucun appel externe ici (dispatcher reaper hors transaction).
+                    self._enqueue_completion_notification(db, job_id, runner_id, now)
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def record_runner_question(
@@ -1267,6 +1371,119 @@ class Store:
             "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
         )
         log.info("mission_progress mission_id=%s job %s -> %s", m["id"], job_state, nxt)
+
+    # --------------------------------------- notifications de fin (outbox)
+    def _enqueue_completion_notification(self, db, job_id: str, runner_id: str, now: float) -> bool:
+        """Enqueue atomique UNIQUE (job_id, kind) sur completed allowlisté.
+
+        Appelé DANS la transaction de transition acceptée : aucun appel
+        externe ici. `INSERT OR IGNORE` => replay idempotent (retry runner).
+        Retourne True si une ligne a été créée."""
+        cur = db.execute(
+            """INSERT OR IGNORE INTO completion_notifications
+                 (job_id, kind, runner_id, status, attempts, next_attempt_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                job_id, P.NOTIFY_KIND_COMPLETED, runner_id,
+                P.NOTIFY_STATUS_PENDING, 0, now, now, now,
+            ),
+        )
+        if cur.rowcount == 1:
+            log.info("completion_notif_enqueued job_id=%s runner=%s", job_id[:8], runner_id)
+            return True
+        return False
+
+    def mission_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Mission concernée par un job (tentative courante ou tentative passée).
+
+        Retourne {mission_id, state} ou None. Lecture seule, jamais de secret."""
+        with self._lock:
+            m = self._db.execute(
+                "SELECT id, state FROM missions WHERE current_job_id=?", (job_id,)
+            ).fetchone()
+            if m is not None:
+                return {"mission_id": m["id"], "state": m["state"]}
+            a = self._db.execute(
+                """SELECT m.id, m.state FROM mission_attempts a
+                   JOIN missions m ON m.id = a.mission_id
+                   WHERE a.job_id=? ORDER BY a.attempt_no DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if a is not None:
+                return {"mission_id": a["id"], "state": a["state"]}
+            return None
+
+    def due_completion_notifications(self, now: float | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        """Notifications dues pour le dispatcher : pending + next_attempt_at <= now."""
+        now = self.clock() if now is None else float(now)
+        limit = max(1, min(int(limit or 20), 100))
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT job_id, kind, runner_id, status, attempts, next_attempt_at,
+                          created_at, updated_at, sent_at, last_error
+                   FROM completion_notifications
+                   WHERE status=? AND next_attempt_at <= ?
+                   ORDER BY created_at LIMIT ?""",
+                (P.NOTIFY_STATUS_PENDING, now, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_completion_notification(self, job_id: str, kind: str = P.NOTIFY_KIND_COMPLETED) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT job_id, kind, runner_id, status, attempts, next_attempt_at,"
+                " created_at, updated_at, sent_at, last_error"
+                " FROM completion_notifications WHERE job_id=? AND kind=?",
+                (job_id, kind),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    @staticmethod
+    def _notify_backoff_s(attempts: int) -> float:
+        """Retry exponentiel borné : 60s, 120s, 240s, … plafonné à 1h."""
+        return min(3600.0, 60.0 * (2 ** max(0, int(attempts) - 1)))
+
+    def mark_completion_sent(self, job_id: str, kind: str = P.NOTIFY_KIND_COMPLETED) -> dict[str, Any] | None:
+        now = self.clock()
+        with self._tx() as db:
+            db.execute(
+                "UPDATE completion_notifications SET status=?, sent_at=?, updated_at=? WHERE job_id=? AND kind=?",
+                (P.NOTIFY_STATUS_SENT, now, now, job_id, kind),
+            )
+            log.info("completion_notif_sent job_id=%s", job_id[:8])
+        return self.get_completion_notification(job_id, kind)
+
+    def mark_completion_error(
+        self, job_id: str, error: str, kind: str = P.NOTIFY_KIND_COMPLETED,
+        max_attempts: int = P.NOTIFY_MAX_ATTEMPTS,
+    ) -> dict[str, Any] | None:
+        """Échec d'envoi : retry exponentiel borné, puis status failed (borné)."""
+        now = self.clock()
+        clean = P.clip(redact(error), 500) if error else "sender_failed"
+        with self._tx() as db:
+            row = db.execute(
+                "SELECT attempts FROM completion_notifications WHERE job_id=? AND kind=?",
+                (job_id, kind),
+            ).fetchone()
+            if row is None:
+                return None
+            attempts = int(row["attempts"]) + 1
+            if attempts >= int(max_attempts):
+                db.execute(
+                    "UPDATE completion_notifications SET status=?, attempts=?, last_error=?, updated_at=? "
+                    "WHERE job_id=? AND kind=?",
+                    (P.NOTIFY_STATUS_FAILED, attempts, clean, now, job_id, kind),
+                )
+                log.warning("completion_notif_failed job_id=%s attempts=%d", job_id[:8], attempts)
+            else:
+                nxt = now + self._notify_backoff_s(attempts)
+                db.execute(
+                    "UPDATE completion_notifications SET attempts=?, next_attempt_at=?, last_error=?, updated_at=? "
+                    "WHERE job_id=? AND kind=?",
+                    (attempts, nxt, clean, now, job_id, kind),
+                )
+                log.info("completion_notif_retry job_id=%s attempts=%d next_in_s=%d", job_id[:8], attempts, int(nxt - now))
+        return self.get_completion_notification(job_id, kind)
 
     # ------------------------------------------------------- alertes infra
     @staticmethod
@@ -1772,10 +1989,27 @@ class Store:
             }
 
     # ------------------------------------------------------------- attente
-    def wait_for_change(self, job_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any] | None:
+    def wait_for_change(
+        self,
+        job_id: str,
+        since_seq: int = -1,
+        timeout_s: float = P.WAIT_DEFAULT_S,
+        waits_done: int = 0,
+    ) -> dict[str, Any] | None:
         """Long-poll borné : se réveille sur changement significatif (état, sortie,
         événement) ou à expiration du timeout. Réveil par polling 0,2 s, jamais plus
         de WAIT_MAX_S. N'est PAS un fond de tâche : le réveil exige un tour actif.
+
+        Budget actif (anti-timeout ChatGPT) : `waits_done` = nombre de waits déjà
+        effectués dans le tour courant (0 au premier appel). Tant que
+        `waits_done < FOLLOW_MAX_WAITS` (2) et non terminal => suivi actif
+        (should_continue=true, rappel même tour). Au-delà et toujours non
+        terminal => `detached=true` (terminal=false, should_continue=false,
+        must_follow=false, next_tool=agent_job_get, curseur conservé +
+        resume_hint) : le caller répond puis reprend plus tard via
+        agent_job_get + agent_job_wait(since_seq=last_event_seq). Terminal
+        inchangé (jamais detached). `fire_and_forget` reste distinct
+        (detached=false, sans resume_hint).
 
         Sémantique (woke_by) :
         - job déjà terminal à l'appel => retour IMMÉDIAT `terminal` (jamais
@@ -1784,15 +2018,10 @@ class Store:
         - pendant l'attente : `terminal` (état terminal atteint), `state`
           (autre changement d'état), `change` (sortie/activité sans changement
           d'état), `event` (nouvel événement au-delà de since_seq) ;
-        - sinon `timeout` à expiration du délai borné.
-        - contrat de suivi : chaque retour porte `terminal` (job figé ou non),
-          `should_continue`/`must_follow` (= non terminal), `next_tool`
-          (`agent_job_wait` tant que non terminal, `agent_job_get` sinon),
-          `since_seq`/`last_event_seq` (curseur : rappeler avec
-          `since_seq=last_event_seq`) et `until='terminal'`. Un `timeout` non
-          terminal impose de rappeler IMMÉDIATEMENT dans le même tour."""
+        - sinon `timeout` à expiration du délai borné."""
         timeout_s = max(0.0, min(float(timeout_s), P.WAIT_MAX_S))
         since_seq = max(-1, int(since_seq))
+        waits_done = max(0, int(waits_done))
         import time as _t
 
         def _snapshot(woke_by: str) -> dict[str, Any] | None:
@@ -1807,8 +2036,9 @@ class Store:
                 "execution_health": view["execution_health"],
                 "last_event_seq": seq,
             }
-            out.update(follow_for_wait(view["state"], woke_by, seq))
+            out.update(follow_for_wait(view["state"], woke_by, seq, waits_done, job_id=job_id))
             out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+            out["since_seq"] = seq
             return out
 
         with self._lock:
@@ -1852,29 +2082,56 @@ class Store:
             "execution_health": view["execution_health"],
             "last_event_seq": seq,
         }
-        out.update(follow_for_wait(view["state"], woke_by, seq))
+        out.update(follow_for_wait(view["state"], woke_by, seq, waits_done, job_id=job_id))
         out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+        out["since_seq"] = seq
         return out
 
     def wait_for_mission(
-        self, mission_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S
+        self, mission_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S,
+        waits_done: int = 0,
     ) -> dict[str, Any] | None:
         """Attente bornée sur la tentative COURANTE d'une mission (même sémantique
-        que `wait_for_change`, jamais plus de WAIT_MAX_S). Retourne l'état mission
-        + job + suivi : `executing` non terminal => rappeler ; `needs_validation`
-        / `incomplete` => inspecter puis `agent_mission_validate` (jamais confondre
-        `completed` process avec `validated` mission). Pas de callback de fond."""
+        que `wait_for_change`, jamais plus de WAIT_MAX_S). Budget actif : 2 waits
+        dans le même tour (`waits_done`), puis `detached=true` si toujours
+        executing non terminal (next_tool=agent_mission_get + resume_hint,
+        curseur conservé). `needs_validation`/`incomplete` => inspecter puis
+        `agent_mission_validate` (jamais confondre `completed` process avec
+        `validated` mission ; jamais detached sur needs_validation). Pas de callback de fond."""
+        waits_done = max(0, int(waits_done))
         m = self.get_mission(mission_id)
         if m is None:
             return None
         job_id = m["current_job_id"]
         if not job_id:
             return {"mission_id": mission_id, "error": "no_attempt", **m}
-        w = self.wait_for_change(job_id, since_seq, timeout_s)
+        w = self.wait_for_change(job_id, since_seq, timeout_s, waits_done=waits_done)
         if w is None:
             return None
         m2 = self.get_mission(mission_id) or m
         state = m2["state"]
+        # Détaché : la tentative est toujours executing non terminale et le budget
+        # actif est épuisé => reprise différée (jamais une fin).
+        if state == P.MISSION_EXECUTING and bool(w.get("detached")):
+            return {
+                "mission_id": mission_id,
+                "mission_state": state,
+                "job_id": job_id,
+                "job_state": w["state"],
+                "woke_by": w["woke_by"],
+                "terminal": False,
+                "should_continue": False,
+                "must_follow": False,
+                "detached": True,
+                "next_tool": P.DETACHED_NEXT_MISSION,
+                "since_seq": w["since_seq"],
+                "last_event_seq": w["last_event_seq"],
+                "until": FOLLOW_UNTIL,
+                "wait_timeout_s": FOLLOW_WAIT_S,
+                "waits_done": waits_done,
+                "resume_hint": detached_hint_mission(mission_id, w["last_event_seq"]),
+                "current_job_id": job_id,
+            }
         pursuing = state == P.MISSION_EXECUTING and not w["terminal"]
         if pursuing:
             nxt = "agent_mission_wait"
@@ -1891,11 +2148,13 @@ class Store:
             "terminal": w["terminal"],
             "should_continue": pursuing,
             "must_follow": pursuing,
+            "detached": False,
             "next_tool": nxt,
             "since_seq": w["since_seq"],
             "last_event_seq": w["last_event_seq"],
             "until": FOLLOW_UNTIL,
             "wait_timeout_s": FOLLOW_WAIT_S,
+            "waits_done": waits_done,
             "current_job_id": job_id,
         }
 

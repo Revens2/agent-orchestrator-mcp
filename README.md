@@ -47,8 +47,8 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 | `agent_job_output` | lecture | sortie paginée (`cursor`, `limit` ≤ 20 000) |
 | `agent_job_events` | lecture | journal structuré borné et paginé (`after_seq`, `limit` ≤ 200), pas de transcript |
 | `agent_runner_inspect` | lecture | snapshot runner : versions, capacités, workspaces, git (branch/HEAD/dirty), jobs actifs |
-| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) ; retour machine-lisible (`terminal`, `should_continue`/`must_follow`, `next_tool`, curseur `since_seq`) : un timeout non terminal impose de rappeler dans le même tour, jamais de répondre |
-| `agent_mission_wait` | lecture | attente bornée (≤ 60 s) sur la tentative courante d'une mission (`mission_state`, `terminal`, `should_continue`, `next_tool` = `agent_mission_wait` ou `agent_mission_validate`) |
+| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) ; retour machine-lisible (`terminal`, `detached`, `should_continue`/`must_follow`, `next_tool`, curseur `since_seq`, `waits_done`, `resume_hint`) : suivi actif court de 2 waits (`waits_done=0 puis 1`), puis `detached=true` si non terminal — répondre et reprendre plus tard via `agent_job_get` |
+| `agent_mission_wait` | lecture | attente bornée (≤ 60 s) sur la tentative courante (`mission_state`, `terminal`, `detached`, `should_continue`, `next_tool` = `agent_mission_wait` actif, `agent_mission_validate` si à valider, `agent_mission_get` si détaché) |
 | `agent_job_cancel` | écriture | `cancelled` / `cancel_requested` / `already_finished` / `unknown_job` |
 | `agent_job_list` | lecture | liste filtrable |
 | `agent_mission_create` | écriture | mission (objectif + critères) + 1re tentative ; jamais de retry auto |
@@ -69,6 +69,20 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 > `agent_job_get` expose alors les couches `broker_health` / `runner_health` /
 > `runtime_process_health` pour diagnostiquer la cause observable, et `agent_job_events`
 > le journal (`lease_expired`, `runner_disconnect`, …).
+>
+> **Suivi anti-timeout** : 2 `agent_job_wait` / `agent_mission_wait` actifs max par tour
+> ChatGPT (`waits_done=0 puis 1`) ; au-delà, si toujours non terminal, `detached=true`
+> (`terminal=false`, `should_continue=false`, `next_tool=agent_job_get` /
+> `agent_mission_get`, curseur + `resume_hint`) — répondre puis reprendre plus tard.
+> `fire_and_forget=true` reste distinct (`detached=false`, sans reprise attendue).
+>
+> **Notification de fin** : tout `completed` d'un runner allowlisté
+> (`ORCH_NOTIFY_RUNNERS`, défaut `main-windows-pc,pc-fixe`) est notifié **une fois**
+> sur Telegram via outbox SQLite + sender configurable
+> (`ORCH_NOTIFY_SENDER`, défaut `/usr/local/bin/send_telegram.sh`, timeout + retry
+> bornés). Message strictement whitelisté (runner/runtime/workspace/titre/durée/job8/
+> état mission, `completed ≠ mission validée` si mission) — jamais prompt/sortie/
+> résumé/erreur/secrets.
 >
 > **Stalls** : processus vivant + silence d'activité/output ≥ 10 min → événement
 > `suspected_stall`, ≥ 30 min → `stalled`. Notification seule : jamais de relance ni

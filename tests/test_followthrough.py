@@ -49,14 +49,22 @@ def to_running(store, epoch, claimed):
 def test_follow_helpers_contract(tmp_path):
     f = follow_for_job("running", 7)
     assert f == {"must_follow": True, "terminal": False, "should_continue": True,
+                "detached": False,
                 "next_tool": "agent_job_wait", "wait_timeout_s": 25,
                 "until": "terminal", "since_seq": 7}
     f_done = follow_for_job("completed", 9)
     assert f_done["terminal"] is True and f_done["should_continue"] is False
     assert f_done["must_follow"] is False and f_done["next_tool"] == "agent_job_get"
+    assert f_done["detached"] is False
     w = follow_for_wait("running", "timeout", 3)
     assert w["should_continue"] is True and w["next_tool"] == "agent_job_wait"
     assert w["woke_by"] == "timeout" and w["since_seq"] == 3
+    assert w["detached"] is False
+    # budget épuisé => détaché (job)
+    d = follow_for_wait("running", "timeout", 3, waits_done=2, job_id="jid")
+    assert d["detached"] is True and d["terminal"] is False
+    assert d["should_continue"] is False and d["must_follow"] is False
+    assert d["next_tool"] == "agent_job_get" and "resume_hint" in d
 
 
 def test_wait_timeout_carries_recall_contract(tmp_path):
