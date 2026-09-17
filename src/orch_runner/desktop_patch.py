@@ -97,9 +97,8 @@ def extract_patches(text: str) -> list[str]:
         blob = body.strip("\n")
         if not blob or len(blob) > MAX_PATCH_CHARS:
             continue
-        if (lang or "").lower() in _DIFF_LANGS or "--- " in blob:
-            if _looks_like_diff(blob):
-                out.append(blob)
+        if ((lang or "").lower() in _DIFF_LANGS or "--- " in blob) and _looks_like_diff(blob):
+            out.append(blob)
         if len(out) >= MAX_PATCH_BLOCKS:
             break
     if not out and _looks_like_diff(text):
@@ -115,7 +114,7 @@ def _clean_path(raw: str) -> str:
     p = raw.strip().strip('"').strip("'").strip()
     p = p.replace("\\", "/")
     if p.startswith(("a/", "b/", "./")):
-        p = p[2:] if p.startswith("./") else p[2:]
+        p = p[2:]
     return p
 
 
@@ -213,11 +212,11 @@ def _read_lines(path: Path) -> tuple[list[str], bool]:
         raise PatchError(E_CONTEXT, f"{path.name} : fichier non UTF-8 (patch texte seul)") from None
     if not text:
         return [], False
-    nl = text.endswith("\n") or text.endswith("\r")
+    nl = text.endswith(("\n", "\r"))
     raw = text.split("\n")
     if text.endswith("\n"):
         raw = raw[:-1]
-    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in raw]
+    lines = [ln.removesuffix("\r") for ln in raw]
     return lines, nl
 
 
