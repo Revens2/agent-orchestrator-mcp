@@ -49,6 +49,22 @@ class Adapter:
         self.policy = policy
         self.session_id: str | None = None
         self.last_text: str | None = None
+        # Session à REPRENDRE dans ce processus neuf (posée par le runner depuis
+        # le job). Un runtime qui ne sait pas reprendre l'ignore simplement :
+        # la conversation repart de zéro, et le broker l'a déjà annoncé.
+        self.resume_session_id: str | None = None
+        # Lignes d'ouverture de conversation (skill de départ, autorisation des
+        # sous-agents), posées par le runner. Appliquées au prompt ENVOYÉ, jamais
+        # au prompt d'origine : un titre de session reste dérivé de la mission.
+        self.session_preamble: list[str] = []
+
+    def _with_preamble(self, prompt: str) -> str:
+        # Une conversation REPRISE a déjà été ouverte : son skill de départ ne se
+        # rejoue pas. L'invariant est tenu ici en plus du runner, pour qu'aucun
+        # appelant ne puisse le contourner par erreur.
+        if self.resume_session_id:
+            return prompt
+        return P.apply_session_preamble(prompt, self.session_preamble)
 
     # -- découverte
     def probe(self) -> dict[str, Any]:
@@ -114,7 +130,7 @@ class ClaudeCode(Adapter):
         argv = [self.exe, "-p", "--output-format", "stream-json", "--verbose", *self.MODE[self.policy][mode]]
         if self.extra.get("max_budget_usd"):
             argv += ["--max-budget-usd", str(float(self.extra["max_budget_usd"]))]
-        return Launch(argv, prompt)
+        return Launch(argv, self._with_preamble(prompt))
 
     def on_line(self, line):
         data = _json(line)
@@ -162,7 +178,7 @@ class Codex(Adapter):
         last = tmpdir / "last_message.txt"
         argv = [self.exe, "exec", "--json", "-s", self.MODE[self.policy][mode], "-c", 'approval_policy="never"',
                 "-C", cwd, "--skip-git-repo-check", "-o", str(last), "-"]
-        return Launch(argv, prompt)
+        return Launch(argv, self._with_preamble(prompt))
 
     def on_line(self, line):
         data = _json(line)
@@ -208,7 +224,7 @@ class Agy(Adapter):
         framed = (
             f"[orchestrator] Workspace for this task: {cwd}\n"
             "Treat that directory as the current directory; read and write files only inside it.\n\n"
-            + prompt
+            + self._with_preamble(prompt)
         )
         # forme --flag=valeur : un prompt commençant par '-' ne peut pas être lu comme option
         argv = [self.exe, f"--print={framed}", "--output-format", "json", *self.MODE[self.policy][mode],
@@ -265,12 +281,24 @@ class OpenCode(Adapter):
     def build(self, prompt, mode, cwd, tmpdir):
         if mode not in self.MODE[self.policy]:
             raise ValueError(f"opencode : mode {mode} non supporté en politique {self.policy}")
+        # Reprise de conversation : `opencode run --session <id>` (« Session ID to
+        # continue »). C'est ce qui rend indolore un changement de clé d'API —
+        # opencode lit ses identifiants au démarrage, donc seul un processus NEUF
+        # charge la nouvelle clé, et --session évite de refaire la conversation.
+        # On ne repasse alors PAS --title : le titre appartient à la session
+        # existante et ne doit jamais être renommé.
+        if self.resume_session_id:
+            self.session_id = self.resume_session_id
+            return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
+                           "--session", self.resume_session_id, "--dir", cwd, "--",
+                           self._with_preamble(prompt)], None)
         # --title natif (tronque le prompt sinon) : titre stable dérivé du
         # premier objectif réel, jamais renommé ensuite.
         title = P.display_title(prompt, fallback="session opencode")
         self._prompt_title = title
+        # Le titre reste dérivé de la MISSION, jamais du préambule.
         return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
-                       "--title", title, "--dir", cwd, "--", prompt], None)
+                       "--title", title, "--dir", cwd, "--", self._with_preamble(prompt)], None)
 
     def probe(self):
         """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
@@ -419,7 +447,8 @@ class ClaudeDesktop(Adapter):
             raise ValueError(f"claude-desktop : mode {mode} non supporté (attendus : {', '.join(self.modes)})")
         self._workspace_cwd = cwd
         self._patch_mode = mode == "workspace_write"
-        framed = self.PATCH_HEADER.format(cwd=cwd) + prompt if self._patch_mode else prompt
+        body = self._with_preamble(prompt)
+        framed = self.PATCH_HEADER.format(cwd=cwd) + body if self._patch_mode else body
         prompt_file = Path(tmpdir) / "prompt.txt"
         prompt_file.write_text(framed, encoding="utf-8")
         argv = [self.exe, self._bridge, "--prompt-file", str(prompt_file), "--out-dir", str(tmpdir), "--profile", self._profile()]

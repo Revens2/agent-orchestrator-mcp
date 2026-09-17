@@ -224,6 +224,89 @@ sudo -u orch-app ORCH_DATA_DIR=/srv/orch/data \
   Jamais de secrets, jamais de dump d'environnement (`current_command_sanitized`
   est toujours null : les adapters n'exposent pas les commandes, par design).
 
+## Reprise après changement de clé d'API (OpenCode et autres)
+
+Fait d'exploitation : **les runtimes lisent leurs identifiants au démarrage**.
+Une nouvelle clé d'API n'est donc JAMAIS rechargée par le processus en cours —
+il faut l'éteindre et le relancer. Une pause `quota_exhausted` / `auth_required`
+ne se lève pas toute seule pour ces runtimes : le bloc `human_action_required`
+porte `restart_required=true` et la marche à suivre.
+
+Marche à suivre, une fois la nouvelle clé en place :
+
+1. `agent_job_cancel(job_id)` si le job tient encore le workspace ;
+2. `agent_job_relaunch(job_id)` — ou `agent_mission_retry(mission_id)` si le job
+   appartient à une mission (même reprise, et le compte des tentatives est tenu).
+
+Le processus créé est NEUF : il lit la nouvelle clé. Et quand le runtime sait
+reprendre une conversation, elle continue au lieu d'être refaite :
+
+| Runtime | Reprise | Comment |
+|---|---|---|
+| `opencode` | oui | `opencode run --session <id>` (« Session ID to continue ») |
+| autres | non (à ce jour) | conversation neuve ; le retour dit `conversation="fresh"` — **dites-le à l'utilisateur** |
+
+Le `runtime_session_id` observé sur le job précédent est transmis au runner dans
+le `claim` (`resume_session_id`), et le runner le passe à l'adapter. Sur une
+reprise, le titre de session n'est **jamais** réécrit et le préambule d'ouverture
+n'est **jamais** rejoué.
+
+Exception préservée : une session reconnue **corrompue**
+(`SESSION_CORRUPTION_SIGNS`) n'est jamais reprise — elle repart toujours neuve,
+comme avant.
+
+## Qui est qui : machines et runtimes
+
+Un `runner_id` opaque ne dit pas de quelle machine il s'agit, et `claude-code`
+ressemble trop à `claude-desktop` pour être distingué de son seul identifiant.
+Deux cartes d'identité règlent ça, exposées par `agent_runner_list` et
+`agent_runner_inspect`.
+
+**Machine** (`machine`) : `label`, `hostname`, `os`, `role`, `description`.
+`label`, `role` et `description` viennent de la section `[machine]` de
+`runner.toml` ; `hostname` et `os` sont observés par le runner. Un champ non
+déclaré et non observable reste `null` : **jamais deviné**. Parlez de la machine
+par son `label`, pas par son identifiant.
+
+**Runtime** (`identity` sur chaque entrée de `runtimes`) : `label`, `vendor`,
+`kind`, `interface`, `use_when`, `subagents`, plus `distinct_from` /
+`distinction` qui nomment explicitement la confusion à éviter :
+
+- `claude-code` — CLI headless d'Anthropic, un processus par job, sans fenêtre,
+  confiné au workspace ;
+- `claude-desktop` — APPLICATION DE BUREAU de l'utilisateur pilotée par son UI :
+  une seule à la fois, profil et historique partagés avec lui, aucun accès
+  disque ni shell (`workspace_write` = diffs appliqués par le runner).
+
+Quand l'utilisateur dit seulement « Claude », l'outil demande lequel plutôt que
+de choisir à sa place.
+
+## Ouverture de conversation : skill de départ et sous-agents
+
+Section `[session]` de `runner.toml` :
+
+```toml
+[session]
+start_skill = "/caveman ultra"   # "" pour désactiver
+subagents = true
+```
+
+- **`start_skill`** est placé en **première ligne** du prompt — condition pour
+  qu'une commande `/skill` soit interprétée comme telle et non lue comme du
+  texte. Envoyé uniquement aux runtimes qui comprennent ces commandes
+  (`P.SLASH_SKILL_RUNTIMES` : `claude-code` à ce jour). `claude-desktop` passe
+  par l'UI et n'a pas été vérifié sur ce point : il n'est pas dans la liste tant
+  que ce n'est pas constaté.
+- **`subagents`** ajoute une autorisation explicite de déléguer, sur les seuls
+  runtimes qui documentent des sous-agents (`subagents="native"` :
+  `claude-code`, `opencode`). Ailleurs (`"unknown"`), **rien n'est dit** : le
+  préambule n'invente pas une capacité qui n'a pas été vérifiée.
+- Le prompt de l'utilisateur n'est jamais modifié ni tronqué, seulement précédé.
+  Le titre de session reste dérivé de la **mission**, jamais du préambule.
+- **Rien n'est rejoué sur une conversation reprise** (`resume_session_id`
+  présent) : elle a déjà été ouverte. L'invariant est tenu par l'adapter en plus
+  du runner.
+
 ## Alertes infra unifiées ([ETUDE]/[NEXUS])
 
 Persistance normalisée des alertes sortantes dans le broker (`infra_alerts`),

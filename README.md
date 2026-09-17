@@ -10,7 +10,7 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
                                                                             ▼
                          orch-gateway  127.0.0.1:8801   OAuth + politique outil par outil
                                                                             ▼
-                          orch-mcp      127.0.0.1:8802   MCP (23 outils) + broker SQLite (autorité)
+                          orch-mcp      127.0.0.1:8802   MCP (24 outils) + broker SQLite (autorité)
                                                                             ▲
                          nginx 10.200.114.203:8803      /runner/v1/* — IP NetBird uniquement
                                                                             │ long-poll SORTANT
@@ -33,6 +33,14 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 - **Le broker est la source d'autorité** : transitions compare-and-set avec *fencing token* et epoch de
   session runner ; un job perdu après lancement devient `lost`, **jamais relancé ni déclaré `completed`**.
 - **Aucun port entrant sur le PC** : le runner se connecte en sortie au VPS via NetBird.
+- **Qui est qui** : chaque machine porte une carte `machine` (label, hostname, os, role) et chaque
+  runtime une carte `identity` qui nomme explicitement la confusion à éviter — `claude-code` (CLI
+  headless, confinée au workspace) n'est pas `claude-desktop` (application de bureau de
+  l'utilisateur, pilotée par son UI). Champ non déclaré = `null`, jamais deviné.
+- **Ouverture de conversation** (`[session]` de `runner.toml`) : `start_skill` (défaut
+  `/caveman ultra`) est placé en première ligne du prompt, et seulement sur les runtimes qui
+  interprètent les commandes `/skill` ; `subagents` autorise explicitement la délégation, et
+  seulement là où le runtime la documente. Rien n'est rejoué sur une conversation reprise.
 - **Pas de duplication ConvIA** : le broker ne garde que métadonnées, sortie bornée (2 Mo/job) et
   résumé ; prompts purgés à 7 j, sorties à 7 j, métadonnées à 90 j.
 
@@ -51,6 +59,7 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 | `agent_job_liveness` | lecture | **signal de vie** immédiat : `verdict` (`working`/`starting`/`waiting_for_human`/`lost_contact`/`unknown`/`finished`), `evidence` datée (heartbeat, télémétrie, sortie, événements), `freshest_signal_age_s` |
 | `agent_job_pause` | écriture | déclare une **attente humaine** bornée (quota épuisé, reconnexion, pause volontaire) : suspend `lost`/stall/timeout dur |
 | `agent_job_resume` | écriture | lève l'attente humaine (l'utilisateur a agi) ; automatique dès que l'agent reparle |
+| `agent_job_relaunch` | écriture | relance dans un **processus neuf** (seul moyen de charger une nouvelle clé d'API) en **reprenant la conversation** quand le runtime le sait (`opencode --session`) |
 | `agent_mission_wait` | lecture | attente bornée (≤ 60 s) sur la tentative courante d'une mission (`mission_state`, `terminal`, `should_continue`, `next_tool` = `agent_mission_wait` ou `agent_mission_validate`) |
 | `agent_job_cancel` | écriture | `cancelled` / `cancel_requested` / `already_finished` / `unknown_job` |
 | `agent_job_list` | lecture | liste filtrable |

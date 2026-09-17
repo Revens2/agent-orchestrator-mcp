@@ -210,7 +210,9 @@ def test_terminal_on_quota_is_human_action_not_failure(tmp_path):
     job = store.get_job(jid)
     human = job["human_action_required"]
     assert human is not None and human["reason"] == P.PAUSE_QUOTA
-    assert human["job_is_alive"] is False and human["resume_with"] == "agent_mission_retry"
+    assert human["job_is_alive"] is False and human["resume_with"] == "agent_job_relaunch"
+    # `fake` n'a pas d'identifiants à recharger : pas de redémarrage imposé.
+    assert human["restart_required"] is False
     # La mission dit « il manque une action », pas « l'agent a échoué ».
     assert store.get_mission(mission["mission_id"])["state"] == P.MISSION_BLOCKED
     # Et une fois la clé changée, la relance explicite est autorisée.
@@ -245,3 +247,201 @@ def test_follow_for_wait_stops_only_on_human_action(tmp_path):
     done = follow_for_wait("failed", "terminal", 4, {"required": True, "reason": P.PAUSE_QUOTA})
     assert done["terminal"] is True and "stop_reason" not in done
     assert done["human_action_required"]["reason"] == P.PAUSE_QUOTA
+
+
+# ------------- relance après changement de clé : il faut un PROCESSUS NEUF
+def die_on_quota(store, epoch, jid, fen, session="ses_abc123"):
+    store.event("pc", epoch, jid, fen, "ev-sid-1", output="je bosse", runtime_session_id=session)
+    store.transition("pc", epoch, jid, fen, "running", "failed", exit_code=1,
+                     error="opencode: insufficient_quota")
+
+
+def claim_one(store, epoch, job_id):
+    """Le claim peut ramener plusieurs jobs : on isole celui qu'on teste."""
+    return next(c for c in store.claim("pc", epoch, 2) if c["job_id"] == job_id)
+
+
+def opencode_job(store, epoch):
+    job, _ = store.create_job("pc", "opencode", "demo", "analyse le projet", "read_only", None, None)
+    claimed = claim_one(store, epoch, job["job_id"])
+    jid, fen = claimed["job_id"], claimed["fencing"]
+    store.transition("pc", epoch, jid, fen, "claimed", "starting")
+    store.transition("pc", epoch, jid, fen, "starting", "running", telemetry={"proc_alive": 1})
+    return jid, fen
+
+
+INFO_OC = {
+    "version": "test",
+    "max_parallel": 2,
+    "runtimes": [{"id": "fake", "available": True}, {"id": "opencode", "available": True}],
+    "workspaces": [{"id": "demo", "modes": ["read_only", "workspace_write"]}],
+}
+
+
+def make_store_oc(tmp_path):
+    clock = Clock()
+    store = Store(tmp_path / "oc.db", clock=clock)
+    epoch = store.hello("pc", INFO_OC, [])
+    return store, clock, epoch
+
+
+def test_pause_says_a_restart_is_required(tmp_path):
+    store, clock, epoch = make_store_oc(tmp_path)
+    jid, fen = opencode_job(store, epoch)
+    store.pause_job(jid, P.PAUSE_QUOTA, None, None, P.PAUSE_SRC_CHATGPT)
+    human = store.get_job(jid)["human_action_required"]
+    # Une simple levée de pause ne suffit PAS : le processus a lu sa clé au démarrage.
+    assert human["restart_required"] is True
+    assert "relancer" in human["restart_note"]
+    assert "reprise" in human["restart_note"]
+
+
+def test_manual_pause_needs_no_restart(tmp_path):
+    store, clock, epoch = make_store_oc(tmp_path)
+    jid, _ = opencode_job(store, epoch)
+    store.pause_job(jid, P.PAUSE_MANUAL, None, None, P.PAUSE_SRC_HUMAN)
+    human = store.get_job(jid)["human_action_required"]
+    assert human["restart_required"] is False and human["restart_note"] is None
+
+
+def test_relaunch_continues_the_opencode_conversation(tmp_path):
+    store, clock, epoch = make_store_oc(tmp_path)
+    jid, fen = opencode_job(store, epoch)
+    die_on_quota(store, epoch, jid, fen)
+
+    out = store.relaunch_job(jid)
+    assert out["result"] == "relaunched"
+    assert out["conversation"] == "continued"
+    assert out["resumed_session_id"] == "ses_abc123"
+    assert out["should_continue"] is True and out["next_tool"] == "agent_job_wait"
+
+    # Le runner reçoit la session à reprendre dans le claim : c'est ce qui
+    # permet d'ouvrir un processus NEUF (nouvelle clé) sur la MÊME conversation.
+    claimed = claim_one(store, epoch, out["job_id"])
+    assert claimed["resume_session_id"] == "ses_abc123"
+
+
+def test_relaunch_is_honest_when_the_runtime_cannot_resume(tmp_path):
+    store, clock, epoch = make_store_oc(tmp_path)
+    jid, fen = running_job(store, epoch, clock)  # runtime `fake` : pas de reprise
+    store.event("pc", epoch, jid, fen, "ev-sid-2", output="x", runtime_session_id="s1")
+    store.transition("pc", epoch, jid, fen, "running", "failed", exit_code=1,
+                     error="invalid_api_key")
+    out = store.relaunch_job(jid)
+    assert out["conversation"] == "fresh" and out["resumed_session_id"] is None
+    assert "repart de zéro" in out["note"]
+
+
+def test_relaunch_refuses_while_the_job_still_holds_the_workspace(tmp_path):
+    store, clock, epoch = make_store_oc(tmp_path)
+    jid, _ = opencode_job(store, epoch)
+    out = store.relaunch_job(jid)
+    assert out["result"] == "job_still_active" and "agent_job_cancel" in out["hint"]
+    assert store.relaunch_job("fantome")["result"] == "unknown_job"
+
+
+def test_mission_retry_after_quota_resumes_the_session(tmp_path):
+    store, clock, epoch = make_store_oc(tmp_path)
+    mission = store.create_mission(
+        "analyser", ["rapport"], 2, "pc", "opencode", "demo", "read_only", None, None, None,
+    )
+    jid = mission["current_job_id"]
+    claimed = next(c for c in store.claim("pc", epoch, 2) if c["job_id"] == jid)
+    fen = claimed["fencing"]
+    store.transition("pc", epoch, jid, fen, "claimed", "starting")
+    store.transition("pc", epoch, jid, fen, "starting", "running", telemetry={"proc_alive": 1})
+    die_on_quota(store, epoch, jid, fen, session="ses_mission")
+
+    assert store.get_mission(mission["mission_id"])["state"] == P.MISSION_BLOCKED
+    again = store.retry_mission(mission["mission_id"])
+    new_jid = again["current_job_id"]
+    claimed2 = next(c for c in store.claim("pc", epoch, 2) if c["job_id"] == new_jid)
+    assert claimed2["resume_session_id"] == "ses_mission"
+
+
+def test_corrupted_session_is_never_resumed(tmp_path):
+    """Règle existante préservée : une session corrompue repart TOUJOURS neuve,
+    même si le runtime sait reprendre."""
+    store, clock, epoch = make_store_oc(tmp_path)
+    mission = store.create_mission(
+        "analyser", ["rapport"], 2, "pc", "opencode", "demo", "read_only", None, None, None,
+    )
+    jid = mission["current_job_id"]
+    claimed = next(c for c in store.claim("pc", epoch, 2) if c["job_id"] == jid)
+    fen = claimed["fencing"]
+    store.transition("pc", epoch, jid, fen, "claimed", "starting")
+    store.transition("pc", epoch, jid, fen, "starting", "running")
+    store.event("pc", epoch, jid, fen, "ev-sid-3", output="x", runtime_session_id="ses_pourrie")
+    store.transition("pc", epoch, jid, fen, "running", "failed", exit_code=1,
+                     error=P.SESSION_CORRUPTED_PREFIX + " failed to load plugin")
+    again = store.retry_mission(mission["mission_id"])
+    claimed2 = claim_one(store, epoch, again["current_job_id"])
+    assert claimed2["resume_session_id"] is None
+
+
+# ------------------------------------------------ qui est qui : machines et runtimes
+def test_runtime_identity_separates_claude_code_from_desktop(tmp_path):
+    store, _, _ = make_store_oc(tmp_path)
+    cli = P.runtime_identity("claude-code")
+    app = P.runtime_identity("claude-desktop")
+    assert cli["kind"] == "cli" and app["kind"] == "desktop_app"
+    # La confusion est nommée explicitement, dans les deux sens.
+    assert cli["distinct_from"] == "claude-desktop"
+    assert app["distinct_from"] == "claude-code"
+    assert "headless" in cli["distinction"] and "FENÊTRE" in app["distinction"]
+    assert P.runtime_identity("inconnu") is None
+
+
+def test_runner_list_carries_machine_and_runtime_identity(tmp_path):
+    clock = Clock()
+    store = Store(tmp_path / "id.db", clock=clock)
+    store.hello("main-windows-pc", {
+        **INFO_OC,
+        "machine": {"label": "PC du bureau", "hostname": "CAROLINE-PC",
+                    "os": "Windows 11", "role": "poste de travail"},
+    }, [])
+    runner = store.runners()[0]
+    assert runner["machine"]["label"] == "PC du bureau"
+    assert runner["machine"]["hostname"] == "CAROLINE-PC"
+    assert runner["machine"]["description"] is None  # non déclaré : jamais deviné
+    ids = {rt["id"]: rt["identity"] for rt in runner["runtimes"]}
+    assert ids["opencode"]["vendor"] == "SST"
+    assert store.runner_inspect("main-windows-pc")["machine"]["label"] == "PC du bureau"
+
+
+def test_machine_identity_is_absent_when_not_declared(tmp_path):
+    store, _, _ = make_store_oc(tmp_path)
+    machine = store.runners()[0]["machine"]
+    assert set(machine) == set(P.MACHINE_FIELDS)
+    assert all(v is None for v in machine.values())
+
+
+# ---------------- ouverture de conversation : skill de départ et sous-agents
+def test_start_skill_is_the_very_first_line(tmp_path):
+    lines = P.build_session_preamble("claude-code", "/caveman ultra", True, resuming=False)
+    assert lines[0] == "/caveman ultra", "une commande /skill doit ouvrir le prompt"
+    out = P.apply_session_preamble("corrige le bug", lines)
+    assert out.startswith("/caveman ultra\n\n")
+    assert out.endswith("corrige le bug"), "le prompt de l'utilisateur n'est jamais modifié"
+
+
+def test_start_skill_is_not_sent_to_runtimes_that_would_read_it_as_text(tmp_path):
+    for runtime in ("opencode", "codex", "agy"):
+        lines = P.build_session_preamble(runtime, "/caveman ultra", True)
+        assert "/caveman ultra" not in lines
+
+
+def test_subagents_are_authorised_only_where_documented(tmp_path):
+    assert P.subagent_support("claude-code") == "native"
+    assert P.subagent_support("opencode") == "native"
+    # Jamais annoncé comme acquis quand ce n'est pas vérifié.
+    assert P.subagent_support("codex") == "unknown"
+    assert P.subagent_support("inconnu") == "unknown"
+    assert any("sous-agents" in line for line in P.build_session_preamble("opencode", "", True))
+    assert P.build_session_preamble("codex", "", True) == []
+    assert P.build_session_preamble("claude-code", "", False) == []
+
+
+def test_nothing_is_replayed_when_resuming_a_conversation(tmp_path):
+    assert P.build_session_preamble("claude-code", "/caveman ultra", True, resuming=True) == []
+    assert P.apply_session_preamble("suite", []) == "suite"

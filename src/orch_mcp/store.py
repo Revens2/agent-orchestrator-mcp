@@ -312,6 +312,11 @@ class Store:
         """Migration idempotente des bases v1 : nouvelles colonnes NULL (= inconnu)
         et nouvelles tables. Sûre à rejouer ; l'ancien code ignore ces ajouts."""
         with self._lock:
+            rcols = {r["name"] for r in self._db.execute("PRAGMA table_info(runners)").fetchall()}
+            if "machine_json" not in rcols:
+                # Carte d'identité lisible de la machine (label, hostname, OS, rôle).
+                # Absente = non déclarée par le runner, jamais devinée.
+                self._db.execute("ALTER TABLE runners ADD COLUMN machine_json TEXT")
             cols = {r["name"] for r in self._db.execute("PRAGMA table_info(jobs)").fetchall()}
             # DDL littéraux (pas d'interpolation : exigence semgrep) ; chaque
             # colonne n'est ajoutée que si absente.
@@ -360,6 +365,11 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN blocker_reason TEXT")
             if "blocker_sign" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN blocker_sign TEXT")
+            # Reprise de conversation dans un processus NEUF (nouvelle clé d'API).
+            if "resume_session_id" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN resume_session_id TEXT")
+            if "relaunch_of" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN relaunch_of TEXT")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -500,16 +510,19 @@ class Store:
         runtimes = [r for r in info.get("runtimes", []) if isinstance(r, dict) and r.get("id") in P.RUNTIMES]
         workspaces = [w for w in info.get("workspaces", []) if isinstance(w, dict) and P.valid_id(w.get("id"))]
         max_parallel = max(1, min(int(info.get("max_parallel", 1)), 16))
+        machine = P.machine_identity(info.get("machine"))
         held_map = {h.get("job_id"): h for h in held if isinstance(h, dict)}
         with self._tx() as db:
             row = db.execute("SELECT epoch FROM runners WHERE id=?", (runner_id,)).fetchone()
             epoch = (int(row["epoch"]) if row else 0) + 1
             db.execute(
-                """INSERT INTO runners(id, epoch, last_seen, hello_at, version, max_parallel, runtimes_json, workspaces_json)
-                   VALUES (?,?,?,?,?,?,?,?)
+                """INSERT INTO runners(id, epoch, last_seen, hello_at, version, max_parallel, runtimes_json,
+                     workspaces_json, machine_json)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, last_seen=excluded.last_seen,
                      hello_at=excluded.hello_at, version=excluded.version, max_parallel=excluded.max_parallel,
-                     runtimes_json=excluded.runtimes_json, workspaces_json=excluded.workspaces_json""",
+                     runtimes_json=excluded.runtimes_json, workspaces_json=excluded.workspaces_json,
+                     machine_json=excluded.machine_json""",
                 (
                     runner_id,
                     epoch,
@@ -519,6 +532,7 @@ class Store:
                     max_parallel,
                     json.dumps(runtimes)[:20_000],
                     json.dumps(workspaces)[:20_000],
+                    json.dumps(machine)[:2_000],
                 ),
             )
             active = db.execute(
@@ -632,7 +646,15 @@ class Store:
                         "status": "online" if online else "offline",
                         "last_seen": _iso(r["last_seen"]),
                         "seconds_since_seen": None if r["last_seen"] is None else round(now - r["last_seen"], 1),
-                        "runtimes": json.loads(r["runtimes_json"]),
+                        # Qui est cette machine ? Champ non déclaré = null, jamais deviné.
+                        "machine": self._machine_view(r),
+                        # Chaque runtime porte sa carte d'identité : c'est ce qui
+                        # empêche de confondre la CLI Claude Code et l'application
+                        # Claude Desktop, dont les identifiants se ressemblent.
+                        "runtimes": [
+                            {**rt, "identity": P.runtime_identity(rt.get("id"))}
+                            for rt in json.loads(r["runtimes_json"])
+                        ],
                         "workspaces": json.loads(r["workspaces_json"]),
                         "max_parallel": r["max_parallel"],
                         "active_jobs": active,
@@ -643,6 +665,18 @@ class Store:
             return out
 
     # ------------------------------------------------------------------- jobs
+    @staticmethod
+    def _machine_view(row) -> dict[str, Any]:
+        """Carte d'identité machine déclarée par le runner (champs absents = null)."""
+        try:
+            raw = row["machine_json"]
+        except (IndexError, KeyError):
+            raw = None
+        try:
+            return P.machine_identity(json.loads(raw) if raw else None)
+        except (ValueError, TypeError):
+            return P.machine_identity(None)
+
     def create_job(
         self,
         runner_id: str,
@@ -652,6 +686,8 @@ class Store:
         mode: str,
         timeout_s: int | None = None,
         idempotency_key: str | None = None,
+        resume_session_id: str | None = None,
+        relaunch_of: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Crée un job `queued`. Retourne (job, created). Refuse avant toute exécution
         si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé."""
@@ -705,10 +741,12 @@ class Store:
             job_id = str(uuid.uuid4())
             db.execute(
                 """INSERT INTO jobs(id, runner_id, runtime, workspace_id, mode, prompt, prompt_chars, idem_key, idem_hash,
-                     state, timeout_s, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     state, timeout_s, created_at, updated_at, resume_session_id, relaunch_of)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job_id, runner_id, runtime, workspace_id, mode, prompt, len(prompt), idempotency_key, req_hash,
-                 P.QUEUED, timeout_s, now, now),
+                 P.QUEUED, timeout_s, now, now,
+                 str(resume_session_id)[:128] if resume_session_id else None,
+                 str(relaunch_of)[:64] if relaunch_of else None),
             )
             self._log_transition(db, job_id, None, P.QUEUED, "mcp")
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -754,6 +792,9 @@ class Store:
                         "mode": fresh["mode"],
                         "prompt": fresh["prompt"],
                         "timeout_s": fresh["timeout_s"],
+                        # Reprise de conversation : le runner relance un processus
+                        # NEUF (donc nouvelle clé d'API lue) sur la MÊME session.
+                        "resume_session_id": fresh["resume_session_id"],
                         "lease_s": P.LEASE_S,
                     }
                 )
@@ -994,7 +1035,20 @@ class Store:
         if _paused(row):
             reason = row["pause_reason"] or P.PAUSE_MANUAL
             expires = row["pause_expires"]
+            restart = reason in (P.PAUSE_QUOTA, P.PAUSE_AUTH) and P.needs_restart_for_credentials(row["runtime"])
             return {
+                # Le processus en cours a lu ses identifiants à SON démarrage :
+                # une nouvelle clé n'y entrera jamais. La reprise passe donc par
+                # une relance, pas par une simple levée de pause.
+                "restart_required": restart,
+                "restart_note": (
+                    "le processus en cours ne rechargera pas la nouvelle clé : il faut le relancer "
+                    "(agent_job_cancel puis agent_job_relaunch)"
+                    + (" ; la conversation sera reprise, rien n'est perdu."
+                       if P.can_resume_session(row["runtime"]) else
+                       f" ; le runtime {row['runtime']} ne sait pas reprendre une conversation, "
+                       "celle-ci repartira de zéro.")
+                ) if restart else None,
                 "required": True,
                 "reason": reason,
                 "message": P.PAUSE_MESSAGES.get(reason, "action de l'utilisateur attendue"),
@@ -1024,7 +1078,16 @@ class Store:
                 "note": row["blocker_sign"],
                 "since": _iso(row["finished_at"] or row["updated_at"]),
                 "job_is_alive": False,
-                "resume_with": "agent_mission_retry",
+                "restart_required": P.needs_restart_for_credentials(row["runtime"]),
+                "restart_note": (
+                    "un processus NEUF lira la nouvelle clé d'API"
+                    + (" et reprendra la conversation (agent_job_relaunch, ou agent_mission_retry "
+                       "si le job appartient à une mission)."
+                       if P.can_resume_session(row["runtime"]) else
+                       f" ; le runtime {row['runtime']} ne sait pas reprendre une conversation, "
+                       "celle-ci repartira de zéro.")
+                ),
+                "resume_with": "agent_job_relaunch",
                 "note_for_caller": (
                     "la tentative s'est arrêtée sur un blocage qui demande une action "
                     "humaine, pas sur un défaut de l'agent : ne l'annoncez pas comme un "
@@ -1115,6 +1178,67 @@ class Store:
             self._resume(db, row, source, clean or "reprise demandée")
             fresh = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             return {"job_id": job_id, "result": "resumed", "state": fresh["state"]}
+
+    def relaunch_job(self, job_id: str, prompt: str | None = None) -> dict[str, Any]:
+        """Relance un job dans un PROCESSUS NEUF, en reprenant la conversation.
+
+        C'est le geste qui manque après un changement de clé d'API : les runtimes
+        lisent leurs identifiants au démarrage, donc le processus en cours ne
+        rechargera jamais la nouvelle clé — il faut l'éteindre et le relancer.
+        Quand le runtime sait reprendre une session (`P.RUNTIME_RESUME_FLAG`), la
+        conversation continue au lieu d'être refaite depuis zéro ; sinon la
+        relance repart d'une conversation neuve et le retour le DIT
+        (`conversation='fresh'`), au lieu de le laisser croire."""
+        with self._lock:
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return {"job_id": job_id, "result": "unknown_job"}
+        if row["state"] not in P.TERMINAL:
+            return {
+                "job_id": job_id,
+                "result": "job_still_active",
+                "state": row["state"],
+                "hint": ("le job tient encore le workspace : annulez-le (agent_job_cancel) puis "
+                         "relancez, pour ne jamais faire tourner deux processus sur le même workspace"),
+            }
+        resumable = P.can_resume_session(row["runtime"]) and bool(row["runtime_session_id"])
+        text = prompt if isinstance(prompt, str) and prompt.strip() else None
+        if text is None:
+            text = (
+                "Reprends la mission là où elle s'est arrêtée."
+                if resumable
+                else f"Reprends cette mission depuis le début : {row['prompt'] or ''}".strip()
+            )
+        job, _ = self.create_job(
+            row["runner_id"], row["runtime"], row["workspace_id"], text,
+            row["mode"], row["timeout_s"],
+            resume_session_id=row["runtime_session_id"] if resumable else None,
+            relaunch_of=job_id,
+        )
+        seq = self._last_seq(job["job_id"])
+        follow = follow_for_job(job["state"], seq)
+        return {
+            "result": "relaunched",
+            "job_id": job["job_id"],
+            "relaunch_of": job_id,
+            "state": job["state"],
+            "runtime": row["runtime"],
+            "conversation": "continued" if resumable else "fresh",
+            "resumed_session_id": row["runtime_session_id"] if resumable else None,
+            "note": (
+                "processus neuf : la nouvelle clé d'API sera lue au démarrage ; "
+                + ("la conversation précédente est reprise."
+                   if resumable else
+                   f"le runtime {row['runtime']} ne sait pas reprendre une conversation : "
+                   "celle-ci repart de zéro, dites-le à l'utilisateur.")
+            ),
+            "follow_up": follow,
+            "terminal": follow["terminal"],
+            "should_continue": follow["should_continue"],
+            "next_tool": follow["next_tool"],
+            "since_seq": follow["since_seq"],
+            "until": follow["until"],
+        }
 
     def liveness(self, job_id: str) -> dict[str, Any] | None:
         """SIGNAL DE VIE : « est-ce que ça avance, et depuis quand ? »
@@ -1500,7 +1624,8 @@ class Store:
             if cur is None or cur["state"] not in P.TERMINAL:
                 raise BrokerError("attempt_still_active", "la tentative en cours n'est pas terminée")
             job_spec = db.execute(
-                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error FROM jobs WHERE id=?", (m["current_job_id"],)
+                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error, runtime_session_id, blocker_reason "
+                "FROM jobs WHERE id=?", (m["current_job_id"],)
             ).fetchone()
             prev_corrupted = bool(job_spec and isinstance(job_spec["error"], str)
                                   and job_spec["error"].startswith(P.SESSION_CORRUPTED_PREFIX))
@@ -1520,10 +1645,19 @@ class Store:
                         f"{P.MAX_CONSECUTIVE_CORRUPTIONS} sessions corrompues d'affilée : "
                         "corriger la cause (config/plugin/auth opencode) avant tout retry",
                     )
+        # Blocage d'identifiants (quota, auth) : le processus neuf lira la
+        # nouvelle clé, et on REPREND la conversation au lieu de la refaire.
+        # Une session CORROMPUE, elle, ne se reprend jamais (règle existante).
+        resume = None
+        if (not prev_corrupted
+                and job_spec["blocker_reason"] in (P.PAUSE_QUOTA, P.PAUSE_AUTH)
+                and P.can_resume_session(job_spec["runtime"])):
+            resume = job_spec["runtime_session_id"]
         job, _ = self.create_job(
             job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
             prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
             job_spec["mode"], job_spec["timeout_s"],
+            resume_session_id=resume, relaunch_of=m["current_job_id"] if resume else None,
         )
         now = self.clock()
         with self._tx() as db:
@@ -2093,7 +2227,11 @@ class Store:
                 "seconds_since_seen": None if r["last_seen"] is None else round(now - r["last_seen"], 1),
                 "runner_version": r["version"],
                 "max_parallel": r["max_parallel"],
-                "runtimes": json.loads(r["runtimes_json"]),
+                "machine": self._machine_view(r),
+                "runtimes": [
+                    {**rt, "identity": P.runtime_identity(rt.get("id"))}
+                    for rt in json.loads(r["runtimes_json"])
+                ],
                 "workspaces": json.loads(r["workspaces_json"]),
                 "workspace_git": env,
                 "active_jobs": active,

@@ -42,7 +42,7 @@ def test_tool_surface_has_no_shell(client):
     names = {t["name"] for t in tools}
     assert names == {"agent_runner_list", "agent_workspace_list", "agent_job_start", "agent_job_get", "agent_job_output", "agent_job_cancel", "agent_job_list",
                      "agent_job_events", "agent_runner_inspect", "agent_job_wait",
-                     "agent_job_liveness", "agent_job_pause", "agent_job_resume",
+                     "agent_job_liveness", "agent_job_pause", "agent_job_resume", "agent_job_relaunch",
                      "agent_mission_create", "agent_mission_get", "agent_mission_wait", "agent_mission_retry", "agent_mission_validate",
                      "infra_alert_list", "infra_alert_get",
                      "agent_question_list", "agent_question_get", "agent_question_answer"}

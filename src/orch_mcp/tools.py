@@ -40,12 +40,19 @@ def register(mcp, store: Store) -> None:
     @mcp.tool(
         name="agent_runner_list",
         description=(
-            "Liste les PC runners de l'orchestrateur d'agents IA personnel, leur présence réelle "
-            "(online si heartbeat < 30 s, sinon offline), les runtimes d'agents disponibles "
-            "(claude-code, codex, agy, opencode, claude-desktop) et le nombre de jobs actifs. "
-            "À appeler avant agent_job_start. Note : claude-desktop pilote l'application Claude "
-            "Desktop (profil vérifié, accès UI sérialisé) : read_only = réponse seule, "
-            "workspace_write = patchs proposés par le Desktop et appliqués par le runner, bornés au workspace."
+            "Liste les MACHINES (runners) de l'orchestrateur d'agents IA personnel, leur présence "
+            "réelle (online si heartbeat < 30 s, sinon offline), les runtimes d'agents disponibles "
+            "et le nombre de jobs actifs. À appeler avant agent_job_start. QUI EST QUI : chaque "
+            "machine porte un bloc `machine` (label, hostname, os, role, description) — utilisez le "
+            "`label` pour en parler à l'utilisateur, jamais l'identifiant brut ; un champ à null "
+            "n'a pas été déclaré, ne le devinez pas. Chaque runtime porte un bloc `identity` "
+            "(label, vendor, kind, interface, use_when, distinct_from, distinction) : LISEZ-LE avant "
+            "de choisir. En particulier `claude-code` et `claude-desktop` ne sont PAS la même chose "
+            "— le premier est la CLI headless d'Anthropic (un processus par job, sans fenêtre, "
+            "confiné au workspace), le second pilote l'APPLICATION DE BUREAU de l'utilisateur "
+            "(profil et historique partagés, une seule à la fois, aucun accès disque : "
+            "read_only = réponse seule, workspace_write = diffs appliqués par le runner). "
+            "Si l'utilisateur dit seulement « Claude » sans préciser, demandez-lui lequel."
         ),
     )
     async def agent_runner_list() -> dict:
@@ -211,8 +218,10 @@ def register(mcp, store: Store) -> None:
     @mcp.tool(
         name="agent_runner_inspect",
         description=(
-            "Snapshot compact runner/environnement : version runner, runtimes (versions/capacités), "
-            "workspaces allowlistés, état réseau/broker (last_seen), jobs actifs enrichis, et git par "
+            "Snapshot compact d'une machine runner : bloc `machine` (label, hostname, os, role, "
+            "description — de quoi la nommer dans une phrase), version runner, runtimes avec leur "
+            "bloc `identity` (dont la distinction claude-code / claude-desktop), workspaces "
+            "allowlistés, état réseau/broker (last_seen), jobs actifs enrichis, et git par "
             "workspace (branch/HEAD/dirty) si observé. Jamais de secrets ni dump d'environnement."
         ),
     )
@@ -286,7 +295,11 @@ def register(mcp, store: Store) -> None:
             "execution_health=waiting_for_human au lieu d'un faux diagnostic de panne. Aucune "
             "observation n'est falsifiée : la télémétrie du processus reste ce qu'elle est. La pause "
             "est BORNÉE (expected_s, ≤ 6 h) : à son échéance la supervision normale reprend. Reprise : "
-            "agent_job_resume, ou automatiquement dès que l'agent produit à nouveau de la sortie."
+            "agent_job_resume, ou automatiquement dès que l'agent produit à nouveau de la sortie. ATTENTION "
+            "pour un quota épuisé ou une authentification expirée : le processus en cours a lu ses "
+            "identifiants à SON démarrage et ne rechargera jamais la nouvelle clé. Le retour porte "
+            "alors restart_required=true : la reprise passe par agent_job_cancel puis "
+            "agent_job_relaunch (ou agent_mission_retry), pas par un simple agent_job_resume."
         ),
     )
     async def agent_job_pause(
@@ -320,6 +333,31 @@ def register(mcp, store: Store) -> None:
     ) -> dict:
         try:
             return await anyio.to_thread.run_sync(lambda: store.resume_job(job_id, "chatgpt-web", note))
+        except BrokerError as exc:
+            return _err(exc)
+
+    @mcp.tool(
+        name="agent_job_relaunch",
+        description=(
+            "Relance un job terminé dans un PROCESSUS NEUF, en reprenant la conversation quand le "
+            "runtime le sait. C'EST le geste à faire après un changement de clé d'API : les runtimes "
+            "lisent leurs identifiants au démarrage, donc le processus arrêté ne rechargera JAMAIS la "
+            "nouvelle clé — il faut le relancer. Pour OpenCode la conversation est reprise telle "
+            "quelle (rien n'est perdu, rien n'est à refaire) ; pour un runtime qui ne sait pas "
+            "reprendre, le retour dit conversation='fresh' et il faut le dire à l'utilisateur. "
+            "Exige un job terminal : si le job tourne encore, annulez-le d'abord (agent_job_cancel), "
+            "pour ne jamais faire tourner deux processus sur le même workspace. Si le job appartient "
+            "à une mission, préférez agent_mission_retry (qui reprend la session de la même façon et "
+            "tient le compte des tentatives). Le retour porte le contrat de suivi habituel : "
+            "enchaînez sur agent_job_wait."
+        ),
+    )
+    async def agent_job_relaunch(
+        job_id: Annotated[str, Field(description="Identifiant du job à relancer (doit être terminé).")],
+        prompt: Annotated[str | None, Field(description="Consigne de reprise (défaut : reprendre la mission là où elle s'est arrêtée).")] = None,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(lambda: store.relaunch_job(job_id, prompt))
         except BrokerError as exc:
             return _err(exc)
 
@@ -539,7 +577,7 @@ TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_
                         "agent_job_events", "agent_runner_inspect", "agent_job_wait", "agent_job_liveness",
                         "agent_mission_get", "agent_mission_wait",
                         "infra_alert_list", "infra_alert_get", "agent_question_list", "agent_question_get"})
-TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel", "agent_job_pause", "agent_job_resume",
+TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel", "agent_job_pause", "agent_job_resume", "agent_job_relaunch",
                          "agent_mission_create", "agent_mission_retry", "agent_mission_validate",
                          "agent_question_answer"})
 _ = P

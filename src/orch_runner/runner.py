@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import shutil
 import subprocess
 import threading
@@ -282,6 +283,17 @@ class JobWorker(threading.Thread):
         if ws is None:
             return self._refuse("workspace_denied", "workspace absent de l'allowlist locale")
         adapter = ADAPTERS[job["runtime"]](rt.exe, rt.extra, cfg.permission_policy)
+        # Relance après changement de clé d'API : le broker désigne la session à
+        # reprendre ; ce processus est neuf, donc il lira la nouvelle clé.
+        resume = job.get("resume_session_id")
+        if isinstance(resume, str) and resume.strip():
+            adapter.resume_session_id = resume.strip()[:128]
+        # Ouverture de conversation : skill de départ et autorisation des
+        # sous-agents. Rien n'est ajouté sur une REPRISE (la conversation a déjà
+        # commencé) ni pour un runtime qui ne saurait pas quoi en faire.
+        adapter.session_preamble = P.build_session_preamble(
+            job["runtime"], cfg.start_skill, cfg.subagents, resuming=bool(adapter.resume_session_id)
+        )
         if job["mode"] not in ws.modes or job["mode"] not in adapter.modes:
             return self._refuse("mode_denied", "mode non autorisé pour ce workspace/runtime")
         prompt = job.get("prompt")
@@ -468,7 +480,21 @@ class Runner:
             snap = _git_snapshot(path)
             if snap is not None:
                 env[ws.id] = snap
-        return {"version": VERSION, "max_parallel": self.config.max_parallel, "runtimes": runtimes, "workspaces": workspaces, "env": env}
+        return {"version": VERSION, "max_parallel": self.config.max_parallel, "runtimes": runtimes,
+                "workspaces": workspaces, "env": env, "machine": self._machine()}
+
+    def _machine(self) -> dict[str, Any]:
+        """Carte d'identité lisible de CETTE machine : de quoi la nommer dans une
+        phrase, jamais un chemin ni un secret. `label`/`role`/`description`
+        viennent de runner.toml ; hostname et OS sont observés. Un champ non
+        déclaré et non observable reste absent : on ne devine pas une machine."""
+        return {
+            "label": self.config.machine_label or None,
+            "hostname": _best_effort(platform.node) or None,
+            "os": _best_effort(lambda: f"{platform.system()} {platform.release()}".strip()) or None,
+            "role": self.config.machine_role or None,
+            "description": self.config.machine_description or None,
+        }
 
     def held(self) -> list[dict[str, Any]]:
         """Jobs réellement détenus + télémétrie d'exécution (pid, vivant, enfants,
