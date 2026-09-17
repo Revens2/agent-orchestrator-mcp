@@ -42,6 +42,7 @@ def test_tool_surface_has_no_shell(client):
     names = {t["name"] for t in tools}
     assert names == {"agent_runner_list", "agent_workspace_list", "agent_job_start", "agent_job_get", "agent_job_output", "agent_job_cancel", "agent_job_list",
                      "agent_job_events", "agent_runner_inspect", "agent_job_wait",
+                     "agent_job_liveness", "agent_job_pause", "agent_job_resume",
                      "agent_mission_create", "agent_mission_get", "agent_mission_wait", "agent_mission_retry", "agent_mission_validate",
                      "infra_alert_list", "infra_alert_get",
                      "agent_question_list", "agent_question_get", "agent_question_answer"}
@@ -126,3 +127,32 @@ def test_invalid_runtime_rejected_by_schema(client):
     c, _ = client
     res = rpc(c, "tools/call", {"name": "agent_job_start", "arguments": {"runner_id": "pc", "runtime": "bash", "workspace_id": "demo", "prompt": "x"}})
     assert res.get("error") or res["result"].get("isError")
+
+
+def test_keepalive_tools_via_mcp(client):
+    """Le signal de vie et l'attente humaine existent bien à travers MCP : c'est
+    ce que ChatGPT voit, et c'est ce qui l'empêche de conclure au time-out."""
+    c, store = client
+    started = call(c, "agent_job_start", {"runner_id": "pc", "runtime": "fake",
+                                          "workspace_id": "demo", "prompt": "longue tache"})
+    job_id = started["job_id"]
+
+    live = call(c, "agent_job_liveness", {"job_id": job_id})
+    assert live["verdict"] == "starting" and live["alive"] is True
+    assert live["keep_waiting"] is True
+
+    paused = call(c, "agent_job_pause", {"job_id": job_id, "reason": "quota_exhausted",
+                                         "note": "je change ma cle d'API"})
+    assert paused["result"] == "paused"
+    assert paused["human_action_required"]["reason"] == "quota_exhausted"
+
+    waited = call(c, "agent_job_wait", {"job_id": job_id, "timeout_s": 30})
+    assert waited["woke_by"] == "paused" and waited["terminal"] is False
+    assert waited["stop_reason"] == "waiting_for_human"
+    assert waited["liveness"]["verdict"] == "waiting_for_human"
+
+    got = call(c, "agent_job_get", {"job_id": job_id})
+    assert got["execution_health"] == "waiting_for_human"
+
+    assert call(c, "agent_job_resume", {"job_id": job_id})["result"] == "resumed"
+    assert call(c, "agent_job_resume", {"job_id": job_id})["result"] == "not_paused"

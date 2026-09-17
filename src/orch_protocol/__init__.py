@@ -103,7 +103,9 @@ SUSPECTED_STALL = "suspected_stall"        # processus vivant mais sans activit�
 STALLED = "stalled"                        # silence prolongé, processus vivant : intervention humaine requise
 RUNNER_DISCONNECTED = "runner_disconnected"  # runner hors ligne (heartbeat trop vieux)
 PROCESS_DEAD = "process_dead"              # processus non vivant alors que le job est actif
-EXECUTION_HEALTH = frozenset({HEALTHY, IDLE, SUSPECTED_STALL, STALLED, RUNNER_DISCONNECTED, PROCESS_DEAD})
+WAITING_FOR_HUMAN = "waiting_for_human"    # pause humaine explicite : silence VOULU, jamais une panne
+EXECUTION_HEALTH = frozenset({HEALTHY, IDLE, SUSPECTED_STALL, STALLED, RUNNER_DISCONNECTED,
+                              PROCESS_DEAD, WAITING_FOR_HUMAN})
 
 # Seuils de détection de stall (processus vivant + silence d'activité/output).
 # La détection EMET un événement (notify) ; elle ne relance ni n'annule jamais seule.
@@ -124,6 +126,10 @@ EV_CANCEL_REQUESTED = "cancel_requested"
 EV_TIMEOUT_MARKED = "timeout_marked"
 EV_SUSPECTED_STALL = "suspected_stall"
 EV_STALLED = "stalled"
+# Pause humaine explicite (signal de vie) : le silence est VOULU, pas une panne.
+EV_PAUSED = "paused"
+EV_RESUMED = "resumed"
+EV_PAUSE_EXPIRED = "pause_expired"
 # Reprise sur session corrompue : session abandonnée (jamais réutilisée),
 # nouvelle session propre via mission_retry, handoff minimal (pas de transcript).
 EV_SESSION_CORRUPTED = "session_corrupted"
@@ -133,6 +139,7 @@ EVENT_KINDS = frozenset({
     EV_ACTIVITY, EV_PROCESS_EXIT, EV_RUNNER_DISCONNECT, EV_LEASE_EXPIRED,
     EV_REQUEUED, EV_CANCEL_REQUESTED, EV_TIMEOUT_MARKED, EV_SUSPECTED_STALL, EV_STALLED,
     EV_SESSION_CORRUPTED, EV_SESSION_RECREATED,
+    EV_PAUSED, EV_RESUMED, EV_PAUSE_EXPIRED,
 })
 MAX_EVENTS_PER_JOB = 500
 OUTPUT_PROGRESS_STEP_CHARS = 65_536
@@ -321,3 +328,74 @@ def clip(text: str | None, limit: int) -> str | None:
     if len(text) <= limit:
         return text
     return text[: limit - 15] + "…[tronqué]"
+
+
+# --- pause humaine explicite : « je suis vivant, n'abandonne pas » -----------
+# Problème résolu : une attente HUMAINE (changement de clé d'API après quota
+# épuisé, login à refaire, pause volontaire) était indistinguable d'une panne.
+# Le processus mort faisait démarrer PROCESS_RECOVERY_S -> `lost` en 60 s, et le
+# silence faisait tomber le job en `suspected_stall`/`stalled`. Une pause
+# EXPLICITE suspend ces trois comptes à rebours (recovery, stall, timeout dur)
+# et rend le silence lisible : execution_health = WAITING_FOR_HUMAN.
+# Une pause ne falsifie AUCUNE observation : proc_alive/telemetry restent ce
+# qu'ils sont ; seule l'horloge des verdicts est suspendue, et elle est bornée.
+PAUSE_QUOTA = "quota_exhausted"   # quota/crédit épuisé : nouvelle clé d'API attendue
+PAUSE_AUTH = "auth_required"      # session/jeton expiré : login à refaire
+PAUSE_MANUAL = "manual"           # pause volontaire déclarée par l'humain
+PAUSE_QUESTION = "question"       # question waiting_for_user ouverte
+PAUSE_REASONS = (PAUSE_QUOTA, PAUSE_AUTH, PAUSE_MANUAL, PAUSE_QUESTION)
+PAUSE_DEFAULT_S = 1_800           # durée attendue par défaut d'une pause
+PAUSE_MAX_S = 6 * 3_600           # borne dure : au-delà la pause expire, les comptes repartent
+MAX_PAUSE_NOTE_CHARS = 300
+# Sources autorisées (traçabilité : qui a déclaré la pause).
+PAUSE_SRC_RUNNER = "runner"       # auto-détection sur la sortie de l'agent
+PAUSE_SRC_HUMAN = "human"         # CLI locale sur le VPS
+PAUSE_SRC_CHATGPT = "chatgpt-web"  # outil MCP agent_job_pause
+PAUSE_SOURCES = (PAUSE_SRC_RUNNER, PAUSE_SRC_HUMAN, PAUSE_SRC_CHATGPT)
+
+# Signatures EXACTES (sous-chaînes littérales, jamais un match naïf sur
+# « error » ou « limit ») des blocages qui demandent une action humaine.
+# Même discipline que SESSION_CORRUPTION_SIGNS : tout texte ne contenant
+# aucune de ces formes n'est PAS un blocage humain.
+QUOTA_EXHAUSTED_SIGNS = (
+    "insufficient_quota",
+    "You exceeded your current quota",
+    "billing_hard_limit_reached",
+    "credit balance is too low",
+    "Credit balance too low",
+    "usage limit reached",
+    "quota exceeded",
+    "run out of credits",
+)
+AUTH_REQUIRED_SIGNS = (
+    "invalid_api_key",
+    "Incorrect API key provided",
+    "authentication_error",
+    "401 Unauthorized",
+    "OAuth token has expired",
+    "auth login",
+)
+
+
+def match_pause_reason(text: object) -> tuple[str, str] | None:
+    """(raison, signature exacte) si le texte porte un blocage qui demande une
+    action humaine, sinon None. Le quota prime sur l'auth (une clé épuisée
+    renvoie souvent aussi une erreur d'authentification)."""
+    if not isinstance(text, str):
+        return None
+    for sign in QUOTA_EXHAUSTED_SIGNS:
+        if sign in text:
+            return PAUSE_QUOTA, sign
+    for sign in AUTH_REQUIRED_SIGNS:
+        if sign in text:
+            return PAUSE_AUTH, sign
+    return None
+
+
+# Message humain associé à une raison de pause (affiché tel quel à l'utilisateur).
+PAUSE_MESSAGES = {
+    PAUSE_QUOTA: "quota ou crédit épuisé : l'agent attend une nouvelle clé d'API",
+    PAUSE_AUTH: "authentification expirée : l'agent attend une reconnexion",
+    PAUSE_MANUAL: "pause volontaire : l'agent attend le feu vert de l'utilisateur",
+    PAUSE_QUESTION: "question en attente : l'agent attend une réponse de l'utilisateur",
+}

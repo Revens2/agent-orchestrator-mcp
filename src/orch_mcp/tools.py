@@ -21,6 +21,7 @@ StateT = Literal["queued", "claimed", "starting", "running", "completed", "faile
 AlertSourceT = Literal["etude", "nexus"]
 AlertSeverityT = Literal["info", "warning", "critical"]
 AlertStateT = Literal["active", "acked", "resolved"]
+PauseReasonT = Literal["quota_exhausted", "auth_required", "manual", "question"]
 
 STATE_HELP = (
     "États : queued (attend le PC ; reste en file si le PC est offline), claimed (pris, pas lancé), "
@@ -232,10 +233,17 @@ def register(mcp, store: Store) -> None:
             "(curseur), until=terminal. RÈGLE : si terminal=false — Y COMPRIS woke_by=timeout — vous "
             "DEVEZ rappeler agent_job_wait avec since_seq=last_event_seq dans le MÊME tour, sans "
             "répondre à l'utilisateur. Un timeout pendant que le process continue n'est jamais une fin. "
+            "Chaque retour porte un bloc liveness (signal de vie daté : verdict, evidence, "
+            "freshest_signal_age_s) : un timeout accompagné de verdict=working PROUVE que l'agent est "
+            "vivant — ne concluez jamais à une panne ni à une perte de connexion sur un timeout. "
             "Ne répondez qu'après terminal=true (puis agent_job_get / agent_job_output / "
-            "agent_job_events). Seuls vrais arrêts : question waiting_for_user ouverte "
-            "(agent_question_list), entrée utilisateur réellement requise, ou job "
-            "failed/timeout/cancelled/lost à remonter explicitement."
+            "agent_job_events). Seuls vrais arrêts : human_action_required présent dans le retour "
+            "(woke_by=paused, stop_reason=waiting_for_human) — l'agent attend un geste de "
+            "l'utilisateur, dites-lui LEQUEL en citant le message fourni, ce n'est pas un échec, puis "
+            "reprenez avec agent_job_wait ; question waiting_for_user ouverte (agent_question_list) ; "
+            "entrée utilisateur réellement requise ; ou job failed/timeout/cancelled/lost à remonter "
+            "explicitement — et si ce terminal porte human_action_required, présentez-le comme une "
+            "action à faire, jamais comme un défaut de l'agent."
         ),
     )
     async def agent_job_wait(
@@ -245,6 +253,75 @@ def register(mcp, store: Store) -> None:
     ) -> dict:
         res = await anyio.to_thread.run_sync(store.wait_for_change, job_id, since_seq, timeout_s)
         return res if res is not None else {"error": "unknown_job", "job_id": job_id}
+
+    @mcp.tool(
+        name="agent_job_liveness",
+        description=(
+            "SIGNAL DE VIE d'un job : « est-ce que ça avance, et depuis quand ? ». Appel très court "
+            "(pas d'attente) à utiliser dès que vous doutez qu'un agent réponde encore, AVANT de "
+            "conclure quoi que ce soit. Retour : verdict (working | starting | waiting_for_human | "
+            "lost_contact | unknown | finished), alive, message en clair, freshest_signal_age_s et "
+            "evidence (liste datée des preuves réellement observées : heartbeat du PC runner, "
+            "télémétrie du processus, sortie de l'agent, événements). Un signal manquant est ABSENT "
+            "de evidence, jamais supposé bon. RÈGLE : verdict=working ou starting => l'agent est "
+            "vivant, continuez d'attendre (agent_job_wait) et ne dites jamais à l'utilisateur que ça "
+            "a échoué. verdict=waiting_for_human => l'agent attend une action de l'utilisateur "
+            "(human_action_required) : dites-la-lui, ce n'est PAS une panne."
+        ),
+    )
+    async def agent_job_liveness(
+        job_id: Annotated[str, Field(description="Identifiant du job.")],
+    ) -> dict:
+        res = await anyio.to_thread.run_sync(store.liveness, job_id)
+        return res if res is not None else {"error": "unknown_job", "job_id": job_id}
+
+    @mcp.tool(
+        name="agent_job_pause",
+        description=(
+            "Déclare une ATTENTE HUMAINE sur un job en cours : l'utilisateur doit faire quelque chose "
+            "(changer une clé d'API après un quota épuisé, se reconnecter, valider) et l'agent ne peut "
+            "pas avancer d'ici là. À appeler dès que l'utilisateur annonce une telle pause "
+            "(« attends, je change ma clé »). Effet : le broker SUSPEND ses trois comptes à rebours "
+            "(passage en lost, détection de stall, timeout dur) le temps annoncé, et le job affiche "
+            "execution_health=waiting_for_human au lieu d'un faux diagnostic de panne. Aucune "
+            "observation n'est falsifiée : la télémétrie du processus reste ce qu'elle est. La pause "
+            "est BORNÉE (expected_s, ≤ 6 h) : à son échéance la supervision normale reprend. Reprise : "
+            "agent_job_resume, ou automatiquement dès que l'agent produit à nouveau de la sortie."
+        ),
+    )
+    async def agent_job_pause(
+        job_id: Annotated[str, Field(description="Identifiant du job.")],
+        reason: Annotated[
+            PauseReasonT,
+            Field(description="quota_exhausted = quota/crédit épuisé, nouvelle clé attendue ; auth_required = reconnexion ; manual = pause volontaire ; question = réponse attendue."),
+        ] = "manual",
+        note: Annotated[str | None, Field(description="Précision courte (≤300 car.) affichée à l'utilisateur.")] = None,
+        expected_s: Annotated[int | None, Field(description="Durée attendue en secondes (60..21600, défaut 1800).")] = None,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: store.pause_job(job_id, reason, note, expected_s, "chatgpt-web")
+            )
+        except BrokerError as exc:
+            return _err(exc)
+
+    @mcp.tool(
+        name="agent_job_resume",
+        description=(
+            "Lève une attente humaine posée par agent_job_pause : l'utilisateur a fait ce qu'il avait "
+            "à faire (nouvelle clé d'API en place, reconnexion effectuée). La supervision normale et "
+            "le suivi reprennent immédiatement ; enchaînez avec agent_job_wait. Idempotent "
+            "(not_paused si aucune pause n'était en cours)."
+        ),
+    )
+    async def agent_job_resume(
+        job_id: Annotated[str, Field(description="Identifiant du job.")],
+        note: Annotated[str | None, Field(description="Précision courte (≤300 car.) sur ce qui a été fait.")] = None,
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(lambda: store.resume_job(job_id, "chatgpt-web", note))
+        except BrokerError as exc:
+            return _err(exc)
 
     @mcp.tool(
         name="agent_mission_create",
@@ -459,10 +536,10 @@ def register(mcp, store: Store) -> None:
 
 
 TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_get", "agent_job_output", "agent_job_list",
-                        "agent_job_events", "agent_runner_inspect", "agent_job_wait", "agent_mission_get",
-                        "agent_mission_wait",
+                        "agent_job_events", "agent_runner_inspect", "agent_job_wait", "agent_job_liveness",
+                        "agent_mission_get", "agent_mission_wait",
                         "infra_alert_list", "infra_alert_get", "agent_question_list", "agent_question_get"})
-TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel",
+TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel", "agent_job_pause", "agent_job_resume",
                          "agent_mission_create", "agent_mission_retry", "agent_mission_validate",
                          "agent_question_answer"})
 _ = P
