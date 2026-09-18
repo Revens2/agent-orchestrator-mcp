@@ -9,6 +9,28 @@ offline_kill_s = 120
 # read_only reste lecture seule dans les deux cas. Changer puis relancer la tâche orch-runner.
 default_permission_policy = "unattended"
 
+# Carte d'identité LISIBLE de cette machine : sert à la nommer dans une phrase
+# (« le PC du bureau ») plutôt que par son identifiant. Facultatif — un champ
+# non déclaré reste absent côté broker, jamais deviné. hostname et OS sont
+# observés automatiquement, ne les mettez pas ici. Aucun chemin, aucun secret.
+[machine]
+label = "PC principal (bureau)"
+role = "poste de travail Windows personnel"
+description = "Machine qui héberge Claude Code, Codex, OpenCode et Claude Desktop"
+
+# Ouverture de chaque conversation d'agent.
+# start_skill : invoqué en PREMIÈRE ligne du prompt, uniquement sur les runtimes
+#   qui comprennent les commandes `/skill` (claude-code aujourd'hui). Les autres
+#   ne le reçoivent pas du tout, plutôt que de le lire comme du texte.
+#   "" désactive complètement l'invocation.
+# subagents : autorise explicitement la délégation à des sous-agents, sur les
+#   runtimes qui les documentent (claude-code, opencode). Ailleurs, rien n'est
+#   dit : on ne promet pas une capacité non vérifiée.
+# Rien de tout cela n'est réinjecté quand une conversation est REPRISE.
+[session]
+start_skill = "/caveman ultra"
+subagents = true
+
 [runtimes.claude-code]
 enabled = true
 exe = 'C:\Users\<user>\.local\bin\claude.exe'

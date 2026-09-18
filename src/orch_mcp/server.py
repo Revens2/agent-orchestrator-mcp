@@ -39,7 +39,14 @@ INSTRUCTIONS = (
     "contrat de suivi : rappeler agent_job_wait jusqu'à terminal=true dans le même tour) "
     "-> agent_job_get/output/events jusqu'à un état terminal. Missions : agent_mission_create -> "
     "agent_mission_wait en boucle -> agent_mission_validate (completed exit 0 ≠ validated). "
-    "Un timeout de wait non terminal impose de rappeler, jamais de répondre. Pas de shell distant : seul un prompt est transmis."
+    "SIGNAL DE VIE : un timeout de wait non terminal impose de rappeler, jamais de répondre ; chaque "
+    "retour porte un bloc liveness daté (verdict/evidence) et agent_job_liveness répond à tout moment "
+    "— un agent qui met longtemps n'est pas un agent en panne, ne concluez jamais à l'échec sur un "
+    "timeout. ATTENTE HUMAINE : quand l'utilisateur doit agir (quota épuisé, nouvelle clé d'API, "
+    "reconnexion), le retour porte human_action_required et execution_health=waiting_for_human ; "
+    "c'est le seul arrêt intermédiaire légitime : dites à l'utilisateur ce qu'il doit faire, ne "
+    "l'annoncez jamais comme une panne, puis reprenez le suivi. agent_job_pause / agent_job_resume "
+    "permettent de déclarer et de lever cette attente. Pas de shell distant : seul un prompt est transmis."
 )
 
 

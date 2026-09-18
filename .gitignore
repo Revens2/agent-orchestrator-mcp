@@ -11,3 +11,4 @@ __pycache__/
 !deploy/orch.env.example
 runner.toml
 status.json
+*.egg-info/
