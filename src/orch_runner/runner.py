@@ -74,6 +74,32 @@ def _git_snapshot(path: str) -> dict[str, Any] | None:
 ABORT_CODES = {"stale_fencing", "state_conflict", "unknown_job", "invalid_transition"}
 RESYNC_CODES = {"superseded", "unknown_runner"}
 
+# Commande locale de reprise par runtime (affichée à ChatGPT Web avec l'ID).
+_RESUME_HINTS = {
+    "claude-code": "claude --resume {sid}",
+    "agy": "agy --conversation {sid}",
+    "opencode": "opencode run --session {sid}",
+    "codex": "codex resume {sid}",
+}
+
+
+def with_session_header(runtime: str, session_id: str | None, summary: str | None) -> str | None:
+    """Préfixe le résumé final par l'ID de session runtime (première ligne).
+
+    ChatGPT Web ne voit que le texte du résultat, pas le champ
+    `runtime_session_id` déjà envoyé au broker : sans cet en-tête, l'ID
+    permettant de reprendre la conversation en local est perdu pour
+    l'utilisateur. L'en-tête est en tête car le broker clippe le résumé
+    à MAX_SUMMARY_CHARS (la fin peut être coupée, jamais le début).
+    """
+    if not session_id:
+        return summary
+    hint = _RESUME_HINTS.get(runtime, "")
+    header = f"[session {runtime}: {session_id}" + (f" | reprise: {hint.format(sid=session_id)}]" if hint else "]")
+    if not summary:
+        return header
+    return f"{header}\n---\n{summary}"
+
 
 class NetworkError(Exception):
     pass
@@ -359,7 +385,9 @@ class JobWorker(threading.Thread):
         self.session_id = adapter.session_id or self.session_id
         self.proc.close()  # tue d'éventuels descendants restants
         shutil.rmtree(tmpdir, ignore_errors=True)
-        summary = outcome.summary
+        # L'ID de session part en tête du résumé : c'est le seul canal que
+        # ChatGPT Web voit (le champ runtime_session_id ne lui est pas relayé).
+        summary = with_session_header(job["runtime"], self.session_id, outcome.summary)
         if reason == P.CANCELLED:
             self._transition(P.CANCELLED, exit_code=exit_code, result_summary=summary, error="annulé : arbre de processus terminé")
         elif reason == P.TIMEOUT:
