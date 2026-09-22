@@ -76,3 +76,43 @@ def test_config_policy(tmp_path):
     (tmp_path / "c.toml").write_text(base + 'default_permission_policy = "yolo"\n')
     with pytest.raises(PolicyError):
         Config.load(tmp_path / "c.toml")
+
+
+def test_opencode_probe_lazy_no_generation_by_default(tmp_path, monkeypatch):
+    """Le probe OpenCode ne doit consommer aucun token par défaut : --version uniquement.
+
+    Régression : avec probe_generation=true (ancien défaut), chaque re-probe
+    lançait une vraie génération "Reply OK." (tokens brûlés pour un simple
+    healthcheck). Le mode lazy ne teste rien : l'échec éventuel du modèle
+    se révèle à la première vraie requête (fail-fast).
+    """
+    import subprocess as sp
+
+    exe = tmp_path / "opencode.exe"
+    exe.write_bytes(b"")  # os.path.isfile OK, jamais exécuté (subprocess moqué)
+    calls = []
+
+    class R:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        if "run" in argv:
+            return R('{"type":"event","part":{"type":"text","text":"ok"}}\n')
+        return R("opencode v9.9.9\n")
+
+    monkeypatch.setattr(sp, "run", fake_run)
+
+    info = ADAPTERS["opencode"](str(exe), {"model": "opencode/m"}).probe()
+    assert info["available"] is True, info
+    assert calls, "le probe --version aurait dû être appelé"
+    assert all("run" not in c for c in calls), calls
+
+    # Opt-in explicite : la génération de test est bien exécutée.
+    calls.clear()
+    info = ADAPTERS["opencode"](str(exe), {"model": "opencode/m", "probe_generation": True}).probe()
+    assert info["available"] is True, info
+    assert any("run" in c for c in calls), calls

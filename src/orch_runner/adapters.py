@@ -273,9 +273,9 @@ class OpenCode(Adapter):
                        "--title", title, "--dir", cwd, "--", prompt], None)
 
     def probe(self):
-        """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
+        """Probe lazy : --version uniquement, zero token par defaut. Opt-in via probe_generation=true."""
         info = super().probe()
-        if not info["available"] or not self.extra.get("probe_generation", True):
+        if not info["available"] or not self.extra.get("probe_generation", False):
             return info
         errors: list = []
         try:
