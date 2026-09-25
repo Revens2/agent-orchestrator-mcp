@@ -66,7 +66,7 @@ def portees_du_jeton_statique() -> list[str]:
 # Un code d'autorisation ne doit vivre que le temps d'un aller-retour de redirection.
 DUREE_CODE_S = 90
 DUREE_ACCES_S = 3600
-DUREE_RAFRAICHISSEMENT_S = 30 * 24 * 3600
+DUREE_RAFRAICHISSEMENT_S = 10 * 365 * 24 * 3600  # pas de limite pratique (23/09)
 # Au-dela, une demande de consentement laissee ouverte est abandonnee.
 DUREE_DEMANDE_S = 600
 
@@ -432,7 +432,7 @@ class FournisseurOAuth(
         scopes: list[str],
     ) -> OAuthToken:
         # Rotation : l'ancien jeton de rafraichissement est revoque a l'echange.
-        self._magasin.revoquer(refresh_token.token)
+        pass  # rotation stricte retiree (23/09) : un refresh deja utilise reste valide, evite les deconnexions ChatGPT
         return self._emettre(str(client.client_id), scopes or refresh_token.scopes, None)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
