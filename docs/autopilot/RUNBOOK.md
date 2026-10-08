@@ -17,7 +17,7 @@ indisponible sur le runner, l'étape passe `BLOCKED_WORKER` et repart seule quan
    reçu **hors bande** (fichier 0600 dans `/srv/autopilot/data/approvals/` ou commande configurée).
    Le code n'est jamais renvoyé au cockpit.
 4. Arrêt d'urgence : `autopilot_pause("*")` (kill switch). Désactivation : CLI VPS uniquement :
-   `sudo -u orch-app env $(cat /srv/autopilot/secrets/autopilot.env | xargs) PYTHONPATH=/srv/autopilot/src /srv/orch/venv/bin/python -m orch_autopilot.service kill-switch off`
+   `cd /tmp && sudo -u orch-app env $(sudo cat /srv/autopilot/secrets/autopilot.env | xargs) PYTHONPATH=/srv/autopilot/src /srv/orch/venv/bin/python -P -m orch_autopilot.service kill-switch off`
 
 ## Sémantique des états
 
