@@ -1,0 +1,53 @@
+[Unit]
+Description=Autopilot V1 : superviseur durable + cockpit MCP (plan de controle au-dessus du broker orch)
+After=network-online.target orch-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=orch-app
+Group=orch-app
+WorkingDirectory=/srv/autopilot
+EnvironmentFile=/srv/autopilot/secrets/autopilot.env
+Environment=PYTHONPATH=/srv/autopilot/src
+ExecStart=/srv/orch/venv/bin/python -m orch_autopilot.service run
+Restart=always
+RestartSec=5
+# Le superviseur notifie WATCHDOG=1 a chaque tick : bloque > 120 s => redemarrage.
+WatchdogSec=120
+
+# --- Isolation (calque sur orch-mcp.service) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Boucle locale : broker 127.0.0.1:8802 et gateway autopilot. Un gate Opus distant exige
+# une ouverture d'egress explicite (decision a prendre, non faite en staging).
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Seules autopilot.db et la boite de codes hors bande sont en ecriture. orch.db : jamais.
+ReadWritePaths=/srv/autopilot/data
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

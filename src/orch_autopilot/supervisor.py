@@ -304,8 +304,8 @@ class Supervisor:
             self._kill_active()
         stats["promoted"] = self._promote(now)
         stats["enqueued"] = self._enqueue_ready(now)
-        stats["sent"] = self._dispatch(now)
-        stats["reconciled"] = self._reconcile(now)
+        stats["sent"] = self._dispatch(self.clock())
+        stats["reconciled"] = self._reconcile(self.clock())
         self._finalize_objectives()
         self.last_tick_at = self.clock()
         return stats

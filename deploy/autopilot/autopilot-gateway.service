@@ -1,0 +1,49 @@
+[Unit]
+Description=Passerelle OAuth du cockpit autopilot (instance orch-gateway, politique autopilot)
+After=network-online.target autopilot.service
+Wants=network-online.target
+Requires=autopilot.service
+
+[Service]
+User=orch-app
+Group=orch-app
+WorkingDirectory=/srv/autopilot
+EnvironmentFile=/srv/autopilot/secrets/autopilot-gw.env
+Environment=PYTHONPATH=/srv/autopilot/src
+ExecStart=/srv/orch/venv/bin/python -m orch_gateway.server
+Restart=always
+RestartSec=3
+
+# --- Isolation (calque sur tasks-gateway.service) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Boucle locale : nginx (vhost mymcps) est le seul client ; upstream autopilot en 127.0.0.1:$AUTOPILOT_PORT.
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Seul l'etat OAuth (clients, jetons, consentements) est ecrit.
+ReadWritePaths=/srv/autopilot/gw-oauth
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

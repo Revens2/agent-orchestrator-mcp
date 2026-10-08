@@ -28,13 +28,14 @@ from starlette.routing import Route
 
 from orch_gateway.consentement import routes_consentement
 from orch_gateway.oauth import PORTEE, PORTEES, FournisseurOAuth, MagasinOAuth
-from orch_gateway.politique import PolitiqueOutils
+from orch_gateway.politique import politique_depuis_nom
 from orch_gateway.upstream import ProxyMCP
 
 PORT_PAR_DEFAUT = 8801
 CHEMIN_MCP = "/mcp"
 # Politique d'autorisation explicite : lecture/ecriture par outil, inconnu -> fail-closed.
-POLITIQUE = PolitiqueOutils()
+# ORCH_GW_POLICY=autopilot : instance dediee au cockpit autopilot (defaut : outils du broker orch).
+POLITIQUE = politique_depuis_nom(os.environ.get("ORCH_GW_POLICY", "orch").strip() or "orch")
 
 
 def _config() -> tuple[str, str, int, str, str]:
