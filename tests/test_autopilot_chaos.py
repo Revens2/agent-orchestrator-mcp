@@ -44,7 +44,7 @@ class CrashingBroker(FakeBroker):
 
 
 def make(path, clock, broker, seed=0):
-    return Supervisor(AutopilotDB(path, clock=clock), broker, Config(backoff_base_s=5, backoff_max_s=30, lost_grace_s=30),
+    return Supervisor(AutopilotDB(path, clock=clock), broker, Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, backoff_base_s=5, backoff_max_s=30, lost_grace_s=30),
                       clock=clock, rng=random.Random(seed))
 
 

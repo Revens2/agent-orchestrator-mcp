@@ -35,7 +35,7 @@ def stack(tmp_path):
     with TestClient(app, base_url="http://127.0.0.1:8802") as http:
         broker = MCPBroker("http://127.0.0.1:8802/mcp", client=http)
         notifier = MemoryNotifier()
-        sup = Supervisor(AutopilotDB(tmp_path / "autopilot.db"), broker, Config(), notifier=notifier)
+        sup = Supervisor(AutopilotDB(tmp_path / "autopilot.db"), broker, Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False), notifier=notifier)
         yield store, epoch, sup, broker, notifier
 
 

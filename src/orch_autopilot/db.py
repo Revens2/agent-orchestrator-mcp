@@ -126,6 +126,10 @@ MIGRATIONS: list[str] = [
         WHEN OLD.state IN ('DONE','FAILED','CANCELLED') AND NEW.state != OLD.state
         BEGIN SELECT RAISE(ABORT, 'objective_terminal_immutable'); END;
     """,
+    # v2 — approbation hors bande par tentative pour local_write
+    """
+    ALTER TABLE steps ADD COLUMN write_approved_attempt INTEGER;
+    """,
 ]
 
 MAX_EVENT_DATA = 4_000

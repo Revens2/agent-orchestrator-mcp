@@ -72,15 +72,28 @@ class Config:
     backoff_max_s: float = 1800.0
     expected_served_model: str | None = None   # gate Opus : identité attendue ; None = jamais attestable
     tick_s: float = 5.0
+    # Par défaut : lecture + décisions seulement. local_write exige un compte Windows dédié déclaré
+    # (AUTOPILOT_RUNNER_DEDICATED_ACCOUNT=1) ET une approbation hors bande par tentative.
+    allowed_kinds: frozenset[str] = frozenset({"read", "decision"})
+    local_write_needs_approval: bool = True
+    runner_dedicated_account: bool = False
 
     def __post_init__(self) -> None:
         if self.runtime not in PRODUCT_RUNTIMES:
             raise PolicyError("runtime_forbidden", f"runtime produit interdit : {self.runtime!r} (OpenCode exclusif)")
+        if not self.allowed_kinds <= set(KINDS):
+            raise PolicyError("invalid_config", f"allowed_kinds inconnus : {sorted(self.allowed_kinds - set(KINDS))}")
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
         env = dict(os.environ if env is None else env)
         ws = frozenset(w.strip() for w in env.get("AUTOPILOT_WORKSPACES", "e2e").split(",") if w.strip())
+        kinds = frozenset(k.strip() for k in env.get("AUTOPILOT_ALLOWED_KINDS", "read,decision").split(",") if k.strip())
+        dedicated = env.get("AUTOPILOT_RUNNER_DEDICATED_ACCOUNT", "0") == "1"
+        if "local_write" in kinds and not dedicated:
+            # refus au démarrage : pas d'écriture autonome tant que l'OS ne confine pas le runner
+            raise PolicyError("local_write_requires_dedicated_account",
+                              "local_write activé sans compte Windows dédié déclaré (AUTOPILOT_RUNNER_DEDICATED_ACCOUNT=1)")
         return cls(
             runner_id=env.get("AUTOPILOT_RUNNER_ID", "main-windows-pc"),
             workspaces=ws,
@@ -88,6 +101,9 @@ class Config:
             daily_max_jobs=int(env.get("AUTOPILOT_DAILY_MAX_JOBS", "50")),
             expected_served_model=env.get("AUTOPILOT_EXPECTED_SERVED_MODEL") or None,
             tick_s=float(env.get("AUTOPILOT_TICK_S", "5")),
+            allowed_kinds=kinds,
+            local_write_needs_approval=env.get("AUTOPILOT_LOCAL_WRITE_APPROVAL", "1") != "0",
+            runner_dedicated_account=dedicated,
         )
 
 
@@ -132,6 +148,8 @@ def validate_objective(spec: dict, cfg: Config) -> dict:
             raise PolicyError("kind_forbidden", "kind=external désactivé en V1 (publication, DM, paiement, push interdits)")
         if kind not in KINDS:
             raise PolicyError("invalid_step", f"kind inconnu : {kind!r}")
+        if kind not in cfg.allowed_kinds:
+            raise PolicyError("kind_disabled", f"kind={kind} désactivé par la configuration ({sorted(cfg.allowed_kinds)})")
         if "runtime" in raw and raw["runtime"] not in PRODUCT_RUNTIMES:
             raise PolicyError("runtime_forbidden", "runtime produit = opencode exclusivement")
         workspace = raw.get("workspace_id")

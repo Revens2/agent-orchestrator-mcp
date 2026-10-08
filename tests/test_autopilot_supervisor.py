@@ -35,7 +35,7 @@ def env(tmp_path):
     clock = Clock()
     broker = FakeBroker()
     notifier = MemoryNotifier()
-    cfg = Config(backoff_base_s=10, backoff_max_s=60, lost_grace_s=120, breaker_threshold=3, breaker_cooldown_s=300)
+    cfg = Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, backoff_base_s=10, backoff_max_s=60, lost_grace_s=120, breaker_threshold=3, breaker_cooldown_s=300)
     db = AutopilotDB(tmp_path / "autopilot.db", clock=clock)
     sup = Supervisor(db, broker, cfg, gate=FakeGate(), notifier=notifier, clock=clock, rng=random.Random(1))
 
@@ -385,7 +385,7 @@ def test_gate_unattested_blocks_structural_but_independent_steps_continue(env):
 
 
 def test_gate_attested_only_with_expected_model(env):
-    cfg = Config(expected_served_model="claude-opus-5-5")
+    cfg = Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, expected_served_model="claude-opus-5-5")
     sup = env.restart(cfg=cfg, gate=FakeGate(served_model="claude-opus-5-5"))
     oid = sup.submit(spec({"key": "d1", "kind": "decision", "prompt": "q"}))["objective_id"]
     sup.tick()
@@ -408,7 +408,7 @@ def test_db_integrity_triggers(env):
     env.sup.tick()
     with pytest.raises(sqlite3.DatabaseError), env.db.tx() as db:
         db.execute("UPDATE steps SET state='READY'")
-    assert env.db.schema_version() == 1
+    assert env.db.schema_version() == 2
 
 
 def test_secrets_redacted_in_db(env):
@@ -471,3 +471,58 @@ def test_pause_stops_new_dispatch(env):
     env.sup.set_objective_state(oid, "resume")
     env.sup.tick()
     assert len(env.broker.start_calls) == 1
+
+
+# ------------------------------------------------------------------ écriture contrainte par défaut
+def test_default_config_forbids_local_write(tmp_path):
+    cfg = Config()
+    assert "local_write" not in cfg.allowed_kinds and cfg.local_write_needs_approval
+    sup = Supervisor(AutopilotDB(tmp_path / "d.db"), FakeBroker(), cfg)
+    with pytest.raises(AutopilotError) as exc:
+        sup.submit(spec(write("w1")))
+    assert exc.value.code == "kind_disabled"
+    assert Config.from_env({}).allowed_kinds == frozenset({"read", "decision"})
+
+
+def test_local_write_refused_at_startup_without_dedicated_account():
+    with pytest.raises(PolicyError) as exc:
+        Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write"})
+    assert exc.value.code == "local_write_requires_dedicated_account"
+    cfg = Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write", "AUTOPILOT_RUNNER_DEDICATED_ACCOUNT": "1"})
+    assert "local_write" in cfg.allowed_kinds and cfg.local_write_needs_approval
+
+
+def test_local_write_needs_out_of_band_approval_per_attempt(tmp_path):
+    clock, broker, notifier = Clock(), FakeBroker(), MemoryNotifier()
+    cfg = Config(allowed_kinds=frozenset({"read", "local_write", "decision"}))
+    sup = Supervisor(AutopilotDB(tmp_path / "w.db", clock=clock), broker, cfg, notifier=notifier, clock=clock)
+    oid = sup.submit(spec(write("w1")))["objective_id"]
+    sup.tick()
+    assert broker.start_calls == [] and sup.objective(oid)["steps"][0]["state"] == A.NEEDS_APPROVAL
+    req = sup.request_approval(f"{oid}:w1", "approve")
+    sup.approve(req["action_hash"], notifier.last_code())
+    sup.tick()
+    assert len(broker.start_calls) == 1
+    broker.finish(broker.created_jobs()[0], "lost")
+    sup.tick()
+    req = sup.request_approval(f"{oid}:w1", "retry")  # audit humain => accord pour UNE nouvelle tentative
+    sup.approve(req["action_hash"], notifier.last_code())
+    sup.tick()
+    assert len(broker.start_calls) == 2
+
+
+def test_migration_v1_to_v2_keeps_data(tmp_path):
+    import sqlite3 as sq
+
+    from orch_autopilot.db import MIGRATIONS, _split_sql
+
+    path = tmp_path / "old.db"
+    con = sq.connect(path, isolation_level=None)
+    for stmt in _split_sql(MIGRATIONS[0]):
+        con.execute(stmt)
+    con.execute("INSERT INTO meta VALUES('schema_version','1')")
+    con.execute("INSERT INTO meta VALUES('kill_switch','1')")
+    con.close()
+    db = AutopilotDB(path)
+    assert db.schema_version() == 2 and db.get_meta("kill_switch") == "1"
+    assert "write_approved_attempt" in {r[1] for r in db.query("PRAGMA table_info(steps)")}

@@ -222,8 +222,10 @@ class Supervisor:
         elif resolution == "mark_done":
             self._step(db, st, A.DONE, evidence={"evidence_level": "human_attested"})
         elif resolution in ("retry", "approve"):
-            # nouvelle tentative explicite : le plafond est relevé d'une unité, jamais au-delà sans nouvel accord
-            db.execute("UPDATE steps SET max_attempts=MAX(max_attempts, attempt+1), not_before=NULL WHERE id=?", (st["id"],))
+            # nouvelle tentative explicite : le plafond est relevé d'une unité, jamais au-delà sans nouvel accord ;
+            # l'accord vaut pour cette seule tentative d'écriture
+            db.execute("UPDATE steps SET max_attempts=MAX(max_attempts, attempt+1), not_before=NULL, "
+                       "write_approved_attempt=attempt+1 WHERE id=?", (st["id"],))
             self._step(db, st, A.READY, reason="human_retry")
 
     # ================================================================= lecture
@@ -370,6 +372,10 @@ class Supervisor:
                     continue
                 if st["kind"] == "decision":
                     continue  # décision approuvée : déjà DONE via le gate
+                if (st["kind"] == "local_write" and self.cfg.local_write_needs_approval
+                        and st["write_approved_attempt"] != st["attempt"] + 1):
+                    self._step(db, st, A.NEEDS_APPROVAL, reason="local_write : approbation hors bande requise pour cette tentative")
+                    continue
                 if self._enqueue_job(db, st, now):
                     n += 1
         return n
