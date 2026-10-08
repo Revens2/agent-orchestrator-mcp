@@ -6,6 +6,7 @@ AUTOPILOT_TEST_AGENT_USER / AUTOPILOT_TEST_AGENT_CRED (fichier DPAPI) sont défi
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -23,19 +24,23 @@ PROBE = {"sid": "S-1-5-21-1-2-3-1010", "is_admin": False, "elevated": False, "in
                      "why": "access_denied"}]}
 
 
+PROMPT = "[autopilot objective=o step=w attempt=1] tâche"
+
+
 def job(mode="workspace_write"):
-    return {"job_id": "j-1", "fencing": 3, "workspace_id": "e2e", "mode": mode}
+    return {"job_id": "j-1", "fencing": 3, "workspace_id": "e2e", "mode": mode, "prompt": PROMPT}
 
 
 def payload_for(before, after, mode="workspace_write", att=None):
     return I.build_payload(runner_id="autopilot-win-01", job=job(mode), exit_code=0, started_at=1000.0,
-                           finished_at=1001.0, tree_killed=True, att=att or I.attestation(RUNNER, PROBE, None),
+                           finished_at=1001.0, tree_killed=True, att=att or I.attestation(RUNNER, PROBE, PROBE["sid"]),
                            before=before, after=after)
 
 
 def binding(**kw):
     base = {"runner_id": "autopilot-win-01", "job_id": "j-1", "workspace_id": "e2e", "mode": "workspace_write",
-            "exit_code": 0, "expected_agent_sid": PROBE["sid"], "not_before": 1000.0}
+            "exit_code": 0, "expected_agent_sid": PROBE["sid"], "not_before": 1000.0,
+            "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()}
     base.update(kw)
     return EV.Binding(**base)
 
@@ -98,12 +103,12 @@ def test_scan_caps_fail_closed(tmp_path):
 
 # ------------------------------------------------------------------ attestation
 @pytest.mark.parametrize("runner,probe,proc_sid,ok", [
-    (RUNNER, PROBE, None, True),
+    (RUNNER, PROBE, None, False),                                            # jeton agent illisible
     (RUNNER, PROBE, PROBE["sid"], True),
     (RUNNER, PROBE, RUNNER["sid"], False),                                    # agent lancé sous A
     ({**RUNNER, "is_admin": True}, PROBE, None, False),                      # runner admin
     (RUNNER, {**PROBE, "is_admin": True}, None, False),                      # agent admin
-    (RUNNER, {**PROBE, "sid": RUNNER["sid"]}, None, False),                  # même compte
+    (RUNNER, {**PROBE, "sid": RUNNER["sid"]}, RUNNER["sid"], False),         # même compte
     (RUNNER, {**PROBE, "probes": [{**PROBE["probes"][0], "denied": False}]}, None, False),
     (RUNNER, {**PROBE, "probes": []}, None, False),
 ])
@@ -135,7 +140,7 @@ def test_envelope_survives_broker_redaction_and_clip():
     key = Ed25519PrivateKey.generate()
     probes = [{"probe": "read", "path": rf"C:\Users\Juliann\secret{i}\file.bin", "denied": True,
                "why": "access_denied"} for i in range(12)]
-    att = I.attestation(RUNNER, {**PROBE, "probes": probes}, None)
+    att = I.attestation(RUNNER, {**PROBE, "probes": probes}, PROBE["sid"])
     many = I.Scan({f"out/f{i}.txt": {"sha256": "cd" * 32, "size": 9} for i in range(EV.MAX_CHANGED)}, [], [], True, True)
     line = EV.encode_envelope(payload_for(I.Scan({}, [], [], True, True), many, att=att), key.sign)
     stored = P.clip(redact(line + "\n" + "token: " + "z" * 40 + "\n" + "y" * 20_000), P.MAX_SUMMARY_CHARS)
@@ -179,3 +184,30 @@ def test_zlib_bomb_rejected():
     with pytest.raises(EV.EvidenceError) as exc:
         EV.decode_envelope(f"{EV.PREFIX}{bomb}.{'00' * 64}", lambda sig, data: None)
     assert exc.value.code == "evidence_malformed"
+
+
+def test_prompt_of_other_attempt_rejected():
+    p = payload_for(I.Scan({}, [], [], True, True), I.Scan({"out/x": {"sha256": "ab" * 32, "size": 1}}, [], [], True, True))
+    other = hashlib.sha256(PROMPT.replace("attempt=1", "attempt=2").encode()).hexdigest()
+    v = EV.check_payload(p, EV.Expectation("local_write", ("out/x",)), binding(prompt_sha256=other))
+    assert "prompt_mismatch" in v
+
+
+def test_unverified_agent_process_identity_rejected():
+    att = I.attestation(RUNNER, PROBE, PROBE["sid"])
+    att["agent_process_sid"] = None
+    p = payload_for(I.Scan({}, [], [], True, True), I.Scan({"out/x": {"sha256": "ab" * 32, "size": 1}}, [], [], True, True),
+                    att=att)
+    assert "agent_process_identity_unverified" in EV.check_payload(p, EV.Expectation("local_write", ("out/x",)), binding())
+
+
+@windows
+def test_real_scan_flags_hardlink_and_trailing_dot(tmp_path):
+    outside = tmp_path.parent / (tmp_path.name + "-hl.txt")
+    outside.write_text("hors workspace")
+    os.link(outside, tmp_path / "linked.txt")
+    (tmp_path / "ok.txt").write_text("x")
+    scan = I.scan_workspace(str(tmp_path))
+    assert "linked.txt" in scan.suspicious and "ok.txt" not in scan.suspicious
+    p = payload_for(scan, scan, mode="read_only")
+    assert "suspicious_entry" in EV.check_payload(p, EV.Expectation("read"), binding(mode="read_only"))

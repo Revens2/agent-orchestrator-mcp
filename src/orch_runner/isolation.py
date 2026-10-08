@@ -76,6 +76,7 @@ class Scan:
     alternate_streams: list[str]
     ads_checked: bool
     complete: bool
+    suspicious: list[str] = field(default_factory=list)   # hardlinks, noms terminés par point/espace
 
 
 def scan_workspace(root: str, max_files: int = 20_000, max_bytes: int = 512 * 1024 * 1024) -> Scan:
@@ -86,6 +87,7 @@ def scan_workspace(root: str, max_files: int = 20_000, max_bytes: int = 512 * 10
     files: dict[str, dict] = {}
     reparse: list[str] = []
     ads: list[str] = []
+    suspicious: list[str] = []
     total = 0
     complete = True
     ads_ok = IS_WINDOWS
@@ -114,8 +116,15 @@ def scan_workspace(root: str, max_files: int = 20_000, max_bytes: int = 512 * 10
             if not stat.S_ISREG(st.st_mode):
                 reparse.append(rel)  # périphérique, socket… : hors contrat
                 continue
+            if entry.name.endswith((".", " ")):
+                suspicious.append(rel)
+            try:
+                if os.stat(entry.path, follow_symlinks=False).st_nlink > 1:
+                    suspicious.append(rel)  # hardlink : le contenu peut changer hors workspace
+            except OSError:
+                complete = False
             if len(files) >= max_files or total + st.st_size > max_bytes:
-                return Scan(files, reparse, ads, ads_ok, False)
+                return Scan(files, reparse, ads, ads_ok, False, suspicious)
             try:
                 files[rel] = {"sha256": _sha256_file(entry.path), "size": st.st_size}
             except OSError:
@@ -128,7 +137,7 @@ def scan_workspace(root: str, max_files: int = 20_000, max_bytes: int = 512 * 10
                     ads_ok = False
                 elif streams:
                     ads.extend(f"{rel}:{s}" for s in streams)
-    return Scan(files, sorted(reparse), sorted(ads), ads_ok, complete)
+    return Scan(files, sorted(reparse), sorted(ads), ads_ok, complete, sorted(suspicious))
 
 
 def _sha256_file(path: str) -> str:
@@ -250,9 +259,10 @@ def run_probe(conf: IsolationConf, password: str, timeout_s: float = 60) -> dict
 def attestation(runner: dict, probe: dict, agent_process_sid: str | None) -> dict[str, Any]:
     probes = [{"probe": p["probe"], "path": p["path"], "denied": bool(p["denied"]), "why": p.get("why")}
               for p in probe.get("probes", [])]
+    # fail-closed : le SID du jeton du processus agent DOIT être lu par A et égal à celui de la sonde
     ok = (bool(probes) and all(p["denied"] for p in probes) and probe.get("is_admin") is False
           and probe.get("elevated") is False and runner.get("is_admin") is False and runner.get("sid") != probe.get("sid")
-          and (agent_process_sid is None or agent_process_sid == probe.get("sid")))
+          and agent_process_sid is not None and agent_process_sid == probe.get("sid"))
     return {
         "ok": ok, "runner_sid": runner.get("sid"), "runner_is_admin": runner.get("is_admin"),
         "agent_sid": probe.get("sid"), "agent_is_admin": probe.get("is_admin"), "agent_elevated": probe.get("elevated"),
@@ -411,12 +421,14 @@ def build_payload(*, runner_id: str, job: dict, exit_code: int | None, started_a
     complete = before.complete and after.complete and len(changed) <= EV.MAX_CHANGED
     return {
         "v": EV.VERSION, "runner_id": runner_id, "job_id": job["job_id"], "fencing": job.get("fencing"),
+        "prompt_sha256": hashlib.sha256(str(job.get("prompt", "")).encode("utf-8")).hexdigest(),
         "workspace_id": job["workspace_id"], "mode": job["mode"], "exit_code": exit_code,
         "started_at": started_at, "finished_at": finished_at, "tree_killed": tree_killed,
         "runner_code_sha256": runner_code_digest(), "attestation": att,
         "manifest": {
             "complete": complete, "ads_checked": before.ads_checked and after.ads_checked,
             "alternate_streams": after.alternate_streams[:20], "reparse_points": after.reparse_points[:20],
+            "suspicious": sorted(set(before.suspicious) | set(after.suspicious))[:20],
             "before_sha256": EV.manifest_digest(before.files), "after_sha256": EV.manifest_digest(after.files),
             "files_after": len(after.files), "changed": changed[:EV.MAX_CHANGED],
         },

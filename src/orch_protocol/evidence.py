@@ -135,6 +135,9 @@ class Binding:
     exit_code: int | None
     expected_agent_sid: str | None
     not_before: float | None = None             # dispatch de la tentative (anti-rejeu)
+    # prompt EXACT figé dans l'outbox pour cette tentative (contient objective/step/attempt). Le fencing
+    # (claim courant) est imposé par le broker : une transition d'un ancien détenteur est refusée.
+    prompt_sha256: str | None = None
 
 
 def check_payload(payload: dict, exp: Expectation, bind: Binding) -> list[str]:
@@ -150,6 +153,7 @@ def check_payload(payload: dict, exp: Expectation, bind: Binding) -> list[str]:
     need(payload.get("workspace_id") == bind.workspace_id, "workspace_mismatch")
     need(payload.get("mode") == bind.mode, "mode_mismatch")
     need(payload.get("exit_code") == bind.exit_code, "exit_code_mismatch")
+    need(bind.prompt_sha256 is not None and payload.get("prompt_sha256") == bind.prompt_sha256, "prompt_mismatch")
     if bind.not_before is not None:
         started = payload.get("started_at")
         need(isinstance(started, (int, float)) and started >= bind.not_before - 300, "stale_evidence")
@@ -164,6 +168,9 @@ def check_payload(payload: dict, exp: Expectation, bind: Binding) -> list[str]:
         need(att.get("agent_elevated") is False, "agent_elevated")
         need(bind.expected_agent_sid is not None and att.get("agent_sid") == bind.expected_agent_sid, "agent_sid_mismatch")
         need(att.get("agent_sid") != att.get("runner_sid"), "agent_shares_runner_identity")
+        # SID lu sur le jeton du PROCESSUS agent par A : la sonde confirme, elle ne prouve pas
+        need(att.get("agent_process_sid") is not None and att.get("agent_process_sid") == att.get("agent_sid"),
+             "agent_process_identity_unverified")
         probes = att.get("probes")
         need(isinstance(probes, list) and len(probes) > 0 and all(
             isinstance(p, dict) and p.get("denied") is True for p in probes), "probe_not_denied")
@@ -174,6 +181,7 @@ def check_payload(payload: dict, exp: Expectation, bind: Binding) -> list[str]:
         return v
     need(man.get("complete") is True, "manifest_incomplete")
     need(not man.get("reparse_points"), "reparse_point")
+    need(not man.get("suspicious"), "suspicious_entry")   # hardlinks, noms à point/espace final
     need(man.get("ads_checked") is True and not man.get("alternate_streams"), "alternate_data_stream")
     changed = man.get("changed")
     if not isinstance(changed, list):

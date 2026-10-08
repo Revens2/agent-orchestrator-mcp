@@ -780,12 +780,14 @@ class Supervisor:
         """Vérifie l'enveloppe signée du runner (tête de result_summary). None = runner sans clé configurée."""
         if self._verify is None:
             return None
-        sent = db.execute("SELECT created_at FROM outbox WHERE idempotency_key=?",
+        sent = db.execute("SELECT created_at, payload FROM outbox WHERE idempotency_key=?",
                           (idempotency_key("job", st["id"], st["attempt"]),)).fetchone()
+        prompt = json.loads(sent["payload"]).get("prompt") if sent else None
         bind = EV.Binding(
             runner_id=self.cfg.runner_id, job_id=st["job_id"], workspace_id=st["workspace_id"],
             mode=A.KIND_MODE[st["kind"]], exit_code=job.get("exit_code"),
             expected_agent_sid=self.cfg.expected_agent_sid, not_before=sent["created_at"] if sent else None,
+            prompt_sha256=sha256(prompt) if prompt is not None else None,
         )
         exp = EV.Expectation(kind=st["kind"], artifacts=tuple(expect.get("artifacts", [])),
                              allowed_paths=tuple(expect.get("allowed_paths", [])))

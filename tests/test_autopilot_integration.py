@@ -54,7 +54,8 @@ def runner_complete(store, epoch, output, state="completed", summary="fini", **o
     store.transition(RUNNER_ID, epoch, jid, f, "starting", "running")
     store.event(RUNNER_ID, epoch, jid, f, "evt-00000001", activity="working", output=output)
     if state == "completed":
-        job = {"job_id": jid, "payload": {"runner_id": RUNNER_ID, "workspace_id": c["workspace_id"], "mode": c["mode"]},
+        job = {"job_id": jid, "payload": {"runner_id": RUNNER_ID, "workspace_id": c["workspace_id"], "mode": c["mode"],
+                                          "prompt": c["prompt"]},
                "created_at": store.clock()}
         env = SIGNER.envelope(SIGNER.payload(job, **over))
         store.transition(RUNNER_ID, epoch, jid, f, "running", "completed", exit_code=0, result_summary=f"{env}\n{summary}")

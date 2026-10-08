@@ -31,10 +31,12 @@ class RunnerSigner:
             changed = [] if mode == "read_only" else [{"path": ARTIFACT, "op": "added", "sha256": "ab" * 32, "size": 12}]
         p = {
             "v": EV.VERSION, "runner_id": job["payload"]["runner_id"], "job_id": job["job_id"],
+            "prompt_sha256": hashlib.sha256(job["payload"].get("prompt", "").encode("utf-8")).hexdigest(),
             "workspace_id": job["payload"]["workspace_id"], "mode": mode, "exit_code": 0,
             "started_at": job.get("created_at", 0.0) + 1, "finished_at": job.get("created_at", 0.0) + 2,
             "tree_killed": True,
-            "attestation": {"ok": True, "agent_sid": AGENT_SID, "runner_sid": RUNNER_SID, "agent_is_admin": False,
+            "attestation": {"ok": True, "agent_sid": AGENT_SID, "agent_process_sid": AGENT_SID,
+                            "runner_sid": RUNNER_SID, "agent_is_admin": False,
                             "agent_elevated": False, "probes": [{"probe": "read_runner_token", "denied": True}]},
             "manifest": {"complete": True, "ads_checked": True, "alternate_streams": [], "reparse_points": [],
                          "before_sha256": "00" * 32, "after_sha256": "11" * 32, "changed": changed},
