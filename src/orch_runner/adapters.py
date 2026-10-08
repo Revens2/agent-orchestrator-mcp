@@ -279,15 +279,19 @@ class OpenCode(Adapter):
             return info
         errors: list = []
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            # NOTE 2026-10-08 : le verdict DOIT etre calcule avant la sortie du
+            # TemporaryDirectory. Sur Windows le rmtree echoue souvent (handle
+            # garde par l'enfant / indexation) et l'except ci-dessous transformait
+            # une generation REUSSIE en "generation de test echouee".
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                 out = subprocess.run(
                     [self.exe, "run", "--agent", "plan", *self._model(), "--format", "json", "--dir", tmp, "--", "Reply OK."],
                     capture_output=True, text=True, timeout=int(self.extra.get("probe_timeout_s", 120)),
                     creationflags=0x08000000, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                 )
-            events = [d for d in map(_json, (out.stdout or "").splitlines()) if d]
-            errors = [d for d in events if d.get("type") == "error"]
-            ok = out.returncode == 0 and not errors and any((d.get("part") or {}).get("type") == "text" for d in events)
+                events = [d for d in map(_json, (out.stdout or "").splitlines()) if d]
+                errors = [d for d in events if d.get("type") == "error"]
+                ok = out.returncode == 0 and not errors and any((d.get("part") or {}).get("type") == "text" for d in events)
         except Exception:  # noqa: BLE001
             ok = False
         if not ok:
