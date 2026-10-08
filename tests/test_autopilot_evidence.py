@@ -7,6 +7,7 @@ n'atteint JAMAIS DONE sans enveloppe runner_observed valide, liée au bon job et
 from __future__ import annotations
 
 import random
+import zlib
 
 import pytest
 
@@ -218,7 +219,7 @@ def test_tampered_payload_rejected(env):
     oid, jid, job = env.run(write())
     line = env.signer.envelope(env.signer.payload(job, changed=[]))
     payload_hex, sig = line[len(EV.PREFIX):].split(".")
-    good = EV.canonical(env.signer.payload(job)).hex()  # contenu « arrangé », signature d'origine
+    good = zlib.compress(EV.canonical(env.signer.payload(job))).hex()  # contenu « arrangé », signature d'origine
     st = finish_and_tick(env, oid, jid, output=MARK, envelope=f"{EV.PREFIX}{good}.{sig}")
     assert st["state"] == A.NEEDS_AUDIT and "evidence_bad_signature" in st["last_error"]
 

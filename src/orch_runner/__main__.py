@@ -38,7 +38,8 @@ def setup_logging(home: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="orch_runner")
-    ap.add_argument("command", choices=["run", "gen-token", "probe", "status"])
+    ap.add_argument("command", choices=["run", "gen-token", "probe", "status", "evidence-keygen", "set-agent-password",
+                                        "attest"])
     ap.add_argument("--config", type=Path, default=DEFAULT_HOME / "runner.toml")
     ap.add_argument("--force", action="store_true", help="gen-token : rotation (remplace le jeton existant)")
     args = ap.parse_args(argv)
@@ -55,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cfg = Config.load(args.config)
+    if args.command in ("evidence-keygen", "set-agent-password", "attest"):
+        return _isolation_command(args.command, cfg, args.force)
     if args.command == "status":
         path = cfg.home / "status.json"
         print(path.read_text(encoding="utf-8") if path.exists() else '{"error": "aucun statut (runner jamais lancé)"}')
@@ -75,6 +78,44 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     Runner(cfg).run()
     return 0
+
+
+def _isolation_command(command: str, cfg: Config, force: bool) -> int:
+    """Commandes du runner isolé, à lancer SOUS le compte runner (A) : les secrets sont chiffrés DPAPI de A."""
+    import getpass
+
+    from orch_runner import isolation
+    from orch_runner.policy import load_secret, store_secret
+
+    iso = cfg.isolation
+    if iso is None:
+        print("section [isolation] absente de runner.toml", file=sys.stderr)
+        return 2
+    if command == "evidence-keygen":
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
+
+        if iso.signing_key_file.exists() and not force:
+            print(f"clé existante ({iso.signing_key_file}). Rotation : --force", file=sys.stderr)
+            return 2
+        key = Ed25519PrivateKey.generate()
+        store_secret(iso.signing_key_file, key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+        print("Clé de signature générée (DPAPI du compte runner). Clé PUBLIQUE à déclarer côté VPS :")
+        print("AUTOPILOT_RUNNER_PUBKEY=" + key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex())
+        return 0
+    if command == "set-agent-password":
+        secret = getpass.getpass(f"Mot de passe du compte agent {iso.agent_user} (non affiché) : ")
+        if not secret:
+            return 2
+        store_secret(iso.credential_file, secret.encode("utf-8"))
+        print(f"Mot de passe stocké chiffré DPAPI : {iso.credential_file}")
+        return 0
+    # attest : preuve T1 lisible (identités + refus OS), sans lancer d'agent
+    probe = isolation.run_probe(iso, load_secret(iso.credential_file).decode("utf-8"))
+    att = isolation.attestation(isolation.self_identity(), probe, None)
+    print(json.dumps(att, indent=1, ensure_ascii=False))
+    print("AUTOPILOT_EXPECTED_AGENT_SID=" + str(att["agent_sid"]))
+    return 0 if att["ok"] else 1
 
 
 if __name__ == "__main__":

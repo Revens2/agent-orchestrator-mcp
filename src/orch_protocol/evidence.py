@@ -8,7 +8,8 @@ Niveaux de preuve (du plus faible au plus fort) :
 - `externally_verified` : vérification par un tiers (git distant, CI, API). Non utilisé en V1.
 
 Transport : PREMIÈRE ligne de `result_summary` (champ écrit par le runner, jamais par l'agent ;
-le broker coupe en queue, la tête est conservée). Format : `AUTOPILOT-EVIDENCE-V1 <payload_hex>.<sig_hex>`.
+le broker coupe en queue, la tête est conservée). Format : `AUTOPILOT-EVIDENCE-V1 <zlib(payload)_hex>.<sig_hex>`,
+signature sur le JSON canonique non compressé ; décompression bornée (pas de bombe zlib).
 Hexadécimal minuscule : aucun motif de `orch_protocol.redact` ne peut s'y appliquer.
 Une enveloppe trouvée ailleurs (stdout agent) est ignorée ; une signature invalide = absence de preuve.
 """
@@ -18,12 +19,14 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import zlib
 from dataclasses import dataclass
 from typing import Any
 
 PREFIX = "AUTOPILOT-EVIDENCE-V1 "
 VERSION = 1
-MAX_CHANGED = 40          # au-delà : manifeste tronqué => fail-closed
+MAX_CHANGED = 24          # au-delà : manifeste incomplet => fail-closed (audit humain)
+MAX_PAYLOAD_BYTES = 64 * 1024
 MAX_ENVELOPE_CHARS = 7_000  # MAX_SUMMARY_CHARS broker = 8 000, en tête
 # Chemins sensibles (exécution différée chez un humain/CI) : toute modification => audit.
 SENSITIVE_GLOBS = (".git/config", ".git/hooks/*", ".git/info/*", ".gitattributes", ".gitmodules",
@@ -64,7 +67,7 @@ def manifest_digest(manifest: dict[str, dict]) -> str:
 def encode_envelope(payload: dict, sign) -> str:
     """`sign(bytes) -> bytes` (clé privée du runner). Lève si l'enveloppe dépasse la taille admise."""
     raw = canonical(payload)
-    line = PREFIX + raw.hex() + "." + sign(raw).hex()
+    line = PREFIX + zlib.compress(raw, 9).hex() + "." + sign(raw).hex()
     if len(line) > MAX_ENVELOPE_CHARS:
         raise EvidenceError("envelope_too_large", f"enveloppe {len(line)} > {MAX_ENVELOPE_CHARS}")
     return line
@@ -77,8 +80,12 @@ def decode_envelope(summary: str | None, verify) -> dict:
     line = summary.split("\n", 1)[0][len(PREFIX):].strip()
     try:
         payload_hex, sig_hex = line.split(".", 1)
-        raw, sig = bytes.fromhex(payload_hex), bytes.fromhex(sig_hex)
-    except ValueError as exc:
+        packed, sig = bytes.fromhex(payload_hex), bytes.fromhex(sig_hex)
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(packed, MAX_PAYLOAD_BYTES)
+        if inflater.unconsumed_tail or not inflater.eof:
+            raise ValueError("payload trop grand ou tronqué")
+    except (ValueError, zlib.error) as exc:
         raise EvidenceError("evidence_malformed", "enveloppe illisible") from exc
     try:
         verify(sig, raw)

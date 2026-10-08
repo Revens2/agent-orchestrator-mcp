@@ -27,7 +27,7 @@ import orch_protocol as P
 from orch_protocol.redact import redact
 from orch_runner import winproc
 from orch_runner.adapters import ADAPTERS, Adapter
-from orch_runner.policy import Config, PolicyError, child_env, load_token, resolve_workspace
+from orch_runner.policy import Config, PolicyError, child_env, load_secret, load_token, resolve_workspace
 
 VERSION = "0.2.0"
 log = logging.getLogger("orch.runner")
@@ -156,6 +156,7 @@ class JobWorker(threading.Thread):
         self.session_id: str | None = None
         self.done = threading.Event()
         self._question_sent = False
+        self._evidence: dict[str, Any] = {}  # runner isolé : sonde, scan avant, horodatage
 
     # ------------------------------------------------------------- broker I/O
     def _telemetry(self) -> dict[str, Any]:
@@ -290,6 +291,34 @@ class JobWorker(threading.Thread):
             self.done.set()
             self.runner.job_finished(self)
 
+    def _kill_descendants(self) -> bool:
+        """Termine l'arbre (petits-enfants détachés compris) AVANT le manifeste « après » ; True si vide."""
+        self.proc.kill_tree(0)
+        for _ in range(50):
+            if self.proc.active_processes() == 0:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _envelope(self, cwd: str, exit_code: int | None, tree_killed: bool) -> str | None:
+        from orch_protocol import evidence as EV
+        from orch_runner import isolation
+
+        iso = self.runner.config.isolation
+        try:
+            after = isolation.scan_workspace(cwd, iso.max_files, iso.max_bytes)
+            att = isolation.attestation(self.runner.identity(), self._evidence["probe"],
+                                        self._evidence.get("agent_process_sid"))
+            payload = isolation.build_payload(
+                runner_id=self.runner.config.runner_id, job=self.job, exit_code=exit_code,
+                started_at=self._evidence["started_at"], finished_at=time.time(), tree_killed=tree_killed,
+                att=att, before=self._evidence["before"], after=after)
+            sign = EV.ed25519_signer(load_secret(iso.signing_key_file))
+            return EV.encode_envelope(payload, sign)
+        except Exception as exc:  # noqa: BLE001 - preuve absente plutôt qu'inventée
+            log.error("evidence_failed job_id=%s err=%s", self.job_id, type(exc).__name__)
+            return None
+
     def _refuse(self, code: str, message: str) -> None:
         log.warning("job_refused job_id=%s code=%s", self.job_id, code)
         self._transition(P.FAILED, error=f"{code}: {message}")
@@ -318,14 +347,35 @@ class JobWorker(threading.Thread):
         except PolicyError as exc:
             return self._refuse(exc.code, exc.message)
 
+        iso = cfg.isolation
+        logon = None
+        if iso is not None:
+            # runner isolé : sondes OS sous le compte agent + manifeste AVANT tout lancement ; échec => refus
+            from orch_runner import isolation
+
+            try:
+                password = load_secret(iso.credential_file).decode("utf-8")
+                self._evidence = {"probe": isolation.run_probe(iso, password), "started_at": time.time(),
+                                  "before": isolation.scan_workspace(cwd, iso.max_files, iso.max_bytes)}
+            except Exception as exc:  # noqa: BLE001 - aucune exécution sans attestation
+                log.warning("isolation_unavailable job_id=%s err=%s", self.job_id, type(exc).__name__)
+                return self._refuse("isolation_unavailable", f"attestation impossible : {type(exc).__name__}")
+            logon = (iso.agent_user, password)
+
         if not self._transition(P.STARTING):
             return
         tmpdir = cfg.home / "jobs" / self.job_id
         tmpdir.mkdir(parents=True, exist_ok=True)
         try:
             launch = adapter.build(prompt, job["mode"], cwd, tmpdir)
-            self.proc = winproc.JobProcess(launch.argv, cwd, child_env(self.job_id, launch.env_extra))
+            if iso is not None:
+                env = isolation.agent_env(iso, {"ORCH_JOB_ID": self.job_id, **(launch.env_extra or {})})
+            else:
+                env = child_env(self.job_id, launch.env_extra)
+            self.proc = winproc.JobProcess(launch.argv, cwd, env, logon=logon)
             self.proc_started_at = time.time()
+            if iso is not None:
+                self._evidence["agent_process_sid"] = isolation.process_sid(self.proc.proc._handle)
         except (winproc.LaunchError, ValueError, OSError) as exc:
             shutil.rmtree(tmpdir, ignore_errors=True)
             return self._transition(P.FAILED, error=f"launch_failed: {exc}") and None
@@ -383,11 +433,17 @@ class JobWorker(threading.Thread):
         self._flush()
         outcome = adapter.finish(exit_code, tmpdir)
         self.session_id = adapter.session_id or self.session_id
+        tree_killed = self._kill_descendants() if iso is not None else False
         self.proc.close()  # tue d'éventuels descendants restants
         shutil.rmtree(tmpdir, ignore_errors=True)
         # L'ID de session part en tête du résumé : c'est le seul canal que
         # ChatGPT Web voit (le champ runtime_session_id ne lui est pas relayé).
         summary = with_session_header(job["runtime"], self.session_id, outcome.summary)
+        if iso is not None:
+            # enveloppe signée en TÊTE (le broker coupe en queue) ; absente si la preuve échoue => audit côté VPS
+            envelope = self._envelope(cwd, exit_code, tree_killed)
+            if envelope:
+                summary = envelope + "\n" + P.clip(summary or "", P.MAX_SUMMARY_CHARS - len(envelope) - 1)
         if reason == P.CANCELLED:
             self._transition(P.CANCELLED, exit_code=exit_code, result_summary=summary, error="annulé : arbre de processus terminé")
         elif reason == P.TIMEOUT:
@@ -471,6 +527,16 @@ class Runner:
                 return
             self._refresh_thread = threading.Thread(target=self.refresh_runtimes, name="runtime-refresh", daemon=True)
             self._refresh_thread.start()
+
+    def identity(self) -> dict[str, Any]:
+        """Identité OS du compte runner (A), relue au plus toutes les 10 min (changement de groupe détecté)."""
+        from orch_runner import isolation
+
+        now = time.monotonic()
+        cached = getattr(self, "_identity", None)
+        if cached is None or now - cached[0] > 600:
+            self._identity = (now, isolation.self_identity())
+        return self._identity[1]
 
     def info(self) -> dict[str, Any]:
         runtimes = []
