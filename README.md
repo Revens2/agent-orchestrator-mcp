@@ -10,7 +10,7 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
                                                                             ▼
                          orch-gateway  127.0.0.1:8801   OAuth + politique outil par outil
                                                                             ▼
-                          orch-mcp      127.0.0.1:8802   MCP (20 outils) + broker SQLite (autorité)
+                          orch-mcp      127.0.0.1:8802   MCP (24 outils) + broker SQLite (autorité)
                                                                             ▲
                          nginx 10.200.114.203:8803      /runner/v1/* — IP NetBird uniquement
                                                                             │ long-poll SORTANT
@@ -33,6 +33,14 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 - **Le broker est la source d'autorité** : transitions compare-and-set avec *fencing token* et epoch de
   session runner ; un job perdu après lancement devient `lost`, **jamais relancé ni déclaré `completed`**.
 - **Aucun port entrant sur le PC** : le runner se connecte en sortie au VPS via NetBird.
+- **Qui est qui** : chaque machine porte une carte `machine` (label, hostname, os, role) et chaque
+  runtime une carte `identity` qui nomme explicitement la confusion à éviter — `claude-code` (CLI
+  headless, confinée au workspace) n'est pas `claude-desktop` (application de bureau de
+  l'utilisateur, pilotée par son UI). Champ non déclaré = `null`, jamais deviné.
+- **Ouverture de conversation** (`[session]` de `runner.toml`) : `start_skill` (défaut
+  `/caveman ultra`) est placé en première ligne du prompt, et seulement sur les runtimes qui
+  interprètent les commandes `/skill` ; `subagents` autorise explicitement la délégation, et
+  seulement là où le runtime la documente. Rien n'est rejoué sur une conversation reprise.
 - **Pas de duplication ConvIA** : le broker ne garde que métadonnées, sortie bornée (2 Mo/job) et
   résumé ; prompts purgés à 7 j, sorties à 7 j, métadonnées à 90 j.
 
@@ -47,13 +55,17 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 | `agent_job_output` | lecture | sortie paginée (`cursor`, `limit` ≤ 20 000) |
 | `agent_job_events` | lecture | journal structuré borné et paginé (`after_seq`, `limit` ≤ 200), pas de transcript |
 | `agent_runner_inspect` | lecture | snapshot runner : versions, capacités, workspaces, git (branch/HEAD/dirty), jobs actifs |
-| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) ; retour machine-lisible (`terminal`, `should_continue`/`must_follow`, `next_tool`, curseur `since_seq`) : un timeout non terminal impose de rappeler dans le même tour, jamais de répondre |
+| `agent_job_wait` | lecture | long-poll borné (≤ 60 s) ; retour machine-lisible (`terminal`, `should_continue`/`must_follow`, `next_tool`, curseur `since_seq`) **+ bloc `liveness`** : un timeout non terminal impose de rappeler dans le même tour, jamais de répondre |
+| `agent_job_liveness` | lecture | **signal de vie** immédiat : `verdict` (`working`/`starting`/`waiting_for_human`/`lost_contact`/`unknown`/`finished`), `evidence` datée (heartbeat, télémétrie, sortie, événements), `freshest_signal_age_s` |
+| `agent_job_pause` | écriture | déclare une **attente humaine** bornée (quota épuisé, reconnexion, pause volontaire) : suspend `lost`/stall/timeout dur |
+| `agent_job_resume` | écriture | lève l'attente humaine (l'utilisateur a agi) ; automatique dès que l'agent reparle |
+| `agent_job_relaunch` | écriture | relance dans un **processus neuf** (seul moyen de charger une nouvelle clé d'API) en **reprenant la conversation** quand le runtime le sait (`opencode --session`) |
 | `agent_mission_wait` | lecture | attente bornée (≤ 60 s) sur la tentative courante d'une mission (`mission_state`, `terminal`, `should_continue`, `next_tool` = `agent_mission_wait` ou `agent_mission_validate`) |
 | `agent_job_cancel` | écriture | `cancelled` / `cancel_requested` / `already_finished` / `unknown_job` |
 | `agent_job_list` | lecture | liste filtrable |
 | `agent_mission_create` | écriture | mission (objectif + critères) + 1re tentative ; jamais de retry auto |
 | `agent_mission_get` | lecture | objectif, critères, tentatives, job courant, validation |
-| `agent_mission_retry` | écriture | nouvelle tentative explicite de la même mission (≤ `max_attempts`) |
+| `agent_mission_retry` | écriture | nouvelle tentative explicite de la même mission (≤ `max_attempts`) ; autorisée aussi depuis `blocked` (l'humain a fait ce qu'il fallait) |
 | `agent_mission_validate` | écriture | `validated` \| `incomplete` \| `blocked` \| `failed` (seule preuve de succès) |
 | `infra_alert_list` | lecture | alertes infra [ETUDE]/[NEXUS] filtrables (source, sévérité, état, période), vue compacte |
 | `infra_alert_get` | lecture | détail borné d'une alerte (erreur, contexte, empreinte, occurrences) |
@@ -73,6 +85,27 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 > **Stalls** : processus vivant + silence d'activité/output ≥ 10 min → événement
 > `suspected_stall`, ≥ 30 min → `stalled`. Notification seule : jamais de relance ni
 > d'annulation automatique (surtout pas pour une mission d'écriture).
+>
+> **Signal de vie** : un agent lent, ou un utilisateur occupé, n'est pas une panne.
+> Chaque retour de `agent_job_wait`/`agent_mission_wait` porte un bloc `liveness`
+> (verdict + preuves **datées et réellement observées** : un signal non observé est
+> absent de `evidence`, jamais supposé bon). Un `woke_by=timeout` accompagné de
+> `verdict=working` prouve que ça avance : ce n'est jamais une raison de conclure à
+> l'échec.
+>
+> **Attente humaine** (`execution_health=waiting_for_human`) : quand l'utilisateur
+> doit agir — changer une clé d'API après un quota épuisé, se reconnecter, donner un
+> feu vert — le broker **suspend** ses trois comptes à rebours (`recovery` → `lost`,
+> détection de stall, timeout dur) pour une durée **bornée** (`PAUSE_MAX_S` = 6 h),
+> et le retour porte `human_action_required`. Rien n'est falsifié : `proc_alive` et la
+> télémétrie restent ce qu'elles sont, seules les horloges des verdicts sont
+> suspendues. C'est le **seul arrêt intermédiaire légitime** du contrat de suivi :
+> dire à l'utilisateur ce qu'il doit faire, puis reprendre. Déclaration : automatique
+> (signatures exactes de quota/auth dans la sortie de l'agent, côté broker — aucune
+> MAJ du runner requise), `agent_job_pause` depuis ChatGPT, ou `pause_cli` sur le VPS.
+> Reprise : `agent_job_resume`, automatique dès que l'agent reparle, ou expiration.
+> Un job qui **meurt** sur ce même blocage porte `human_action_required` et passe sa
+> mission en `blocked` (retryable), jamais annoncé comme un échec technique.
 
 ## Arborescence
 

@@ -38,6 +38,15 @@ FOLLOW_NEXT_WAIT = "agent_job_wait"
 FOLLOW_NEXT_DONE = "agent_job_get"
 
 
+def _paused(row) -> bool:
+    """Le job porte-t-il une pause humaine en cours ? (colonne absente sur une
+    base pas encore migrée => False, jamais une exception)."""
+    try:
+        return row["paused_at"] is not None
+    except (IndexError, KeyError):
+        return False
+
+
 def follow_for_job(state: str, last_event_seq: int, wait_timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any]:
     """Bloc de suivi pour un job non terminal : quoi appeler, avec quel curseur,
     jusqu'à quoi. `terminal=True` => le job ne bougera plus (inspecter/valider)."""
@@ -53,20 +62,35 @@ def follow_for_job(state: str, last_event_seq: int, wait_timeout_s: float = P.WA
     }
 
 
-def follow_for_wait(state: str, woke_by: str, last_event_seq: int) -> dict[str, Any]:
+def follow_for_wait(
+    state: str, woke_by: str, last_event_seq: int, human: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Bloc de suivi pour un retour de wait : `woke_by=timeout` + non terminal
-    => rappeler `agent_job_wait` IMMÉDIATEMENT (même tour), pas de réponse user."""
+    => rappeler `agent_job_wait` IMMÉDIATEMENT (même tour), pas de réponse user.
+
+    `human` (bloc `human_action_required`) est le SEUL arrêt intermédiaire
+    légitime : l'agent est vivant mais attend une action de l'utilisateur
+    (nouvelle clé d'API, reconnexion, feu vert). Le suivi s'arrête alors —
+    `stop_reason='waiting_for_human'` — pour que le caller PARLE à l'utilisateur
+    au lieu d'attendre dans le vide ; il reprendra avec `agent_job_wait`."""
     terminal = state in P.TERMINAL
-    return {
-        "must_follow": not terminal,
+    blocked = bool(human) and not terminal
+    out = {
+        "must_follow": not terminal and not blocked,
         "terminal": terminal,
-        "should_continue": not terminal,
+        "should_continue": not terminal and not blocked,
         "next_tool": FOLLOW_NEXT_DONE if terminal else FOLLOW_NEXT_WAIT,
         "wait_timeout_s": FOLLOW_WAIT_S,
         "until": FOLLOW_UNTIL,
         "since_seq": int(last_event_seq),
         "woke_by": woke_by,
     }
+    if human:
+        out["human_action_required"] = human
+        if blocked:
+            out["stop_reason"] = "waiting_for_human"
+            out["resume_with"] = FOLLOW_NEXT_WAIT
+    return out
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -288,6 +312,11 @@ class Store:
         """Migration idempotente des bases v1 : nouvelles colonnes NULL (= inconnu)
         et nouvelles tables. Sûre à rejouer ; l'ancien code ignore ces ajouts."""
         with self._lock:
+            rcols = {r["name"] for r in self._db.execute("PRAGMA table_info(runners)").fetchall()}
+            if "machine_json" not in rcols:
+                # Carte d'identité lisible de la machine (label, hostname, OS, rôle).
+                # Absente = non déclarée par le runner, jamais devinée.
+                self._db.execute("ALTER TABLE runners ADD COLUMN machine_json TEXT")
             cols = {r["name"] for r in self._db.execute("PRAGMA table_info(jobs)").fetchall()}
             # DDL littéraux (pas d'interpolation : exigence semgrep) ; chaque
             # colonne n'est ajoutée que si absente.
@@ -313,6 +342,34 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
             if "recovery_since" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN recovery_since REAL")
+            # Pause humaine explicite (signal de vie). NULL = jamais mis en pause :
+            # l'ancien code ignore ces colonnes, le rollback reste possible.
+            if "paused_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN paused_at REAL")
+            if "pause_reason" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT")
+            if "pause_note" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN pause_note TEXT")
+            if "pause_expires" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN pause_expires REAL")
+            if "pause_source" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN pause_source TEXT")
+            if "pause_count" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0")
+            if "resumed_at" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN resumed_at REAL")
+            # Blocage humain constaté sur un job DÉJÀ terminal (l'agent est mort
+            # sur un quota épuisé) : ce n'est pas une panne, c'est une action
+            # humaine à faire puis un retry explicite.
+            if "blocker_reason" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN blocker_reason TEXT")
+            if "blocker_sign" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN blocker_sign TEXT")
+            # Reprise de conversation dans un processus NEUF (nouvelle clé d'API).
+            if "resume_session_id" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN resume_session_id TEXT")
+            if "relaunch_of" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN relaunch_of TEXT")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -408,6 +465,12 @@ class Store:
         now = self.clock()
         if row["state"] not in (P.STARTING, P.RUNNING):
             return now + P.LEASE_S
+        # Pause humaine explicite : le compte à rebours de recovery est SUSPENDU,
+        # jamais remis à zéro ni falsifié (recovery_since garde sa valeur, la
+        # télémétrie garde la sienne). Un processus mort pendant que l'utilisateur
+        # change sa clé d'API ne devient donc pas `lost` en 60 s.
+        if _paused(row):
+            return now + P.LEASE_S
         since = row["recovery_since"]
         if since is not None and now >= since + P.PROCESS_RECOVERY_S:
             self._set_terminal(
@@ -447,16 +510,19 @@ class Store:
         runtimes = [r for r in info.get("runtimes", []) if isinstance(r, dict) and r.get("id") in P.RUNTIMES]
         workspaces = [w for w in info.get("workspaces", []) if isinstance(w, dict) and P.valid_id(w.get("id"))]
         max_parallel = max(1, min(int(info.get("max_parallel", 1)), 16))
+        machine = P.machine_identity(info.get("machine"))
         held_map = {h.get("job_id"): h for h in held if isinstance(h, dict)}
         with self._tx() as db:
             row = db.execute("SELECT epoch FROM runners WHERE id=?", (runner_id,)).fetchone()
             epoch = (int(row["epoch"]) if row else 0) + 1
             db.execute(
-                """INSERT INTO runners(id, epoch, last_seen, hello_at, version, max_parallel, runtimes_json, workspaces_json)
-                   VALUES (?,?,?,?,?,?,?,?)
+                """INSERT INTO runners(id, epoch, last_seen, hello_at, version, max_parallel, runtimes_json,
+                     workspaces_json, machine_json)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, last_seen=excluded.last_seen,
                      hello_at=excluded.hello_at, version=excluded.version, max_parallel=excluded.max_parallel,
-                     runtimes_json=excluded.runtimes_json, workspaces_json=excluded.workspaces_json""",
+                     runtimes_json=excluded.runtimes_json, workspaces_json=excluded.workspaces_json,
+                     machine_json=excluded.machine_json""",
                 (
                     runner_id,
                     epoch,
@@ -466,6 +532,7 @@ class Store:
                     max_parallel,
                     json.dumps(runtimes)[:20_000],
                     json.dumps(workspaces)[:20_000],
+                    json.dumps(machine)[:2_000],
                 ),
             )
             active = db.execute(
@@ -579,7 +646,15 @@ class Store:
                         "status": "online" if online else "offline",
                         "last_seen": _iso(r["last_seen"]),
                         "seconds_since_seen": None if r["last_seen"] is None else round(now - r["last_seen"], 1),
-                        "runtimes": json.loads(r["runtimes_json"]),
+                        # Qui est cette machine ? Champ non déclaré = null, jamais deviné.
+                        "machine": self._machine_view(r),
+                        # Chaque runtime porte sa carte d'identité : c'est ce qui
+                        # empêche de confondre la CLI Claude Code et l'application
+                        # Claude Desktop, dont les identifiants se ressemblent.
+                        "runtimes": [
+                            {**rt, "identity": P.runtime_identity(rt.get("id"))}
+                            for rt in json.loads(r["runtimes_json"])
+                        ],
                         "workspaces": json.loads(r["workspaces_json"]),
                         "max_parallel": r["max_parallel"],
                         "active_jobs": active,
@@ -590,6 +665,18 @@ class Store:
             return out
 
     # ------------------------------------------------------------------- jobs
+    @staticmethod
+    def _machine_view(row) -> dict[str, Any]:
+        """Carte d'identité machine déclarée par le runner (champs absents = null)."""
+        try:
+            raw = row["machine_json"]
+        except (IndexError, KeyError):
+            raw = None
+        try:
+            return P.machine_identity(json.loads(raw) if raw else None)
+        except (ValueError, TypeError):
+            return P.machine_identity(None)
+
     def create_job(
         self,
         runner_id: str,
@@ -599,6 +686,8 @@ class Store:
         mode: str,
         timeout_s: int | None = None,
         idempotency_key: str | None = None,
+        resume_session_id: str | None = None,
+        relaunch_of: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Crée un job `queued`. Retourne (job, created). Refuse avant toute exécution
         si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé."""
@@ -652,10 +741,12 @@ class Store:
             job_id = str(uuid.uuid4())
             db.execute(
                 """INSERT INTO jobs(id, runner_id, runtime, workspace_id, mode, prompt, prompt_chars, idem_key, idem_hash,
-                     state, timeout_s, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     state, timeout_s, created_at, updated_at, resume_session_id, relaunch_of)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job_id, runner_id, runtime, workspace_id, mode, prompt, len(prompt), idempotency_key, req_hash,
-                 P.QUEUED, timeout_s, now, now),
+                 P.QUEUED, timeout_s, now, now,
+                 str(resume_session_id)[:128] if resume_session_id else None,
+                 str(relaunch_of)[:64] if relaunch_of else None),
             )
             self._log_transition(db, job_id, None, P.QUEUED, "mcp")
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -701,6 +792,9 @@ class Store:
                         "mode": fresh["mode"],
                         "prompt": fresh["prompt"],
                         "timeout_s": fresh["timeout_s"],
+                        # Reprise de conversation : le runner relance un processus
+                        # NEUF (donc nouvelle clé d'API lue) sur la MÊME session.
+                        "resume_session_id": fresh["resume_session_id"],
                         "lease_s": P.LEASE_S,
                     }
                 )
@@ -739,6 +833,14 @@ class Store:
             if row["state"] != src:
                 raise BrokerError("state_conflict", f"état actuel {row['state']}, attendu {src}")
             terminal = dst in P.TERMINAL
+            # Un job qui MEURT sur un quota épuisé ou une authentification expirée
+            # n'est pas un agent défaillant : c'est une action humaine à faire.
+            # On l'enregistre pour ne jamais l'annoncer comme un échec technique.
+            blocker = None
+            if terminal and dst != P.COMPLETED:
+                blocker = P.match_pause_reason(error) or P.match_pause_reason(result_summary)
+                if blocker is None and _paused(row):
+                    blocker = (row["pause_reason"] or P.PAUSE_MANUAL, row["pause_note"] or "")
             lease = None if terminal else self._execution_lease(db, row, tele)
             if not terminal and lease is None:
                 return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
@@ -767,6 +869,16 @@ class Store:
             )
             if cur.rowcount != 1:
                 raise BrokerError("state_conflict", "transition concurrente")
+            if terminal:
+                # Un job figé ne peut plus être « en pause » : la cause devient
+                # un blocage constaté, exposé comme action humaine requise.
+                db.execute(
+                    "UPDATE jobs SET paused_at=NULL, pause_reason=NULL, pause_expires=NULL, "
+                    "pause_source=NULL, blocker_reason=?, blocker_sign=? WHERE id=?",
+                    (blocker[0] if blocker else None,
+                     P.clip(redact(blocker[1]), P.MAX_PAUSE_NOTE_CHARS) if blocker and blocker[1] else None,
+                     job_id),
+                )
             self._log_transition(db, job_id, src, dst, f"runner:{runner_id}")
             # Télémétrie jointe à la transition (surtout STARTING->RUNNING : le
             # pid est connu dès le spawn, pas au prochain heartbeat). Sans elle,
@@ -783,7 +895,10 @@ class Store:
                     # session abandonnée (jamais réutilisée : le retry crée un
                     # nouveau job = nouvelle session + handoff, pas de transcript).
                     self._emit(db, job_id, P.EV_SESSION_CORRUPTED, error[:500])
-                self._mission_on_job_terminal(db, job_id, dst)
+                if blocker:
+                    self._emit(db, job_id, P.EV_PAUSED,
+                               f"{P.PAUSE_MESSAGES.get(blocker[0], blocker[0])} : action humaine requise")
+                self._mission_on_job_terminal(db, job_id, dst, blocked=bool(blocker))
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def record_runner_question(
@@ -843,7 +958,7 @@ class Store:
                 return {"duplicate": False, "ignored": True, "cancel": False}
             chunks, chars, truncated = int(row["output_chunks"]), int(row["output_chars"]), int(row["output_truncated"])
             prev_step = chars // P.OUTPUT_PROGRESS_STEP_CHARS
-            got_output = False
+            got_output, text = False, ""
             if output:
                 text = redact(output)[: P.MAX_CHUNK_CHARS]
                 room = P.MAX_OUTPUT_CHARS_PER_JOB - chars
@@ -877,6 +992,27 @@ class Store:
                     job_id,
                 ),
             )
+            # Détection automatique d'un blocage qui demande une action humaine
+            # (quota épuisé, authentification expirée) sur la sortie de l'agent :
+            # signatures EXACTES, jamais un match naïf. Le broker le fait ici pour
+            # que tous les runtimes en bénéficient sans MAJ du runner sur le PC.
+            hit = P.match_pause_reason(text) if got_output else None
+            if hit and not _paused(row):
+                reason, sign = hit
+                db.execute(
+                    """UPDATE jobs SET paused_at=?, pause_reason=?, pause_expires=?,
+                         pause_source=?, pause_count=pause_count + 1,
+                         pause_note=COALESCE(pause_note, ?)
+                       WHERE id=?""",
+                    (now, reason, now + P.PAUSE_DEFAULT_S, P.PAUSE_SRC_RUNNER,
+                     f"détecté dans la sortie de l'agent : {sign}", job_id),
+                )
+                self._emit(db, job_id, P.EV_PAUSED,
+                           f"{P.PAUSE_MESSAGES[reason]} (détecté automatiquement : {sign})")
+            elif _paused(row) and (got_output or new_activity) and not hit:
+                # L'agent reparle et ce qu'il dit n'est PAS un nouveau blocage :
+                # l'utilisateur a fait ce qu'il avait à faire, la pause se lève.
+                self._resume(db, row, P.PAUSE_SRC_RUNNER, "l'agent a repris son activité")
             if got_output and chars // P.OUTPUT_PROGRESS_STEP_CHARS > prev_step:
                 self._emit(db, job_id, P.EV_OUTPUT_PROGRESS, f"{chars} caractères reçus")
             if new_activity and new_activity != (row["last_activity"] or None):
@@ -886,6 +1022,289 @@ class Store:
             # moins d'un intervalle de heartbeat.
             self._store_telemetry(db, job_id, tele)
             return {"duplicate": False, "cancel": bool(row["cancel_requested"])}
+
+    # --------------------------------------------- pause humaine (signal de vie)
+    def _pause_block(self, row, now: float | None = None) -> dict[str, Any] | None:
+        """Bloc `human_action_required` lisible, ou None si rien n'attend l'humain.
+
+        Deux cas, une seule forme : le job est en pause (vivant, silence voulu),
+        ou le job est terminal sur un blocage humain constaté (quota épuisé,
+        authentification expirée) — auquel cas ce n'est PAS une panne à annoncer
+        comme telle, mais une action à faire puis un retry explicite."""
+        now = self.clock() if now is None else now
+        if _paused(row):
+            reason = row["pause_reason"] or P.PAUSE_MANUAL
+            expires = row["pause_expires"]
+            restart = reason in (P.PAUSE_QUOTA, P.PAUSE_AUTH) and P.needs_restart_for_credentials(row["runtime"])
+            return {
+                # Le processus en cours a lu ses identifiants à SON démarrage :
+                # une nouvelle clé n'y entrera jamais. La reprise passe donc par
+                # une relance, pas par une simple levée de pause.
+                "restart_required": restart,
+                "restart_note": (
+                    "le processus en cours ne rechargera pas la nouvelle clé : il faut le relancer "
+                    "(agent_job_cancel puis agent_job_relaunch)"
+                    + (" ; la conversation sera reprise, rien n'est perdu."
+                       if P.can_resume_session(row["runtime"]) else
+                       f" ; le runtime {row['runtime']} ne sait pas reprendre une conversation, "
+                       "celle-ci repartira de zéro.")
+                ) if restart else None,
+                "required": True,
+                "reason": reason,
+                "message": P.PAUSE_MESSAGES.get(reason, "action de l'utilisateur attendue"),
+                "note": row["pause_note"],
+                "since": _iso(row["paused_at"]),
+                "paused_for_s": round(now - float(row["paused_at"]), 1),
+                "expires_at": _iso(expires),
+                "expires_in_s": round(float(expires) - now, 1) if expires else None,
+                "declared_by": row["pause_source"],
+                "job_is_alive": True,
+                "resume_with": "agent_job_resume",
+                "note_for_caller": (
+                    "l'agent n'est PAS en panne : le silence est voulu. Dites-le à "
+                    "l'utilisateur, puis reprenez le suivi (agent_job_wait) une fois "
+                    "l'action faite."
+                ),
+            }
+        try:
+            blocker = row["blocker_reason"]
+        except (IndexError, KeyError):
+            blocker = None
+        if blocker:
+            return {
+                "required": True,
+                "reason": blocker,
+                "message": P.PAUSE_MESSAGES.get(blocker, "action de l'utilisateur attendue"),
+                "note": row["blocker_sign"],
+                "since": _iso(row["finished_at"] or row["updated_at"]),
+                "job_is_alive": False,
+                "restart_required": P.needs_restart_for_credentials(row["runtime"]),
+                "restart_note": (
+                    "un processus NEUF lira la nouvelle clé d'API"
+                    + (" et reprendra la conversation (agent_job_relaunch, ou agent_mission_retry "
+                       "si le job appartient à une mission)."
+                       if P.can_resume_session(row["runtime"]) else
+                       f" ; le runtime {row['runtime']} ne sait pas reprendre une conversation, "
+                       "celle-ci repartira de zéro.")
+                ),
+                "resume_with": "agent_job_relaunch",
+                "note_for_caller": (
+                    "la tentative s'est arrêtée sur un blocage qui demande une action "
+                    "humaine, pas sur un défaut de l'agent : ne l'annoncez pas comme un "
+                    "échec technique. Une fois l'action faite, relancez explicitement."
+                ),
+            }
+        return None
+
+    def pause_job(
+        self,
+        job_id: str,
+        reason: str = P.PAUSE_MANUAL,
+        note: str | None = None,
+        expected_s: int | None = None,
+        source: str = P.PAUSE_SRC_HUMAN,
+    ) -> dict[str, Any]:
+        """Déclare une attente HUMAINE sur un job actif (idempotent).
+
+        Effet : suspend les trois comptes à rebours du broker (recovery vers
+        `lost`, détection de stall, timeout dur) dans la limite de `expected_s`
+        (borné à P.PAUSE_MAX_S), et rend le silence lisible
+        (`execution_health=waiting_for_human`). Aucune observation n'est
+        falsifiée : la télémétrie reste ce qu'elle est."""
+        if reason not in P.PAUSE_REASONS:
+            raise BrokerError("invalid_pause", f"raison inconnue (attendu : {', '.join(P.PAUSE_REASONS)})")
+        if source not in P.PAUSE_SOURCES:
+            raise BrokerError("invalid_pause", "source de pause inconnue")
+        window = P.PAUSE_DEFAULT_S if expected_s is None else int(expected_s)
+        window = max(60, min(window, P.PAUSE_MAX_S))
+        clean = P.clip(redact(note.strip()), P.MAX_PAUSE_NOTE_CHARS) if note and note.strip() else None
+        now = self.clock()
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return {"job_id": job_id, "result": "unknown_job"}
+            if row["state"] in P.TERMINAL:
+                return {"job_id": job_id, "result": "already_finished", "state": row["state"]}
+            already = _paused(row)
+            db.execute(
+                """UPDATE jobs SET paused_at=COALESCE(paused_at, ?), pause_reason=?,
+                     pause_note=COALESCE(?, pause_note), pause_expires=?, pause_source=?,
+                     pause_count=pause_count + ?, updated_at=?,
+                     stall_suspect_at=NULL, stall_at=NULL
+                   WHERE id=?""",
+                (now, reason, clean, now + window, source, 0 if already else 1, now, job_id),
+            )
+            if not already:
+                self._emit(
+                    db, job_id, P.EV_PAUSED,
+                    f"{P.PAUSE_MESSAGES.get(reason, reason)} (source {source})" + (f" : {clean}" if clean else ""),
+                )
+            fresh = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return {
+                "job_id": job_id,
+                "result": "already_paused" if already else "paused",
+                "state": fresh["state"],
+                "human_action_required": self._pause_block(fresh, now),
+            }
+
+    def _resume(self, db, row, source: str, detail: str) -> None:
+        """Lève la pause et redémarre proprement les comptes à rebours : une
+        observation négative antérieure repart de MAINTENANT (jamais
+        rétroactivement, sinon l'attente humaine compterait contre le job)."""
+        now = self.clock()
+        recovery = now if row["proc_alive"] == 0 else None
+        db.execute(
+            """UPDATE jobs SET paused_at=NULL, pause_reason=NULL, pause_expires=NULL,
+                 pause_source=NULL, resumed_at=?, updated_at=?, recovery_since=?,
+                 lease_expires=MAX(COALESCE(lease_expires, 0), ?),
+                 stall_suspect_at=NULL, stall_at=NULL
+               WHERE id=?""",
+            (now, now, recovery, now + P.LEASE_S, row["id"]),
+        )
+        self._emit(db, row["id"], P.EV_RESUMED, f"{detail} (source {source})")
+
+    def resume_job(self, job_id: str, source: str = P.PAUSE_SRC_HUMAN, note: str | None = None) -> dict[str, Any]:
+        """Lève une pause humaine (idempotent). L'utilisateur a fait ce qu'il
+        avait à faire : le suivi normal reprend."""
+        if source not in P.PAUSE_SOURCES:
+            raise BrokerError("invalid_pause", "source de pause inconnue")
+        clean = P.clip(redact(note.strip()), P.MAX_PAUSE_NOTE_CHARS) if note and note.strip() else None
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return {"job_id": job_id, "result": "unknown_job"}
+            if not _paused(row):
+                return {"job_id": job_id, "result": "not_paused", "state": row["state"]}
+            self._resume(db, row, source, clean or "reprise demandée")
+            fresh = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return {"job_id": job_id, "result": "resumed", "state": fresh["state"]}
+
+    def relaunch_job(self, job_id: str, prompt: str | None = None) -> dict[str, Any]:
+        """Relance un job dans un PROCESSUS NEUF, en reprenant la conversation.
+
+        C'est le geste qui manque après un changement de clé d'API : les runtimes
+        lisent leurs identifiants au démarrage, donc le processus en cours ne
+        rechargera jamais la nouvelle clé — il faut l'éteindre et le relancer.
+        Quand le runtime sait reprendre une session (`P.RUNTIME_RESUME_FLAG`), la
+        conversation continue au lieu d'être refaite depuis zéro ; sinon la
+        relance repart d'une conversation neuve et le retour le DIT
+        (`conversation='fresh'`), au lieu de le laisser croire."""
+        with self._lock:
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return {"job_id": job_id, "result": "unknown_job"}
+        if row["state"] not in P.TERMINAL:
+            return {
+                "job_id": job_id,
+                "result": "job_still_active",
+                "state": row["state"],
+                "hint": ("le job tient encore le workspace : annulez-le (agent_job_cancel) puis "
+                         "relancez, pour ne jamais faire tourner deux processus sur le même workspace"),
+            }
+        resumable = P.can_resume_session(row["runtime"]) and bool(row["runtime_session_id"])
+        text = prompt if isinstance(prompt, str) and prompt.strip() else None
+        if text is None:
+            text = (
+                "Reprends la mission là où elle s'est arrêtée."
+                if resumable
+                else f"Reprends cette mission depuis le début : {row['prompt'] or ''}".strip()
+            )
+        job, _ = self.create_job(
+            row["runner_id"], row["runtime"], row["workspace_id"], text,
+            row["mode"], row["timeout_s"],
+            resume_session_id=row["runtime_session_id"] if resumable else None,
+            relaunch_of=job_id,
+        )
+        seq = self._last_seq(job["job_id"])
+        follow = follow_for_job(job["state"], seq)
+        return {
+            "result": "relaunched",
+            "job_id": job["job_id"],
+            "relaunch_of": job_id,
+            "state": job["state"],
+            "runtime": row["runtime"],
+            "conversation": "continued" if resumable else "fresh",
+            "resumed_session_id": row["runtime_session_id"] if resumable else None,
+            "note": (
+                "processus neuf : la nouvelle clé d'API sera lue au démarrage ; "
+                + ("la conversation précédente est reprise."
+                   if resumable else
+                   f"le runtime {row['runtime']} ne sait pas reprendre une conversation : "
+                   "celle-ci repart de zéro, dites-le à l'utilisateur.")
+            ),
+            "follow_up": follow,
+            "terminal": follow["terminal"],
+            "should_continue": follow["should_continue"],
+            "next_tool": follow["next_tool"],
+            "since_seq": follow["since_seq"],
+            "until": follow["until"],
+        }
+
+    def liveness(self, job_id: str) -> dict[str, Any] | None:
+        """SIGNAL DE VIE : « est-ce que ça avance, et depuis quand ? »
+
+        Réponse fondée UNIQUEMENT sur des observations datées (heartbeat runner,
+        télémétrie processus, sortie, événements). `verdict` résume, `evidence`
+        énumère les preuves avec leur âge : rien n'est inventé, un signal non
+        observé est absent de la liste au lieu d'être supposé bon."""
+        now = self.clock()
+        with self._lock:
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            hb = self._db.execute("SELECT last_seen FROM runners WHERE id=?", (row["runner_id"],)).fetchone()
+        last_seen = hb["last_seen"] if hb else None
+        evidence: list[dict[str, Any]] = []
+
+        def add(signal: str, ts: float | None, **extra: Any) -> None:
+            if ts is None:
+                return
+            evidence.append({"signal": signal, "at": _iso(ts), "age_s": round(now - float(ts), 1), **extra})
+
+        add("runner_heartbeat", last_seen, runner_id=row["runner_id"])
+        add("process_telemetry", row["telemetry_at"],
+            alive=None if row["proc_alive"] is None else bool(row["proc_alive"]), pid=row["proc_pid"])
+        add("agent_output", row["last_output_at"], chars=row["output_chars"])
+        add("job_event", row["last_event_at"], activity=row["last_activity"])
+        freshest = min((e["age_s"] for e in evidence), default=None)
+        human = self._pause_block(row, now)
+        state = row["state"]
+        if state in P.TERMINAL:
+            verdict, keep_waiting = "finished", False
+        elif human:
+            verdict, keep_waiting = "waiting_for_human", False
+        elif last_seen is None or now - float(last_seen) > P.ONLINE_WINDOW_S:
+            verdict, keep_waiting = "lost_contact", True
+        elif state in (P.QUEUED, P.CLAIMED, P.STARTING):
+            verdict, keep_waiting = "starting", True
+        elif freshest is None:
+            verdict, keep_waiting = "unknown", True
+        else:
+            verdict, keep_waiting = "working", True
+        messages = {
+            "working": "l'agent travaille",
+            "starting": "l'agent démarre",
+            "waiting_for_human": (human or {}).get("message", "action de l'utilisateur attendue"),
+            "lost_contact": "plus de signe du PC runner",
+            "unknown": "aucun signal daté encore observé",
+            "finished": f"job terminé ({state})",
+        }
+        message = messages[verdict]
+        if verdict in ("working", "starting") and freshest is not None:
+            message += f" ; dernier signe de vie il y a {freshest:.0f} s"
+        return {
+            "job_id": job_id,
+            "state": state,
+            "alive": verdict in ("working", "starting", "waiting_for_human"),
+            "verdict": verdict,
+            "message": message,
+            "freshest_signal_age_s": freshest,
+            "evidence": evidence,
+            "keep_waiting": keep_waiting,
+            "next_poll_after_s": FOLLOW_WAIT_S,
+            "human_action_required": human,
+            "execution_health": self._execution_health(row, last_seen, now),
+        }
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         now = self.clock()
@@ -991,11 +1410,24 @@ class Store:
         relance ni n'annule jamais seule. Un `lost` garde 'issue inconnue' avec les
         couches broker/runner/process pour diagnostiquer la cause observable."""
         now = self.clock()
-        stats = {"requeued": 0, "lost": 0, "timeout_cancel": 0, "failed": 0, "stalled": 0, "suspected_stall": 0}
+        stats = {"requeued": 0, "lost": 0, "timeout_cancel": 0, "failed": 0, "stalled": 0,
+                 "suspected_stall": 0, "pause_expired": 0}
         with self._tx() as db:
+            # Une pause humaine est bornée : passé son échéance, les comptes à
+            # rebours repartent de MAINTENANT (jamais rétroactivement — l'attente
+            # de l'utilisateur ne doit pas compter contre le job).
             for row in db.execute(
-                "SELECT * FROM jobs WHERE state IN ('starting','running') AND recovery_since IS NOT NULL "
-                "AND recovery_since + ? <= ?", (P.PROCESS_RECOVERY_S, now),
+                "SELECT * FROM jobs WHERE paused_at IS NOT NULL AND pause_expires IS NOT NULL AND pause_expires <= ?",
+                (now,),
+            ).fetchall():
+                reason = row["pause_reason"] or P.PAUSE_MANUAL
+                self._resume(db, row, "broker", f"pause expirée sans reprise ({reason})")
+                self._emit(db, row["id"], P.EV_PAUSE_EXPIRED,
+                           f"aucune reprise après la fenêtre de pause ({reason}) : supervision normale rétablie")
+                stats["pause_expired"] += 1
+            for row in db.execute(
+                "SELECT * FROM jobs WHERE state IN ('starting','running') AND paused_at IS NULL "
+                "AND recovery_since IS NOT NULL AND recovery_since + ? <= ?", (P.PROCESS_RECOVERY_S, now),
             ).fetchall():
                 self._execution_lease(db, row)
                 stats["lost"] += 1
@@ -1025,7 +1457,8 @@ class Store:
             for row in db.execute(
                 """SELECT id, state, proc_alive, last_event_at, started_at, created_at,
                           stall_suspect_at, stall_at, lease_expires
-                   FROM jobs WHERE state IN ('starting','running') AND lease_expires >= ? AND proc_alive = 1""",
+                   FROM jobs WHERE state IN ('starting','running') AND paused_at IS NULL
+                         AND lease_expires >= ? AND proc_alive = 1""",
                 (now,),
             ).fetchall():
                 last_sig = row["last_event_at"] or row["started_at"] or row["created_at"] or now
@@ -1039,7 +1472,8 @@ class Store:
                     self._emit(db, row["id"], P.EV_SUSPECTED_STALL, f"aucune activité/output depuis {int(silence)} s (processus vivant)")
                     stats["suspected_stall"] += 1
             for row in db.execute(
-                "SELECT id FROM jobs WHERE state='running' AND cancel_requested=0 AND started_at + timeout_s + 120 < ?",
+                "SELECT id FROM jobs WHERE state='running' AND cancel_requested=0 AND paused_at IS NULL "
+                "AND started_at + timeout_s + 120 < ?",
                 (now,),
             ).fetchall():
                 db.execute("UPDATE jobs SET cancel_requested=1, updated_at=? WHERE id=?", (now, row["id"]))
@@ -1173,13 +1607,16 @@ class Store:
 
     def retry_mission(self, mission_id: str, prompt: str | None = None) -> dict[str, Any]:
         """Nouvelle tentative de la MÊME mission (nouveau job). Exige : mission en
-        needs_validation/incomplete, tentative précédente terminale, attempts < max.
-        Jamais de relance aveugle : l'appelant MCP décide après examen du journal."""
+        needs_validation/incomplete/blocked, tentative précédente terminale,
+        attempts < max. `blocked` est retryable parce que le blocage est une action
+        humaine (nouvelle clé d'API, reconnexion) : une fois faite, la relance est
+        le geste normal. Jamais de relance aveugle pour autant : l'appelant MCP
+        décide après examen du journal."""
         with self._tx() as db:
             m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
             if m is None:
                 raise BrokerError("unknown_mission", "mission inconnue")
-            if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE):
+            if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
                 raise BrokerError("mission_not_retryable", f"mission {m['state']} : retry refusé")
             if int(m["attempts"]) >= int(m["max_attempts"]):
                 raise BrokerError("max_attempts_reached", "plus de tentatives autorisées")
@@ -1187,7 +1624,8 @@ class Store:
             if cur is None or cur["state"] not in P.TERMINAL:
                 raise BrokerError("attempt_still_active", "la tentative en cours n'est pas terminée")
             job_spec = db.execute(
-                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error FROM jobs WHERE id=?", (m["current_job_id"],)
+                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error, runtime_session_id, blocker_reason "
+                "FROM jobs WHERE id=?", (m["current_job_id"],)
             ).fetchone()
             prev_corrupted = bool(job_spec and isinstance(job_spec["error"], str)
                                   and job_spec["error"].startswith(P.SESSION_CORRUPTED_PREFIX))
@@ -1207,10 +1645,19 @@ class Store:
                         f"{P.MAX_CONSECUTIVE_CORRUPTIONS} sessions corrompues d'affilée : "
                         "corriger la cause (config/plugin/auth opencode) avant tout retry",
                     )
+        # Blocage d'identifiants (quota, auth) : le processus neuf lira la
+        # nouvelle clé, et on REPREND la conversation au lieu de la refaire.
+        # Une session CORROMPUE, elle, ne se reprend jamais (règle existante).
+        resume = None
+        if (not prev_corrupted
+                and job_spec["blocker_reason"] in (P.PAUSE_QUOTA, P.PAUSE_AUTH)
+                and P.can_resume_session(job_spec["runtime"])):
+            resume = job_spec["runtime_session_id"]
         job, _ = self.create_job(
             job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
             prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
             job_spec["mode"], job_spec["timeout_s"],
+            resume_session_id=resume, relaunch_of=m["current_job_id"] if resume else None,
         )
         now = self.clock()
         with self._tx() as db:
@@ -1254,15 +1701,22 @@ class Store:
             )
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
-    def _mission_on_job_terminal(self, db, job_id: str, job_state: str) -> None:
+    def _mission_on_job_terminal(self, db, job_id: str, job_state: str, blocked: bool = False) -> None:
         """Hook : un job terminal fait progresser sa mission, sans jamais valider.
-        exit 0 -> needs_validation ; sinon -> incomplete. Pas de retry automatique."""
+        exit 0 -> needs_validation ; blocage humain (quota, auth) -> blocked, qui
+        dit « il manque une action de l'utilisateur », pas « l'agent a échoué » ;
+        sinon -> incomplete. Pas de retry automatique dans aucun cas."""
         m = db.execute(
             "SELECT id, state FROM missions WHERE current_job_id=? AND state=?", (job_id, P.MISSION_EXECUTING)
         ).fetchone()
         if m is None:
             return
-        nxt = P.MISSION_NEEDS_VALIDATION if job_state == P.COMPLETED else P.MISSION_INCOMPLETE
+        if job_state == P.COMPLETED:
+            nxt = P.MISSION_NEEDS_VALIDATION
+        elif blocked:
+            nxt = P.MISSION_BLOCKED
+        else:
+            nxt = P.MISSION_INCOMPLETE
         db.execute(
             "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
         )
@@ -1659,6 +2113,9 @@ class Store:
             "child_process_count": children,
             "output_chunks": row["output_chunks"],
             "execution_health": self._execution_health(row, runner_last_seen, now),
+            # Attente humaine : présent (non null) => l'agent n'est pas en panne,
+            # il manque un geste de l'utilisateur. À dire tel quel à l'utilisateur.
+            "human_action_required": self._pause_block(row, now),
             "broker_health": {
                 "lease_expires_at": _iso(lease_exp),
                 "lease_valid": bool(lease_valid),
@@ -1682,6 +2139,11 @@ class Store:
         state = row["state"]
         if state in P.TERMINAL:
             return None  # un état terminal se lit via state/exit_code, pas via la santé
+        if _paused(row):
+            # Le silence est VOULU : ne jamais le présenter comme un stall ni une
+            # panne. Les couches runner_health/runtime_process_health continuent
+            # d'exposer les faits bruts (rien n'est caché).
+            return P.WAITING_FOR_HUMAN
         if runner_last_seen is None or now - runner_last_seen > P.ONLINE_WINDOW_S:
             return P.RUNNER_DISCONNECTED
         if state in (P.QUEUED, P.CLAIMED):
@@ -1765,7 +2227,11 @@ class Store:
                 "seconds_since_seen": None if r["last_seen"] is None else round(now - r["last_seen"], 1),
                 "runner_version": r["version"],
                 "max_parallel": r["max_parallel"],
-                "runtimes": json.loads(r["runtimes_json"]),
+                "machine": self._machine_view(r),
+                "runtimes": [
+                    {**rt, "identity": P.runtime_identity(rt.get("id"))}
+                    for rt in json.loads(r["runtimes_json"])
+                ],
                 "workspaces": json.loads(r["workspaces_json"]),
                 "workspace_git": env,
                 "active_jobs": active,
@@ -1800,6 +2266,7 @@ class Store:
             if view is None:
                 return None
             seq = self._last_seq(job_id)
+            human = view.get("human_action_required")
             out: dict[str, Any] = {
                 "job_id": job_id,
                 "state": view["state"],
@@ -1807,19 +2274,31 @@ class Store:
                 "execution_health": view["execution_health"],
                 "last_event_seq": seq,
             }
-            out.update(follow_for_wait(view["state"], woke_by, seq))
+            out.update(follow_for_wait(view["state"], woke_by, seq, human))
             out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+            # SIGNAL DE VIE : joint à CHAQUE retour, y compris un timeout. Un
+            # timeout accompagné d'un signal frais dit « vivant, rappelle-moi »,
+            # jamais « c'est mort » : c'est ce qui évite d'abandonner à tort.
+            out["liveness"] = self.liveness(job_id)
             return out
 
         with self._lock:
-            row = self._db.execute("SELECT updated_at, state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = self._db.execute(
+                "SELECT updated_at, state, paused_at FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
             if row is None:
                 return None
             baseline_updated, baseline_state = float(row["updated_at"]), row["state"]
+            baseline_paused = row["paused_at"]
             base_seq = self._event_seq(self._db, job_id)
             # Réveil immédiat : état terminal déjà atteint (ne bougera plus).
             if baseline_state in P.TERMINAL:
                 return _snapshot("terminal")
+            # Réveil immédiat : une action de l'utilisateur est attendue. Attendre
+            # dans le vide pendant qu'il manque un geste humain est exactement ce
+            # qui faisait conclure au time-out.
+            if baseline_paused is not None:
+                return _snapshot("paused")
             # Réveil immédiat : le client est en retard (événements non vus).
             if base_seq > since_seq:
                 return _snapshot("event")
@@ -1828,12 +2307,17 @@ class Store:
         while _t.monotonic() < deadline:
             _t.sleep(0.2)
             with self._lock:
-                row = self._db.execute("SELECT updated_at, state FROM jobs WHERE id=?", (job_id,)).fetchone()
+                row = self._db.execute(
+                    "SELECT updated_at, state, paused_at FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()
                 if row is None:
                     return None
                 seq = self._event_seq(self._db, job_id)
                 if row["state"] != baseline_state:
                     woke_by = "terminal" if row["state"] in P.TERMINAL else "state"
+                    break
+                if (row["paused_at"] is None) != (baseline_paused is None):
+                    woke_by = "paused" if row["paused_at"] is not None else "resumed"
                     break
                 if float(row["updated_at"]) != baseline_updated or seq != base_seq:
                     woke_by = "change"
@@ -1841,20 +2325,7 @@ class Store:
                 if seq > since_seq:
                     woke_by = "event"
                     break
-        view = self.get_job(job_id, tail_chars=0)
-        if view is None:
-            return None
-        seq = self._last_seq(job_id)
-        out: dict[str, Any] = {
-            "job_id": job_id,
-            "state": view["state"],
-            "woke_by": woke_by,
-            "execution_health": view["execution_health"],
-            "last_event_seq": seq,
-        }
-        out.update(follow_for_wait(view["state"], woke_by, seq))
-        out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
-        return out
+        return _snapshot(woke_by)
 
     def wait_for_mission(
         self, mission_id: str, since_seq: int = -1, timeout_s: float = P.WAIT_DEFAULT_S
@@ -1875,14 +2346,23 @@ class Store:
             return None
         m2 = self.get_mission(mission_id) or m
         state = m2["state"]
-        pursuing = state == P.MISSION_EXECUTING and not w["terminal"]
+        human = w.get("human_action_required")
+        pursuing = state == P.MISSION_EXECUTING and not w["terminal"] and not human
         if pursuing:
             nxt = "agent_mission_wait"
         elif state in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
             nxt = "agent_mission_validate"
         else:
             nxt = "agent_mission_get"
+        out_human: dict[str, Any] = {}
+        if human:
+            out_human["human_action_required"] = human
+            if not w["terminal"]:
+                out_human["stop_reason"] = "waiting_for_human"
+                out_human["resume_with"] = "agent_mission_wait"
         return {
+            **out_human,
+            "liveness": w.get("liveness"),
             "mission_id": mission_id,
             "mission_state": state,
             "job_id": job_id,

@@ -68,6 +68,17 @@ class Config:
     home: Path
     offline_kill_s: int = 120
     permission_policy: str = P.UNATTENDED
+    # Carte d'identité lisible de la machine : de quoi la NOMMER dans une phrase
+    # (« le PC du bureau ») au lieu d'un identifiant opaque. Facultatif : non
+    # déclaré = champ absent côté broker, jamais deviné.
+    machine_label: str = ""
+    machine_role: str = ""
+    machine_description: str = ""
+    # Ouverture de conversation : skill invoqué en première ligne (là où le
+    # runtime comprend les commandes `/skill`) et autorisation explicite des
+    # sous-agents. `start_skill = ""` désactive l'invocation.
+    start_skill: str = P.DEFAULT_START_SKILL
+    subagents: bool = True
     # Re-probe des seuls runtimes indisponibles (backoff exponentiel borné).
     runtime_refresh_min_s: int = 60
     runtime_refresh_max_s: int = 900
@@ -87,6 +98,8 @@ class Config:
         policy = raw.get("default_permission_policy", P.UNATTENDED)
         if policy not in P.PERMISSION_POLICIES:
             raise PolicyError("config", f"default_permission_policy invalide : {policy!r}")
+        machine = raw.get("machine") if isinstance(raw.get("machine"), dict) else {}
+        session = raw.get("session") if isinstance(raw.get("session"), dict) else {}
         workspaces = {}
         for ws_id, ws in (raw.get("workspaces") or {}).items():
             if not P.valid_id(ws_id):
@@ -111,6 +124,11 @@ class Config:
             permission_policy=policy,
             runtime_refresh_min_s=max(10, int(raw.get("runtime_refresh_min_s", 60))),
             runtime_refresh_max_s=max(10, int(raw.get("runtime_refresh_max_s", 900))),
+            machine_label=str(machine.get("label", ""))[:P.MAX_MACHINE_FIELD_CHARS],
+            machine_role=str(machine.get("role", ""))[:P.MAX_MACHINE_FIELD_CHARS],
+            machine_description=str(machine.get("description", ""))[:P.MAX_MACHINE_FIELD_CHARS],
+            start_skill=str(session.get("start_skill", P.DEFAULT_START_SKILL))[:P.MAX_START_SKILL_CHARS],
+            subagents=bool(session.get("subagents", True)),
         )
 
 
