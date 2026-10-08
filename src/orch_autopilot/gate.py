@@ -72,8 +72,9 @@ class OpusMCPGate:
         try:
             think = self._call("opus_think", {"prompt": prompt})
             health = self._call("opus_health", {})
-        except (BrokerUnavailable, ValueError) as exc:
-            return GateResult(None, None, None, error=str(exc)[:300])
+        except (BrokerUnavailable, ValueError, AttributeError, TypeError, KeyError, IndexError) as exc:
+            # toute réponse inexploitable = gate indisponible (PENDING_GATE), jamais une exception de tick
+            return GateResult(None, None, None, error=f"{type(exc).__name__}: {str(exc)[:280]}")
         served = ((health.get("opus") or {}).get("served_model_last")) if isinstance(health, dict) else None
         return GateResult(think.get("answer"), think.get("session_id"), served, None if think.get("answer") else "no_answer")
 

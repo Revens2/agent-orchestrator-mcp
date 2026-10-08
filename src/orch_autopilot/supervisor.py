@@ -7,11 +7,14 @@ pour les décisions structurantes.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
+import os
 import random
 import secrets
+import shutil
 import time
 import uuid
 from collections.abc import Callable
@@ -72,6 +75,8 @@ class Supervisor:
         notifier: Notifier | None = None,
         clock: Callable[[], float] = time.time,
         rng: random.Random | None = None,
+        consent_key: bytes | None = None,
+        disk_usage: Callable[[], tuple[int, int, int]] | None = None,
     ) -> None:
         self.db = db
         self.broker = broker
@@ -82,6 +87,12 @@ class Supervisor:
         self.rng = rng or random.Random()
         self.last_tick_at: float | None = None
         self._verify = EV.ed25519_verifier(cfg.runner_pubkey) if cfg.runner_pubkey else None
+        # Clé serveur des codes d'approbation : une fuite d'autopilot.db seule ne permet pas de retrouver un code.
+        self._consent_key = consent_key or secrets.token_bytes(32)
+        here = os.path.dirname(os.path.abspath(db.path)) if db.path != ":memory:" else "."
+        self._disk_usage = disk_usage or (lambda: tuple(shutil.disk_usage(here)))
+        self._disk_alerted = False
+        self._disk_low_now = False
         self._recover_outbox()
 
     # ================================================================= cockpit
@@ -90,6 +101,8 @@ class Supervisor:
             norm = validate_objective(spec, self.cfg)
         except PolicyError as exc:
             raise AutopilotError(exc.code, exc.message) from exc
+        if self._disk_low():
+            raise AutopilotError("disk_low", "espace disque insuffisant sur le superviseur : mission refusée")
         spec_hash = sha256(canonical(norm))
         now = self.clock()
         with self.db.tx() as db:
@@ -175,13 +188,36 @@ class Supervisor:
         with self.db.tx() as db:
             db.execute(
                 "INSERT INTO consents(action_hash, action_json, code_hash, state, expires_at, created_at) VALUES(?,?,?,?,?,?)",
-                (ahash, canonical(action), sha256(ahash + ":" + code), "pending", now + self.cfg.consent_ttl_s, now),
+                (ahash, canonical(action), self._code_hash(ahash, code), "pending", now + self.cfg.consent_ttl_s, now),
             )
             self.db.event(db, st["objective_id"], step_id, "approval_requested", action_hash=ahash, resolution=resolution)
         summary = f"Autopilot : {resolution} pour l'étape {st['key']} ({st['state']}, tentative {st['attempt']})."
         self.notifier.send(f"autopilot-{ahash[:12]}", f"{summary}\naction_hash={ahash}\ncode={code}\n")
         return {"action_hash": ahash, "summary": summary, "expires_at": now + self.cfg.consent_ttl_s,
                 "next": "Saisir le code reçu hors bande avec autopilot_approve(action_hash, code)."}
+
+    def _code_hash(self, ahash: str, code: str, stored: str | None = None) -> str:
+        if stored is not None and not stored.startswith("h1:"):
+            return sha256(ahash + ":" + code)  # consentements créés avant la clé serveur (expirent en 15 min)
+        return "h1:" + hmac.new(self._consent_key, f"{ahash}:{code}".encode(), hashlib.sha256).hexdigest()
+
+    # ---------------------------------------------------------- garde disque
+    def disk_status(self) -> dict:
+        total, used, free = self._disk_usage()
+        pct = 100.0 * used / total if total else 100.0
+        low = free < self.cfg.min_free_mb * 1024 * 1024 or pct > self.cfg.max_disk_pct
+        return {"free_mb": free // (1024 * 1024), "used_pct": round(pct, 1), "low": low}
+
+    def _disk_low(self) -> bool:
+        try:
+            status = self.disk_status()
+        except OSError:
+            status = {"low": True, "error": "disk_usage_failed"}  # inconnu = plein (fail-closed)
+        if status["low"] and not self._disk_alerted and self.notifier is not None:
+            self.notifier.send("autopilot-disk-low", f"Autopilot : espace disque insuffisant {status} ; "
+                                                     "nouvelles missions et nouveaux jobs refusés.\n")
+        self._disk_alerted = status["low"]
+        return status["low"]
 
     def approve(self, ahash: str, code: str) -> dict:
         now = self.clock()
@@ -194,7 +230,7 @@ class Supervisor:
             if now > c["expires_at"]:
                 db.execute("UPDATE consents SET state='expired' WHERE id=?", (c["id"],))
                 return {"approved": False, "error": "consent_expired"}
-            if not hmac.compare_digest(c["code_hash"], sha256(ahash + ":" + (code or "").strip().upper())):
+            if not hmac.compare_digest(c["code_hash"], self._code_hash(ahash, (code or "").strip().upper(), c["code_hash"])):
                 attempts = c["attempts"] + 1
                 state = "revoked" if attempts >= self.cfg.consent_max_attempts else "pending"
                 db.execute("UPDATE consents SET attempts=?, state=? WHERE id=?", (attempts, state, c["id"]))
@@ -306,6 +342,7 @@ class Supervisor:
         now = self.clock()
         if self.kill_switch_on():
             self._kill_active()
+        self._disk_low_now = self._disk_low()
         stats["promoted"] = self._promote(now)
         stats["enqueued"] = self._enqueue_ready(now)
         stats["sent"] = self._dispatch(self.clock())
@@ -418,6 +455,10 @@ class Supervisor:
             return False
         if self._breaker_open(db, now):
             self._step(db, st, A.COOLDOWN, reason="circuit_open", not_before=self._breaker_until(db))
+            return False
+        if self._disk_low_now:
+            if st["last_error"] != "disk_low":
+                db.execute("UPDATE steps SET last_error='disk_low' WHERE id=?", (st["id"],))
             return False
         if st["kind"] == "local_write" and self._workspace_busy(db, st):
             return False  # un seul job d'écriture (ou audit pendant) par workspace

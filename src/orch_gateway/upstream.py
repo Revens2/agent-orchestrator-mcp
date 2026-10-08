@@ -302,10 +302,13 @@ def _message_jsonrpc_lisible(donnees: Any) -> bool:
 class ProxyMCP:
     """Endpoint ASGI : /mcp authentifie (par le middleware) puis relaye vers l'upstream."""
 
-    def __init__(self, base_url: str, politique: PolitiqueOutils | None = None) -> None:
+    def __init__(self, base_url: str, politique: PolitiqueOutils | None = None, jeton_upstream: str | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._politique = politique or PolitiqueOutils()
         self._client: httpx.AsyncClient | None = None
+        # Jeton presente a l'upstream (cockpit autopilot : authentifie meme sur la boucle locale).
+        # Jamais relaye depuis le client : l'en-tete authorization entrant n'est pas dans _ENTETES_REQUETE.
+        self._jeton_upstream = jeton_upstream
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -570,6 +573,8 @@ class ProxyMCP:
             compter("rabaissement_ere", f"{version}->{version_relayee} {str(methode_rpc)[:32]}")
 
         entetes = _entetes(bruts, version_relayee)
+        if self._jeton_upstream:
+            entetes["authorization"] = f"Bearer {self._jeton_upstream}"
         identite = self._identite(scope)
         if identite:
             entetes["x-orch-mcp-acteur"] = identite

@@ -77,6 +77,9 @@ class Config:
     backoff_max_s: float = 1800.0
     expected_served_model: str | None = None   # gate Opus : identité attendue ; None = jamais attestable
     tick_s: float = 5.0
+    # Garde disque : sous ce seuil, aucune nouvelle mission ni nouveau job (les jobs en cours finissent).
+    min_free_mb: int = 2048
+    max_disk_pct: float = 95.0
     # Par défaut : lecture + décisions seulement. local_write exige une preuve runner_observed vérifiable :
     # clé publique Ed25519 du runner + SID attendu du compte agent (attestation OS à CHAQUE job),
     # ET une approbation hors bande par tentative. Aucune variable déclarative ne suffit.
@@ -125,6 +128,8 @@ class Config:
             daily_max_jobs=int(env.get("AUTOPILOT_DAILY_MAX_JOBS", "50")),
             expected_served_model=env.get("AUTOPILOT_EXPECTED_SERVED_MODEL") or None,
             tick_s=float(env.get("AUTOPILOT_TICK_S", "5")),
+            min_free_mb=int(env.get("AUTOPILOT_MIN_FREE_MB", "2048")),
+            max_disk_pct=float(env.get("AUTOPILOT_MAX_DISK_PCT", "95")),
             allowed_kinds=kinds,
             local_write_needs_approval=env.get("AUTOPILOT_LOCAL_WRITE_APPROVAL", "1") != "0",
             runner_pubkey=env.get("AUTOPILOT_RUNNER_PUBKEY") or None,

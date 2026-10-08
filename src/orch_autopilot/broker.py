@@ -90,7 +90,11 @@ class MCPBroker:
             return {"error": "tool_error", "message": text[:500]}
         data = res.get("structuredContent")
         if data is None:
-            data = json.loads((res.get("content") or [{"text": "{}"}])[0]["text"])
+            try:
+                data = json.loads((res.get("content") or [{"text": "{}"}])[0]["text"])
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                # issue incertaine : traitée comme un échec de transport (outbox rejouée, jamais bloquée)
+                raise BrokerUnavailable("réponse d'outil illisible") from exc
         if isinstance(data, dict) and set(data) == {"result"}:
             data = data["result"]
         return data

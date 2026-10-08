@@ -60,6 +60,18 @@ def _config() -> tuple[str, str, int, str, str]:
     return emetteur, upstream, port, jeton, os.environ.get("ORCH_GW_OAUTH_DIR", "")
 
 
+def _jeton_upstream() -> str | None:
+    """Jeton optionnel presente a l'upstream (fichier 0640, jamais en clair dans l'environnement)."""
+    chemin = os.environ.get("ORCH_GW_UPSTREAM_TOKEN_FILE", "").strip()
+    if not chemin:
+        return None
+    with open(chemin, encoding="utf-8") as fh:
+        jeton = fh.read().strip()
+    if len(jeton) < 32:
+        raise RuntimeError("ORCH_GW_UPSTREAM_TOKEN_FILE : jeton de 32 caracteres minimum")
+    return jeton
+
+
 def _sante(_: Request) -> JSONResponse:
     return JSONResponse(
         {
@@ -91,7 +103,7 @@ def construire_application(
         magasin=MagasinOAuth(repertoire=repertoire_oauth) if repertoire_oauth else None,
         jeton_statique=jeton,
     )
-    proxy = ProxyMCP(upstream, politique=POLITIQUE)
+    proxy = ProxyMCP(upstream, politique=POLITIQUE, jeton_upstream=_jeton_upstream())
 
     # Spec strict: resource = https://mymcps.duckdns.org/{service}/mcp, issuer = https://mymcps.duckdns.org/oauth/{service}
     resource_url_str = emetteur.replace("/oauth", "") + CHEMIN_MCP if "/oauth" in emetteur else f"{emetteur}{CHEMIN_MCP}"

@@ -20,6 +20,7 @@ from tests.test_mcp_tools import rpc
 
 MARK = "AUTOPILOT_STEP_OK"
 SIGNER = RunnerSigner()
+COCKPIT_TOKEN = "c" * 40
 WS = [{"id": "e2e", "modes": ["read_only", "workspace_write"], "description": "sandbox"}]
 
 
@@ -111,7 +112,8 @@ def test_real_broker_opencode_unavailable_blocked_worker(stack):
 @pytest.fixture
 def cockpit_client(stack):
     _, _, sup, _, notifier = stack
-    with TestClient(build_autopilot_app(sup, run_loop=False), base_url="http://127.0.0.1:8807") as c:
+    with TestClient(build_autopilot_app(sup, run_loop=False, token=COCKPIT_TOKEN), base_url="http://127.0.0.1:8807",
+                    headers={"authorization": f"Bearer {COCKPIT_TOKEN}"}) as c:
         rpc(c, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
         yield c, sup, notifier
 
@@ -180,3 +182,30 @@ def test_service_loop_ticks_and_health(stack):
             time.sleep(0.05)
         body = c.get("/health").json()
         assert body["status"] == "ok" and body["kill_switch"] is False
+
+
+# ------------------------------------------------------------------ authentification cockpit (loopback)
+def test_cockpit_refuses_unauthenticated_local_callers(stack):
+    _, _, sup, _, _ = stack
+    app = build_autopilot_app(sup, run_loop=False, token=COCKPIT_TOKEN)
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}
+    hdr = {"accept": "application/json, text/event-stream", "content-type": "application/json"}
+    with TestClient(app, base_url="http://127.0.0.1:8807") as c:
+        assert c.post("/mcp", json=init, headers=hdr).status_code == 401
+        assert c.post("/mcp", json=init, headers={**hdr, "authorization": "Bearer " + "x" * 40}).status_code == 401
+        assert c.post("/mcp", json=init, headers={**hdr, "authorization": f"Bearer {COCKPIT_TOKEN}"}).status_code == 200
+        health = c.get("/health").json()
+        assert health["kill_switch"] in (True, False) and "disk" in health
+
+
+def test_service_refuses_to_start_without_cockpit_token(monkeypatch, tmp_path):
+    from orch_autopilot import service
+
+    monkeypatch.setenv("AUTOPILOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AUTOPILOT_PORT", "18999")
+    monkeypatch.delenv("AUTOPILOT_COCKPIT_TOKEN_FILE", raising=False)
+    monkeypatch.setattr(service.uvicorn, "run", lambda *a, **k: pytest.fail("ne doit pas démarrer"))
+    assert service.main(["run"]) == 2
+    key = tmp_path / "consent.key"
+    assert key.exists() and len(key.read_bytes()) == 32
