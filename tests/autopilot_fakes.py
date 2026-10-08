@@ -5,8 +5,45 @@ from __future__ import annotations
 import hashlib
 import json
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 from orch_autopilot.broker import BrokerUnavailable, check_start_payload
 from orch_autopilot.gate import GateResult
+from orch_protocol import evidence as EV
+
+RUNNER_ID = "autopilot-win-01"
+AGENT_SID = "S-1-5-21-1111111111-2222222222-3333333333-1010"
+RUNNER_SID = "S-1-5-21-1111111111-2222222222-3333333333-1009"
+ARTIFACT = "out/result.txt"
+
+
+class RunnerSigner:
+    """Joue le rôle du runner isolé (compte A) : signe des enveloppes runner_observed."""
+
+    def __init__(self) -> None:
+        self.key = Ed25519PrivateKey.generate()
+        self.pubkey = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+
+    def payload(self, job: dict, changed: list[dict] | None = None, **over) -> dict:
+        mode = job["payload"]["mode"]
+        if changed is None:
+            changed = [] if mode == "read_only" else [{"path": ARTIFACT, "op": "added", "sha256": "ab" * 32, "size": 12}]
+        p = {
+            "v": EV.VERSION, "runner_id": job["payload"]["runner_id"], "job_id": job["job_id"],
+            "workspace_id": job["payload"]["workspace_id"], "mode": mode, "exit_code": 0,
+            "started_at": job.get("created_at", 0.0) + 1, "finished_at": job.get("created_at", 0.0) + 2,
+            "tree_killed": True,
+            "attestation": {"ok": True, "agent_sid": AGENT_SID, "runner_sid": RUNNER_SID, "agent_is_admin": False,
+                            "agent_elevated": False, "probes": [{"probe": "read_runner_token", "denied": True}]},
+            "manifest": {"complete": True, "ads_checked": True, "alternate_streams": [], "reparse_points": [],
+                         "before_sha256": "00" * 32, "after_sha256": "11" * 32, "changed": changed},
+        }
+        p.update(over)
+        return p
+
+    def envelope(self, payload: dict) -> str:
+        return EV.encode_envelope(payload, self.key.sign)
 
 
 class Clock:
@@ -28,6 +65,8 @@ class FakeBroker:
         self.start_calls: list[dict] = []
         self.cancel_calls: list[str] = []
         self.opencode_available = True
+        self.signer: RunnerSigner | None = None  # si défini : finish() joint une enveloppe runner valide
+        self.clock = None
         self.down = False                # toute requête échoue AVANT application
         self.drop_response_once = False  # la création est appliquée puis la réponse est perdue
         self._n = 0
@@ -53,7 +92,8 @@ class FakeBroker:
         else:
             self._n += 1
             job_id = f"job-{self._n}"
-            self.jobs[job_id] = {"job_id": job_id, "state": "queued", "result_summary": None, "payload": payload}
+            self.jobs[job_id] = {"job_id": job_id, "state": "queued", "result_summary": None, "payload": payload,
+                                 "exit_code": None, "created_at": self.clock() if self.clock else 0.0}
             self.by_key[key] = (h, job_id)
             result = {"job_id": job_id, "state": "queued", "created": True}
         if self.drop_response_once:
@@ -65,7 +105,9 @@ class FakeBroker:
         if self.down:
             raise BrokerUnavailable("down")
         job = self.jobs.get(job_id)
-        return dict(job) if job else {"error": "unknown_job", "job_id": job_id}
+        if not job:
+            return {"error": "unknown_job", "job_id": job_id}
+        return {k: v for k, v in job.items() if k not in ("payload", "created_at")}
 
     def read_output(self, job_id: str) -> str:
         if self.down:
@@ -83,9 +125,18 @@ class FakeBroker:
         return {"result": "cancel_requested"}
 
     # pilotage test
-    def finish(self, job_id: str, state: str = "completed", output: str = "", summary: str | None = None) -> None:
-        self.jobs[job_id]["state"] = state
-        self.jobs[job_id]["result_summary"] = summary
+    def finish(self, job_id: str, state: str = "completed", output: str = "", summary: str | None = None,
+               changed: list[dict] | None = None, envelope: str | None = None, error: str | None = None) -> None:
+        job = self.jobs[job_id]
+        job["state"] = state
+        job["error"] = error
+        if state == "completed":
+            job["exit_code"] = 0
+        if envelope is None and self.signer is not None and state in ("completed", "failed"):
+            envelope = self.signer.envelope(self.signer.payload(job, changed))
+        if envelope is not None:
+            summary = envelope + ("\n" + summary if summary else "")
+        job["result_summary"] = summary
         self.outputs[job_id] = output
 
     def created_jobs(self) -> list[str]:

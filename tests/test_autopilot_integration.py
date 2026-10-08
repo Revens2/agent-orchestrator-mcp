@@ -15,15 +15,16 @@ from orch_autopilot.supervisor import Supervisor
 from orch_mcp.runner_api import RunnerAuth
 from orch_mcp.server import build_app as build_broker_app
 from orch_mcp.store import BrokerError, Store
-from tests.autopilot_fakes import MemoryNotifier
+from tests.autopilot_fakes import AGENT_SID, ARTIFACT, RUNNER_ID, MemoryNotifier, RunnerSigner
 from tests.test_mcp_tools import rpc
 
 MARK = "AUTOPILOT_STEP_OK"
+SIGNER = RunnerSigner()
 WS = [{"id": "e2e", "modes": ["read_only", "workspace_write"], "description": "sandbox"}]
 
 
 def hello(store, available=True, held=()):
-    return store.hello("main-windows-pc", {"runtimes": [{"id": "opencode", "available": available}], "workspaces": WS},
+    return store.hello(RUNNER_ID, {"runtimes": [{"id": "opencode", "available": available}], "workspaces": WS},
                        list(held))
 
 
@@ -35,23 +36,27 @@ def stack(tmp_path):
     with TestClient(app, base_url="http://127.0.0.1:8802") as http:
         broker = MCPBroker("http://127.0.0.1:8802/mcp", client=http)
         notifier = MemoryNotifier()
-        sup = Supervisor(AutopilotDB(tmp_path / "autopilot.db"), broker, Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False), notifier=notifier)
+        sup = Supervisor(AutopilotDB(tmp_path / "autopilot.db"), broker, Config(runner_id=RUNNER_ID, runner_pubkey=SIGNER.pubkey, expected_agent_sid=AGENT_SID, allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False), notifier=notifier)
         yield store, epoch, sup, broker, notifier
 
 
 def spec(kind="read"):
     return {"title": "smoke", "goal": "valider la chaîne", "steps": [
-        {"key": "s1", "kind": kind, "workspace_id": "e2e", "prompt": "réponds", "expect": {"markers": [MARK]}}]}
+        {"key": "s1", "kind": kind, "workspace_id": "e2e", "prompt": "réponds",
+         "expect": {"markers": [MARK], **({"artifacts": [ARTIFACT]} if kind == "local_write" else {})}}]}
 
 
-def runner_complete(store, epoch, output, state="completed"):
-    [c] = store.claim("main-windows-pc", epoch, 1)
+def runner_complete(store, epoch, output, state="completed", summary="fini", **over):
+    [c] = store.claim(RUNNER_ID, epoch, 1)
     jid, f = c["job_id"], c["fencing"]
-    store.transition("main-windows-pc", epoch, jid, f, "claimed", "starting")
-    store.transition("main-windows-pc", epoch, jid, f, "starting", "running")
-    store.event("main-windows-pc", epoch, jid, f, "evt-00000001", activity="working", output=output)
+    store.transition(RUNNER_ID, epoch, jid, f, "claimed", "starting")
+    store.transition(RUNNER_ID, epoch, jid, f, "starting", "running")
+    store.event(RUNNER_ID, epoch, jid, f, "evt-00000001", activity="working", output=output)
     if state == "completed":
-        store.transition("main-windows-pc", epoch, jid, f, "running", "completed", exit_code=0, result_summary="fini")
+        job = {"job_id": jid, "payload": {"runner_id": RUNNER_ID, "workspace_id": c["workspace_id"], "mode": c["mode"]},
+               "created_at": store.clock()}
+        env = SIGNER.envelope(SIGNER.payload(job, **over))
+        store.transition(RUNNER_ID, epoch, jid, f, "running", "completed", exit_code=0, result_summary=f"{env}\n{summary}")
     return c
 
 
@@ -66,7 +71,7 @@ def test_real_broker_read_step_done_and_payload_is_opencode(stack):
     s = step(sup, oid)
     assert s["state"] == A.RUNNING
     job = store.get_job(s["job_id"])
-    assert job["runtime"] == "opencode" and job["mode"] == "read_only" and job["runner_id"] == "main-windows-pc"
+    assert job["runtime"] == "opencode" and job["mode"] == "read_only" and job["runner_id"] == RUNNER_ID
     # rejeu des mêmes octets (réponse perdue) : le broker renvoie le même job
     payload = json.loads(sup.db.one("SELECT payload FROM outbox")["payload"])
     again = broker.start_job(payload)
@@ -87,7 +92,7 @@ def test_real_broker_lost_write_late_result_rejected(stack):
     assert store.get_job(c["job_id"])["state"] == "lost"
     assert step(sup, oid)["state"] == A.NEEDS_AUDIT
     with pytest.raises(BrokerError):  # résultat tardif refusé par le broker
-        store.transition("main-windows-pc", epoch, c["job_id"], c["fencing"], "running", "completed", exit_code=0)
+        store.transition(RUNNER_ID, epoch, c["job_id"], c["fencing"], "running", "completed", exit_code=0)
     sup.tick()
     assert step(sup, oid)["state"] == A.NEEDS_AUDIT
     assert len(store.list_jobs(limit=10)) == 1

@@ -17,6 +17,11 @@ from typing import Any
 from orch_autopilot import KINDS, PRODUCT_RUNTIMES
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+PUBKEY_RE = re.compile(r"^[0-9a-f]{64}$")
+SID_RE = re.compile(r"^S-1-5-21(-\d{1,10}){4}$")
+# Chemin relatif POSIX dans le workspace (glob autorisé pour allowed_paths) : ni absolu, ni lecteur, ni `..`.
+REL_PATH_RE = re.compile(r"^(?!/)(?![A-Za-z]:)(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9._*?/\[\]-]{1,200}$")
+MAX_ARTIFACTS = 20
 MAX_STEPS = 30
 MAX_PROMPT = 20_000
 TIMEOUT_MIN, TIMEOUT_MAX, TIMEOUT_DEFAULT = 60, 7_200, 1_500
@@ -72,28 +77,47 @@ class Config:
     backoff_max_s: float = 1800.0
     expected_served_model: str | None = None   # gate Opus : identité attendue ; None = jamais attestable
     tick_s: float = 5.0
-    # Par défaut : lecture + décisions seulement. local_write exige un compte Windows dédié déclaré
-    # (AUTOPILOT_RUNNER_DEDICATED_ACCOUNT=1) ET une approbation hors bande par tentative.
+    # Par défaut : lecture + décisions seulement. local_write exige une preuve runner_observed vérifiable :
+    # clé publique Ed25519 du runner + SID attendu du compte agent (attestation OS à CHAQUE job),
+    # ET une approbation hors bande par tentative. Aucune variable déclarative ne suffit.
     allowed_kinds: frozenset[str] = frozenset({"read", "decision"})
     local_write_needs_approval: bool = True
-    runner_dedicated_account: bool = False
+    runner_pubkey: str | None = None          # hex 32 octets ; None = runner sans preuve (agent_reported seul)
+    expected_agent_sid: str | None = None     # SID du compte Windows de l'agent (B), distinct du runner (A)
+    legacy_runners: frozenset[str] = frozenset({"main-windows-pc"})  # jamais d'écriture autonome
 
     def __post_init__(self) -> None:
         if self.runtime not in PRODUCT_RUNTIMES:
             raise PolicyError("runtime_forbidden", f"runtime produit interdit : {self.runtime!r} (OpenCode exclusif)")
         if not self.allowed_kinds <= set(KINDS):
             raise PolicyError("invalid_config", f"allowed_kinds inconnus : {sorted(self.allowed_kinds - set(KINDS))}")
+        if self.runner_pubkey is not None and not PUBKEY_RE.match(self.runner_pubkey):
+            raise PolicyError("invalid_config", "runner_pubkey : 64 caractères hex attendus")
+        if self.expected_agent_sid is not None and not SID_RE.match(self.expected_agent_sid):
+            raise PolicyError("invalid_config", "expected_agent_sid : SID Windows S-1-5-21-… attendu")
+        if "local_write" in self.allowed_kinds:
+            # refus au démarrage : pas d'écriture autonome sans preuve OS vérifiable par job
+            if self.runner_id in self.legacy_runners:
+                raise PolicyError("local_write_requires_isolated_runner",
+                                  f"local_write interdit sur le runner {self.runner_id!r} (compte personnel)")
+            if not (self.runner_pubkey and self.expected_agent_sid):
+                raise PolicyError("local_write_requires_runner_evidence",
+                                  "local_write exige AUTOPILOT_RUNNER_PUBKEY et AUTOPILOT_EXPECTED_AGENT_SID")
+
+    @property
+    def runner_evidence(self) -> bool:
+        return self.runner_pubkey is not None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
         env = dict(os.environ if env is None else env)
         ws = frozenset(w.strip() for w in env.get("AUTOPILOT_WORKSPACES", "e2e").split(",") if w.strip())
         kinds = frozenset(k.strip() for k in env.get("AUTOPILOT_ALLOWED_KINDS", "read,decision").split(",") if k.strip())
-        dedicated = env.get("AUTOPILOT_RUNNER_DEDICATED_ACCOUNT", "0") == "1"
-        if "local_write" in kinds and not dedicated:
-            # refus au démarrage : pas d'écriture autonome tant que l'OS ne confine pas le runner
-            raise PolicyError("local_write_requires_dedicated_account",
-                              "local_write activé sans compte Windows dédié déclaré (AUTOPILOT_RUNNER_DEDICATED_ACCOUNT=1)")
+        if "AUTOPILOT_RUNNER_DEDICATED_ACCOUNT" in env:
+            # ancienne déclaration de confiance : supprimée, sa présence signale une config obsolète
+            raise PolicyError("deprecated_config",
+                              "AUTOPILOT_RUNNER_DEDICATED_ACCOUNT supprimée : utiliser AUTOPILOT_RUNNER_PUBKEY + "
+                              "AUTOPILOT_EXPECTED_AGENT_SID (attestation vérifiée par job)")
         return cls(
             runner_id=env.get("AUTOPILOT_RUNNER_ID", "main-windows-pc"),
             workspaces=ws,
@@ -103,7 +127,8 @@ class Config:
             tick_s=float(env.get("AUTOPILOT_TICK_S", "5")),
             allowed_kinds=kinds,
             local_write_needs_approval=env.get("AUTOPILOT_LOCAL_WRITE_APPROVAL", "1") != "0",
-            runner_dedicated_account=dedicated,
+            runner_pubkey=env.get("AUTOPILOT_RUNNER_PUBKEY") or None,
+            expected_agent_sid=env.get("AUTOPILOT_EXPECTED_AGENT_SID") or None,
         )
 
 
@@ -170,6 +195,18 @@ def validate_objective(spec: dict, cfg: Config) -> dict:
             isinstance(f, str) and ID_RE.match(f) for f in fields_
         ):
             raise PolicyError("invalid_step", "expect.markers / expect.report_fields invalides")
+        artifacts = expect.get("artifacts", [])
+        allowed_paths = expect.get("allowed_paths", [])
+        for name, items, glob_ok in (("artifacts", artifacts, False), ("allowed_paths", allowed_paths, True)):
+            if not isinstance(items, list) or len(items) > MAX_ARTIFACTS or not all(
+                isinstance(p, str) and REL_PATH_RE.match(p) and (glob_ok or not any(c in p for c in "*?[")) for p in items
+            ):
+                raise PolicyError("invalid_step", f"expect.{name} : chemins relatifs POSIX sans '..' (max {MAX_ARTIFACTS})")
+        if kind == "local_write" and not artifacts:
+            # sans artefact attendu, une écriture « réussie » ne serait prouvée par rien
+            raise PolicyError("invalid_step", f"local_write exige expect.artifacts ({key})")
+        if kind == "read" and (artifacts or allowed_paths):
+            raise PolicyError("invalid_step", f"une étape read ne déclare pas d'artefacts ({key})")
         max_attempts = raw.get("max_attempts", budget.max_attempts_per_step)
         if not isinstance(max_attempts, int) or max_attempts < 1:
             raise PolicyError("invalid_step", "max_attempts entier >= 1")
@@ -183,7 +220,8 @@ def validate_objective(spec: dict, cfg: Config) -> dict:
                 "prompt": _text(raw.get("prompt"), "prompt", MAX_PROMPT),
                 "timeout_s": timeout,
                 "depends_on": depends,
-                "expect": {"markers": markers, "report_fields": fields_},
+                "expect": {"markers": markers, "report_fields": fields_, "artifacts": artifacts,
+                           "allowed_paths": allowed_paths},
                 # une décision est toujours structurante ; une étape peut l'être explicitement
                 "structural": bool(raw.get("structural", False)) or kind == "decision",
                 "max_attempts": min(max_attempts, budget.max_attempts_per_step),
@@ -207,6 +245,9 @@ RULES = (
 )
 
 
+UNTRUSTED_TAG_RE = re.compile(r"(?i)<\s*/?\s*donnees_non_fiables[^>]*>")
+
+
 def build_prompt(objective: dict, step: dict, upstream: list[dict]) -> str:
     """Prompt figé envoyé au worker. Les sorties d'étapes précédentes sont citées comme données."""
     parts = [
@@ -224,9 +265,9 @@ def build_prompt(objective: dict, step: dict, upstream: list[dict]) -> str:
     if expect.get("markers"):
         parts.append("Le message final DOIT contenir littéralement : " + " ; ".join(expect["markers"]))
     for up in upstream:
-        parts.append(
-            f"<donnees_non_fiables etape={up['key']}>\n{(up.get('result_text') or '')[:4000]}\n</donnees_non_fiables>"
-        )
+        # la donnée amont ne peut ni fermer ni rouvrir la balise (injection de prompt)
+        data = UNTRUSTED_TAG_RE.sub("[balise neutralisée]", (up.get("result_text") or "")[:4000])
+        parts.append(f"<donnees_non_fiables etape={up['key']}>\n{data}\n</donnees_non_fiables>")
     parts.append("Tâche :\n" + step["prompt"])
     return "\n\n".join(parts)
 

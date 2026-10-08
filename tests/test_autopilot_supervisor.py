@@ -11,7 +11,7 @@ from orch_autopilot.broker import MCPBroker, RuntimeForbidden, check_start_paylo
 from orch_autopilot.db import AutopilotDB
 from orch_autopilot.policy import Budget, Config, PolicyError
 from orch_autopilot.supervisor import AutopilotError, Supervisor
-from tests.autopilot_fakes import Clock, FakeBroker, FakeGate, MemoryNotifier
+from tests.autopilot_fakes import AGENT_SID, ARTIFACT, RUNNER_ID, Clock, FakeBroker, FakeGate, MemoryNotifier, RunnerSigner
 
 MARK = "AUTOPILOT_STEP_OK"
 
@@ -27,15 +27,20 @@ def read(key="r1", deps=(), **kw):
 
 def write(key="w1", deps=(), **kw):
     return {"key": key, "kind": "local_write", "workspace_id": "e2e", "prompt": "écris", "depends_on": list(deps),
-            "expect": {"markers": [MARK]}, **kw}
+            "expect": {"markers": [MARK], "artifacts": [ARTIFACT]}, **kw}
+
+
+def isolated_cfg(signer, **kw):
+    return Config(runner_id=RUNNER_ID, runner_pubkey=signer.pubkey, expected_agent_sid=AGENT_SID, **kw)
 
 
 @pytest.fixture
 def env(tmp_path):
     clock = Clock()
     broker = FakeBroker()
+    broker.signer, broker.clock = RunnerSigner(), clock
     notifier = MemoryNotifier()
-    cfg = Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, backoff_base_s=10, backoff_max_s=60, lost_grace_s=120, breaker_threshold=3, breaker_cooldown_s=300)
+    cfg = isolated_cfg(broker.signer, allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, backoff_base_s=10, backoff_max_s=60, lost_grace_s=120, breaker_threshold=3, breaker_cooldown_s=300)
     db = AutopilotDB(tmp_path / "autopilot.db", clock=clock)
     sup = Supervisor(db, broker, cfg, gate=FakeGate(), notifier=notifier, clock=clock, rng=random.Random(1))
 
@@ -83,7 +88,7 @@ def test_read_then_write_done_with_dependency_context(env):
     env.sup.tick()
     view = env.sup.objective(oid)
     assert view["state"] == A.OBJ_DONE
-    assert env.step(oid, "w1")["evidence"]["evidence_level"] == "agent_reported"
+    assert env.step(oid, "w1")["evidence"]["evidence_level"] == "runner_observed"
 
 
 def test_completed_without_validation_is_not_done(env):
@@ -239,7 +244,7 @@ def test_opencode_unavailable_blocked_worker_then_recovers(env):
 def test_rate_limit_cooldown_not_counted_then_breaker(env):
     oid = env.sup.submit(spec(read("r1", max_attempts=1)))["objective_id"]
     job = run_to_running(env, oid, "r1")
-    env.broker.finish(job, "failed", output="Error 429 Too Many Requests retry-after: 200")
+    env.broker.finish(job, "failed", error="exit code 1 | stderr: Error 429 Too Many Requests retry-after: 200")
     env.sup.tick()
     s = env.step(oid, "r1")
     assert s["state"] == A.COOLDOWN and s["not_before"] >= env.clock() + 200
@@ -250,7 +255,7 @@ def test_rate_limit_cooldown_not_counted_then_breaker(env):
     assert len(env.broker.created_jobs()) == 2  # tentative 429 non comptée malgré max_attempts=1
     for _ in range(2):
         j = env.step(oid, "r1")["job_id"]
-        env.broker.finish(j, "failed", output="rate limit exceeded")
+        env.broker.finish(j, "failed", error="stderr: rate limit exceeded")
         env.sup.tick()
         env.clock.advance(400)
         env.sup.tick()
@@ -261,7 +266,7 @@ def test_rate_limit_cap_fails_without_quota_evasion(env):
     oid = env.sup.submit(spec(read("r1"), budget={"max_rate_limit_waits": 1}))["objective_id"]
     for _ in range(2):
         env.sup.tick()
-        env.broker.finish(env.step(oid, "r1")["job_id"], "failed", output="429")
+        env.broker.finish(env.step(oid, "r1")["job_id"], "failed", error="stderr: 429")
         env.sup.tick()
         env.clock.advance(2000)
     s = env.step(oid, "r1")
@@ -385,7 +390,8 @@ def test_gate_unattested_blocks_structural_but_independent_steps_continue(env):
 
 
 def test_gate_attested_only_with_expected_model(env):
-    cfg = Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, expected_served_model="claude-opus-5-5")
+    signer = RunnerSigner()
+    cfg = isolated_cfg(signer, allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, expected_served_model="claude-opus-5-5")
     sup = env.restart(cfg=cfg, gate=FakeGate(served_model="claude-opus-5-5"))
     oid = sup.submit(spec({"key": "d1", "kind": "decision", "prompt": "q"}))["objective_id"]
     sup.tick()
@@ -484,17 +490,29 @@ def test_default_config_forbids_local_write(tmp_path):
     assert Config.from_env({}).allowed_kinds == frozenset({"read", "decision"})
 
 
-def test_local_write_refused_at_startup_without_dedicated_account():
+def test_local_write_refused_at_startup_without_runner_evidence():
     with pytest.raises(PolicyError) as exc:
-        Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write"})
-    assert exc.value.code == "local_write_requires_dedicated_account"
-    cfg = Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write", "AUTOPILOT_RUNNER_DEDICATED_ACCOUNT": "1"})
+        Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write", "AUTOPILOT_RUNNER_ID": RUNNER_ID})
+    assert exc.value.code == "local_write_requires_runner_evidence"
+    # l'ancienne déclaration de confiance est refusée, même avec la valeur 1
+    with pytest.raises(PolicyError) as exc:
+        Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write", "AUTOPILOT_RUNNER_DEDICATED_ACCOUNT": "1"})
+    assert exc.value.code == "deprecated_config"
+    # runner personnel : jamais d'écriture autonome, même avec clé
+    signer = RunnerSigner()
+    with pytest.raises(PolicyError) as exc:
+        Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write", "AUTOPILOT_RUNNER_PUBKEY": signer.pubkey,
+                         "AUTOPILOT_EXPECTED_AGENT_SID": AGENT_SID})
+    assert exc.value.code == "local_write_requires_isolated_runner"
+    cfg = Config.from_env({"AUTOPILOT_ALLOWED_KINDS": "read,local_write", "AUTOPILOT_RUNNER_ID": RUNNER_ID,
+                           "AUTOPILOT_RUNNER_PUBKEY": signer.pubkey, "AUTOPILOT_EXPECTED_AGENT_SID": AGENT_SID})
     assert "local_write" in cfg.allowed_kinds and cfg.local_write_needs_approval
 
 
 def test_local_write_needs_out_of_band_approval_per_attempt(tmp_path):
     clock, broker, notifier = Clock(), FakeBroker(), MemoryNotifier()
-    cfg = Config(allowed_kinds=frozenset({"read", "local_write", "decision"}))
+    broker.signer, broker.clock = RunnerSigner(), clock
+    cfg = isolated_cfg(broker.signer, allowed_kinds=frozenset({"read", "local_write", "decision"}))
     sup = Supervisor(AutopilotDB(tmp_path / "w.db", clock=clock), broker, cfg, notifier=notifier, clock=clock)
     oid = sup.submit(spec(write("w1")))["objective_id"]
     sup.tick()

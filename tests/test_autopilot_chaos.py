@@ -9,7 +9,9 @@ from orch_autopilot.broker import BrokerUnavailable
 from orch_autopilot.db import AutopilotDB
 from orch_autopilot.policy import Config
 from orch_autopilot.supervisor import Supervisor
-from tests.autopilot_fakes import Clock, FakeBroker
+from tests.autopilot_fakes import AGENT_SID, ARTIFACT, RUNNER_ID, Clock, FakeBroker, RunnerSigner
+
+SIGNER = RunnerSigner()
 
 MARK = "AUTOPILOT_STEP_OK"
 
@@ -44,13 +46,18 @@ class CrashingBroker(FakeBroker):
 
 
 def make(path, clock, broker, seed=0):
-    return Supervisor(AutopilotDB(path, clock=clock), broker, Config(allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, backoff_base_s=5, backoff_max_s=30, lost_grace_s=30),
+    if broker.signer is None:
+        broker.signer = SIGNER
+    broker.clock = clock
+    return Supervisor(AutopilotDB(path, clock=clock), broker, Config(runner_id=RUNNER_ID, runner_pubkey=broker.signer.pubkey,
+                      expected_agent_sid=AGENT_SID, allowed_kinds=frozenset({"read", "local_write", "decision"}), local_write_needs_approval=False, backoff_base_s=5, backoff_max_s=30, lost_grace_s=30),
                       clock=clock, rng=random.Random(seed))
 
 
 def spec(kind):
     return {"title": "c", "goal": "chaos", "steps": [
-        {"key": "s1", "kind": kind, "workspace_id": "e2e", "prompt": "p", "expect": {"markers": [MARK]}}]}
+        {"key": "s1", "kind": kind, "workspace_id": "e2e", "prompt": "p",
+         "expect": {"markers": [MARK], **({"artifacts": [ARTIFACT]} if kind == "local_write" else {})}}]}
 
 
 @pytest.mark.parametrize("point", ["before_apply", "after_apply", "reconcile", "read_output"])
@@ -84,8 +91,10 @@ def test_fuzz_invariants(tmp_path, seed):
     clock, broker = Clock(), CrashingBroker()
     path = tmp_path / "a.db"
     sup = make(path, clock, broker, seed)
-    steps = [{"key": f"s{i}", "kind": rng.choice(["read", "local_write"]), "workspace_id": "e2e", "prompt": "p",
-              "depends_on": [f"s{i - 1}"] if i and rng.random() < 0.5 else [], "expect": {"markers": [MARK]}}
+    kinds = [rng.choice(["read", "local_write"]) for _ in range(4)]
+    steps = [{"key": f"s{i}", "kind": kinds[i], "workspace_id": "e2e", "prompt": "p",
+              "depends_on": [f"s{i - 1}"] if i and rng.random() < 0.5 else [],
+              "expect": {"markers": [MARK], **({"artifacts": [ARTIFACT]} if kinds[i] == "local_write" else {})}}
              for i in range(4)]
     oid = sup.submit({"title": "f", "goal": "fuzz", "steps": steps})["objective_id"]
     honest_done: set[str] = set()  # jobs réellement terminés avec le contrat

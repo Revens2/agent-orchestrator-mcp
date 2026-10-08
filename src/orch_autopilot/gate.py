@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,21 @@ class UnavailableGate:
 
 def is_attested(result: GateResult, expected_served_model: str | None) -> bool:
     return bool(result.answer) and expected_served_model is not None and result.served_model == expected_served_model
+
+
+VERDICT_RE = re.compile(r"^[\W_]*(NO[- ]GO|GO)(?![\w-])")
+
+
+def verdict(answer: str | None) -> str | None:
+    """`GO` / `NO-GO` si la PREMIÈRE ligne non vide COMMENCE par l'un des deux ; sinon None (réponse invalide).
+
+    Un « GO » noyé plus loin dans le texte ne compte pas.
+    """
+    for line in (answer or "").splitlines():
+        if line.strip():
+            m = VERDICT_RE.match(line.strip().upper())
+            return m.group(1).replace(" ", "-") if m else None
+    return None
 
 
 # ------------------------------------------------------------------ notification
