@@ -7,7 +7,9 @@ set -euo pipefail
 SRC="${1:?dossier de sauvegarde requis}"; WITH_DB="${2:-}"
 RACINE="/srv/autopilot"
 (cd "$SRC" && sha256sum -c --quiet SHA256SUMS) || { echo "sauvegarde corrompue : abandon" >&2; exit 1; }
-SAFETY="$(bash "$RACINE/deploy/autopilot/snapshot.sh")"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# snapshot.sh du script courant, pas celui de la version installee (absent des versions anterieures)
+SAFETY="$(bash "$HERE/snapshot.sh")"
 echo "etat courant sauvegarde : $SAFETY"
 systemctl stop autopilot.service
 TRASH="$SAFETY/replaced"; install -d -m 700 "$TRASH"
