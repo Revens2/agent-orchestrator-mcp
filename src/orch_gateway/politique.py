@@ -103,3 +103,20 @@ class PolitiqueOutils:
                 return None
             return f"portee {self.portee_lecture} requise pour cet outil"
         return "outil inconnu ou non classe : appel refuse (fail-closed)"
+
+
+# Outils du cockpit autopilot (upstream orch_autopilot, instance de passerelle dediee).
+# autopilot_approve est un mutateur : il ne consomme un consentement qu'avec le code hors bande.
+OUTILS_AUTOPILOT_LECTURE: frozenset[str] = frozenset({"autopilot_status", "autopilot_list", "autopilot_handoff"})
+OUTILS_AUTOPILOT_ECRITURE: frozenset[str] = frozenset(
+    {"autopilot_submit", "autopilot_pause", "autopilot_resume", "autopilot_cancel", "autopilot_approve"}
+)
+
+
+def politique_depuis_nom(nom: str) -> PolitiqueOutils:
+    """`orch` (defaut, broker) ou `autopilot` (cockpit). Tout autre nom : erreur au demarrage (fail-closed)."""
+    if nom == "orch":
+        return PolitiqueOutils()
+    if nom == "autopilot":
+        return PolitiqueOutils(lecture=OUTILS_AUTOPILOT_LECTURE, ecriture=OUTILS_AUTOPILOT_ECRITURE)
+    raise RuntimeError(f"ORCH_GW_POLICY inconnue : {nom!r}")

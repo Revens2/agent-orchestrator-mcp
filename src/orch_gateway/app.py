@@ -28,13 +28,14 @@ from starlette.routing import Route
 
 from orch_gateway.consentement import routes_consentement
 from orch_gateway.oauth import PORTEE, PORTEES, FournisseurOAuth, MagasinOAuth
-from orch_gateway.politique import PolitiqueOutils
+from orch_gateway.politique import politique_depuis_nom
 from orch_gateway.upstream import ProxyMCP
 
 PORT_PAR_DEFAUT = 8801
 CHEMIN_MCP = "/mcp"
 # Politique d'autorisation explicite : lecture/ecriture par outil, inconnu -> fail-closed.
-POLITIQUE = PolitiqueOutils()
+# ORCH_GW_POLICY=autopilot : instance dediee au cockpit autopilot (defaut : outils du broker orch).
+POLITIQUE = politique_depuis_nom(os.environ.get("ORCH_GW_POLICY", "orch").strip() or "orch")
 
 
 def _config() -> tuple[str, str, int, str, str]:
@@ -57,6 +58,18 @@ def _config() -> tuple[str, str, int, str, str]:
     if jeton and len(jeton) < 32:
         raise RuntimeError("ORCH_GW_TOKEN trop court : 32 caracteres minimum")
     return emetteur, upstream, port, jeton, os.environ.get("ORCH_GW_OAUTH_DIR", "")
+
+
+def _jeton_upstream() -> str | None:
+    """Jeton optionnel presente a l'upstream (fichier 0640, jamais en clair dans l'environnement)."""
+    chemin = os.environ.get("ORCH_GW_UPSTREAM_TOKEN_FILE", "").strip()
+    if not chemin:
+        return None
+    with open(chemin, encoding="utf-8") as fh:
+        jeton = fh.read().strip()
+    if len(jeton) < 32:
+        raise RuntimeError("ORCH_GW_UPSTREAM_TOKEN_FILE : jeton de 32 caracteres minimum")
+    return jeton
 
 
 def _sante(_: Request) -> JSONResponse:
@@ -90,7 +103,7 @@ def construire_application(
         magasin=MagasinOAuth(repertoire=repertoire_oauth) if repertoire_oauth else None,
         jeton_statique=jeton,
     )
-    proxy = ProxyMCP(upstream, politique=POLITIQUE)
+    proxy = ProxyMCP(upstream, politique=POLITIQUE, jeton_upstream=_jeton_upstream())
 
     # Spec strict: resource = https://mymcps.duckdns.org/{service}/mcp, issuer = https://mymcps.duckdns.org/oauth/{service}
     resource_url_str = emetteur.replace("/oauth", "") + CHEMIN_MCP if "/oauth" in emetteur else f"{emetteur}{CHEMIN_MCP}"

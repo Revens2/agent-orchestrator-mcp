@@ -92,7 +92,7 @@ class LaunchError(Exception):
 class JobProcess:
     """Processus agent + son Job Object."""
 
-    def __init__(self, argv: list[str], cwd: str, env: dict[str, str]) -> None:
+    def __init__(self, argv: list[str], cwd: str, env: dict[str, str], logon: tuple[str, str] | None = None) -> None:
         if not IS_WINDOWS:
             raise LaunchError("winproc réservé à Windows")
         exe = argv[0]
@@ -108,20 +108,30 @@ class JobProcess:
         if not kernel32.SetInformationJobObject(self.job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)):
             self._close_job()
             raise LaunchError(f"SetInformationJobObject a échoué ({ctypes.get_last_error()})")
-        try:
-            self.proc = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-            )
-        except OSError as exc:
-            self._close_job()
-            raise LaunchError(f"CreateProcess a échoué : {exc}") from exc
+        if logon is not None:
+            # compte agent (B) : CreateProcessWithLogonW, suspendu, puis rattaché au même Job Object
+            from orch_runner.isolation import IsolationError, LogonPopen
+
+            try:
+                self.proc = LogonPopen(argv, cwd, env, user=logon[0], password=logon[1], suspended=True)
+            except IsolationError as exc:
+                self._close_job()
+                raise LaunchError(str(exc)) from exc
+        else:
+            try:
+                self.proc = subprocess.Popen(
+                    argv,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                )
+            except OSError as exc:
+                self._close_job()
+                raise LaunchError(f"CreateProcess a échoué : {exc}") from exc
         if not kernel32.AssignProcessToJobObject(self.job, int(self.proc._handle)):
             err = ctypes.get_last_error()
             self.proc.kill()

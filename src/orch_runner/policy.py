@@ -15,6 +15,7 @@ import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import orch_protocol as P
 from orch_runner import winproc
@@ -71,6 +72,8 @@ class Config:
     # Re-probe des seuls runtimes indisponibles (backoff exponentiel borné).
     runtime_refresh_min_s: int = 60
     runtime_refresh_max_s: int = 900
+    # Runner isolé (autopilot) : agent sous un second compte + preuves signées. None = runner historique.
+    isolation: Any = None
 
     @staticmethod
     def load(path: Path | None = None) -> Config:
@@ -111,6 +114,7 @@ class Config:
             permission_policy=policy,
             runtime_refresh_min_s=max(10, int(raw.get("runtime_refresh_min_s", 60))),
             runtime_refresh_max_s=max(10, int(raw.get("runtime_refresh_max_s", 900))),
+            isolation=_isolation(raw.get("isolation")),
         )
 
 
@@ -143,6 +147,17 @@ def resolve_workspace(ws: Workspace) -> str:
     if getattr(st, "st_file_attributes", 0) & winproc.FILE_ATTRIBUTE_REPARSE_POINT:
         raise PolicyError("workspace_denied", "workspace = point d'analyse (reparse point)")
     return real
+
+
+def _isolation(raw: dict | None):
+    if not raw:
+        return None
+    from orch_runner.isolation import IsolationConf, IsolationError
+
+    try:
+        return IsolationConf.from_toml(raw)
+    except (IsolationError, KeyError, ValueError) as exc:
+        raise PolicyError("config", f"section [isolation] invalide : {exc}") from exc
 
 
 def child_env(job_id: str, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -186,3 +201,15 @@ def generate_token(path: Path) -> str:
 
 def load_token(path: Path) -> str:
     return _dpapi(path.read_bytes(), False).decode()
+
+
+def store_secret(path: Path, data: bytes) -> None:
+    """Secret chiffré DPAPI du compte courant (A) : illisible par le compte agent (B), même copié."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(_dpapi(data, True))
+    os.replace(tmp, path)
+
+
+def load_secret(path: Path) -> bytes:
+    return _dpapi(path.read_bytes(), False)
