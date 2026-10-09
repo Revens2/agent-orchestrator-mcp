@@ -44,8 +44,32 @@ curl -s 127.0.0.1:$AUTOPILOT_PORT/health
 Rollback : `sudo bash /srv/autopilot/deploy/autopilot/rollback.sh` (rien n'est effacé ; stack orch, nginx,
 orch.db intacts). L'install staging ne modifie ni `/srv/orch` ni nginx.
 
-## Conditions P0 avant production (non remplies au 2026-10-08)
+## Mode trusted_personal_runner (pivot V1, opt-in explicite)
 
+Second mode de confiance, SANS compte Windows supplémentaire, SANS isolation OS prétendue.
+Le worker tourne sous le compte personnel actuel (ex. `main-windows-pc` / Juliann) avec ses
+fichiers, projets et connexions existantes. Gouvernance des irréversibles conservée
+(kill switch, budgets, anti-replay, outbox, approbation hors bande par tentative pour
+`local_write` par défaut, gate cockpit `action_hash` pour paiement/publication/prod/push).
+
+Activation (staging ou local, jamais en prod sans décision explicite) :
+```
+AUTOPILOT_TRUST_MODE=trusted_personal_runner
+AUTOPILOT_PERSONAL_ACK=I-UNDERSTAND-NO-ISOLATION
+AUTOPILOT_RUNNER_ID=main-windows-pc
+AUTOPILOT_ALLOWED_KINDS=read,decision,local_write
+```
+Sans les deux premières lignes EXACTES, le superviseur refuse de démarrer
+(`personal_ack_required`) ; le défaut reste `isolated` (comportement historique inchangé :
+`local_write` interdit sur `main-windows-pc`, enveloppe signée + SID B distinct exigés).
+
+Preuves honnêtes : `agent_reported` (runner historique sans signature) ou
+`runner_observed_same_user` (enveloppe signée même-SID : lie le manifeste au job déclaré,
+sans prétendre à une isolation). Le superviseur ne produit JAMAIS `externally_verified`.
+`workspace_write` du broker N'EST PAS un sandbox : le périmètre réel = workspaces explicites
+par projet + chemins `artifacts`/`allowed_paths` de la spec + approbation humaine.
+
+## Conditions P0 avant production (non remplies au 2026-10-08)
 - Runner Windows sous compte dédié non admin + ACL limitant l'écriture au workspace sandbox
   (aujourd'hui : compte personnel, confinement par code seulement).
 - Identité du modèle Opus attestable (`served_model_last` non nul) ou acceptation explicite du repli humain.

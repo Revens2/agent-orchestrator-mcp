@@ -30,3 +30,15 @@ Objectif : P0 sécurité + E2E réels (mission « correction P0, intégration et
 
 ## Risques résiduels V1
 Voir `SECURITY-P0.md` (egress de B, persistance profil B, état initial du workspace non vérifié, opus non attesté).
+
+## Pivot trusted_personal_runner (2026-10-09, intention utilisateur : aucun compte supplémentaire)
+- Second mode opt-in `AUTOPILOT_TRUST_MODE=trusted_personal_runner` + `AUTOPILOT_PERSONAL_ACK=I-UNDERSTAND-NO-ISOLATION`
+  (défaut `isolated` inchangé ; `legacy_runners` conservé ; preuves honnêtes `agent_reported` /
+  `runner_observed_same_user`, jamais `externally_verified`). Détails : `TRUSTED_PERSONAL_RUNNER.md`.
+- Code : `policy.py` (trust_mode/ack), `evidence.py` (`allow_same_user`), `supervisor.py` (local_write
+  personnel sans enveloppe => contrat `agent_reported`, même-SID signé => `runner_observed_same_user`).
+  Runner historique `main-windows-pc` non modifié (sans isolation, `opencode` actif).
+- Tests : `test_autopilot_personal.py` 10 passed (négatifs opt-in/faux DONE/rejeu/approbation) ;
+  suite autopilot 146 passed / 2 skipped ; E2E local read→local_write DONE sur fixture `.e2e-personal/`
+  (82 o, mise en corbeille après constat). Staging INCHANGÉ (SSH sans clé : `Permission denied`) :
+  déploiement + restart service Autopilot seul + démo RAG/GitHub/Brave = BLOCKED précis au rapport.

@@ -25,6 +25,12 @@ MAX_ARTIFACTS = 20
 MAX_STEPS = 30
 MAX_PROMPT = 20_000
 TIMEOUT_MIN, TIMEOUT_MAX, TIMEOUT_DEFAULT = 60, 7_200, 1_500
+# Modes de confiance V1. `isolated` = défaut conservateur (runner dédié, deux comptes,
+# enveloppe signée + SID agent distinct exigés pour local_write). `trusted_personal_runner`
+# = second mode EXPLICITE opt-in : même compte Windows personnel, aucune isolation OS
+# prétendue, preuves honnêtes agent_reported / runner_observed_same_user uniquement.
+TRUST_MODES = ("isolated", "trusted_personal_runner")
+PERSONAL_ACK = "I-UNDERSTAND-NO-ISOLATION"
 
 
 class PolicyError(ValueError):
@@ -88,16 +94,36 @@ class Config:
     runner_pubkey: str | None = None          # hex 32 octets ; None = runner sans preuve (agent_reported seul)
     expected_agent_sid: str | None = None     # SID du compte Windows de l'agent (B), distinct du runner (A)
     legacy_runners: frozenset[str] = frozenset({"main-windows-pc"})  # jamais d'écriture autonome
+    # Second mode de confiance, opt-in explicite uniquement (défaut : isolated).
+    trust_mode: str = "isolated"
+    # Accusé de réception obligatoire en mode personnel : prouve une activation claire et
+    # authentifiée par configuration (pas de valeur déclarative silencieuse).
+    personal_ack: str | None = None
 
     def __post_init__(self) -> None:
         if self.runtime not in PRODUCT_RUNTIMES:
             raise PolicyError("runtime_forbidden", f"runtime produit interdit : {self.runtime!r} (OpenCode exclusif)")
+        if self.trust_mode not in TRUST_MODES:
+            raise PolicyError("invalid_config", f"trust_mode inconnu : {self.trust_mode!r} (attendus : {list(TRUST_MODES)})")
         if not self.allowed_kinds <= set(KINDS):
             raise PolicyError("invalid_config", f"allowed_kinds inconnus : {sorted(self.allowed_kinds - set(KINDS))}")
         if self.runner_pubkey is not None and not PUBKEY_RE.match(self.runner_pubkey):
             raise PolicyError("invalid_config", "runner_pubkey : 64 caractères hex attendus")
         if self.expected_agent_sid is not None and not SID_RE.match(self.expected_agent_sid):
             raise PolicyError("invalid_config", "expected_agent_sid : SID Windows S-1-5-21-… attendu")
+        if self.trust_mode == "trusted_personal_runner":
+            # Activation opt-in authentifiée : l'opérateur déclare explicitement accepter
+            # l'absence d'isolation OS sur le compte personnel. Sans cet accusé, refus.
+            if self.personal_ack != PERSONAL_ACK:
+                raise PolicyError("personal_ack_required",
+                                  "trusted_personal_runner exige AUTOPILOT_PERSONAL_ACK=I-UNDERSTAND-NO-ISOLATION")
+            # En mode personnel, local_write sur le runner personnel est autorisé PAR CONFIGURATION
+            # explicite, avec preuves honnêtes (agent_reported, ou runner_observed_same_user si enveloppe
+            # signée même-utilisateur). Aucune attestation d'isolation n'est prétendue, et le niveau
+            # `externally_verified` n'est jamais produit. L'approbation par tentative reste exigée
+            # par défaut (local_write_needs_approval=True) sauf configuration explicite contraire.
+            # Le mode isolated reste inchangé (voir branche ci-dessous).
+            return
         if "local_write" in self.allowed_kinds:
             # refus au démarrage : pas d'écriture autonome sans preuve OS vérifiable par job
             if self.runner_id in self.legacy_runners:
@@ -110,6 +136,10 @@ class Config:
     @property
     def runner_evidence(self) -> bool:
         return self.runner_pubkey is not None
+
+    @property
+    def is_personal(self) -> bool:
+        return self.trust_mode == "trusted_personal_runner"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -134,6 +164,8 @@ class Config:
             local_write_needs_approval=env.get("AUTOPILOT_LOCAL_WRITE_APPROVAL", "1") != "0",
             runner_pubkey=env.get("AUTOPILOT_RUNNER_PUBKEY") or None,
             expected_agent_sid=env.get("AUTOPILOT_EXPECTED_AGENT_SID") or None,
+            trust_mode=(env.get("AUTOPILOT_TRUST_MODE", "isolated") or "isolated").strip(),
+            personal_ack=env.get("AUTOPILOT_PERSONAL_ACK") or None,
         )
 
 

@@ -2,10 +2,16 @@
 
 Niveaux de preuve (du plus faible au plus fort) :
 - `agent_reported`      : marqueurs / rapport JSON écrits par l'agent. Ne prouve rien.
-- `runner_observed`     : enveloppe produite par le runner (compte A), signée Ed25519 avec une clé
+- `runner_observed`     : enveloppe produite par le runner isolé (compte A), signée Ed25519 avec une clé
                           que le compte de l'agent (B) ne peut pas lire. Contient le diff de manifeste
-                          du workspace (avant/après, arbre de processus tué) et l'attestation OS.
-- `externally_verified` : vérification par un tiers (git distant, CI, API). Non utilisé en V1.
+                          du workspace (avant/après, arbre de processus tué) et l'attestation OS
+                          (deux identités distinctes, sondes refusées).
+- `runner_observed_same_user` : enveloppe signée par le runner PERSONNEL (même compte Windows,
+                          mode `trusted_personal_runner`) : prouve que le job a tourné sur le runner
+                          déclaré et lie le manifeste, mais NE prétend à AUCUNE isolation OS ni à une
+                          attestation indépendante (agent_sid == runner_sid accepté, sondes non exigées).
+- `externally_verified` : vérification par un tiers (git distant, CI, API). Non utilisé en V1,
+                          et JAMAIS produit par le superviseur (ni en mode isolé, ni en mode personnel).
 
 Transport : PREMIÈRE ligne de `result_summary` (champ écrit par le runner, jamais par l'agent ;
 le broker coupe en queue, la tête est conservée). Format : `AUTOPILOT-EVIDENCE-V1 <zlib(payload)_hex>.<sig_hex>`,
@@ -140,8 +146,16 @@ class Binding:
     prompt_sha256: str | None = None
 
 
-def check_payload(payload: dict, exp: Expectation, bind: Binding) -> list[str]:
-    """Renvoie la liste des violations (vide = preuve runner_observed acceptée)."""
+def check_payload(payload: dict, exp: Expectation, bind: Binding, allow_same_user: bool = False) -> list[str]:
+    """Renvoie la liste des violations (vide = preuve runner_observed acceptée).
+
+    `allow_same_user=True` (mode `trusted_personal_runner` uniquement) : accepte une enveloppe
+    signée du runner personnel où agent et runner partagent le même SID Windows. Les contrôles
+    d'isolation (deux identités distinctes, non-admin, sondes refusées, attestation ok) sont
+    remplacés par un contrôle d'identité même-utilisateur honnête ; les contrôles de liaison
+    (runner/job/workspace/mode/exit/prompt/fraîcheur/arbre) et de manifeste restent intacts.
+    Ne produit jamais `externally_verified`.
+    """
     v: list[str] = []
 
     def need(cond: bool, code: str) -> None:
@@ -162,6 +176,15 @@ def check_payload(payload: dict, exp: Expectation, bind: Binding) -> list[str]:
     att = payload.get("attestation")
     if not isinstance(att, dict):
         v.append("attestation_missing")
+    elif allow_same_user:
+        # Mode personnel : aucune isolation prétendue. On exige une identité même-utilisateur
+        # explicite (agent_sid == runner_sid, deux SIDs présents), sans exiger sondes refusées,
+        # non-admin, ni attestation ok. Les sondes éventuelles sont conservées telles quelles
+        # dans l'enveloppe à titre informatif, jamais comme preuve d'enfermement.
+        same = att.get("agent_sid") and att.get("agent_sid") == att.get("runner_sid")
+        need(bool(same), "personal_identity_mismatch")
+        if bind.expected_agent_sid is not None:
+            need(att.get("agent_sid") == bind.expected_agent_sid, "agent_sid_mismatch")
     else:
         need(att.get("ok") is True, "attestation_failed")
         need(att.get("agent_is_admin") is False, "agent_admin")

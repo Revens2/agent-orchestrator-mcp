@@ -735,7 +735,12 @@ class Supervisor:
             observed = self._runner_evidence(db, st, job, expect)
             if observed is not None:
                 evidence["runner"] = observed
-                evidence["evidence_level"] = "runner_observed" if not observed["violations"] else "agent_reported"
+                personal = bool(getattr(self.cfg, "is_personal", False))
+                evidence["evidence_level"] = (
+                    "runner_observed_same_user" if personal and not observed["violations"]
+                    else "runner_observed" if not observed["violations"] else "agent_reported")
+                # Garde honnêteté : le superviseur ne produit jamais `externally_verified`.
+                assert evidence["evidence_level"] != "externally_verified"
                 if observed["violations"]:
                     # preuve absente/invalide ou workspace modifié hors contrat : jamais DONE
                     if st["kind"] == "local_write" or observed["workspace_touched"]:
@@ -745,9 +750,15 @@ class Supervisor:
                         self._after_failure(db, st, "runner_evidence_rejected", now, evidence)
                     return
             elif st["kind"] == "local_write":
-                # défense en profondeur : la config interdit déjà local_write sans clé runner
-                self._step(db, st, A.NEEDS_AUDIT, evidence=evidence, reason="local_write sans preuve runner_observed")
-                return
+                # défense en profondeur : en mode isolé, la config interdit déjà local_write sans clé
+                # runner. En mode personnel (`trusted_personal_runner`, opt-in explicite), l'absence
+                # d'enveloppe est HONNÊTE (runner historique sans signature) : le contrat de sortie
+                # (agent_reported) s'applique, sans prétendre à une attestation OS.
+                if bool(getattr(self.cfg, "is_personal", False)):
+                    pass
+                else:
+                    self._step(db, st, A.NEEDS_AUDIT, evidence=evidence, reason="local_write sans preuve runner_observed")
+                    return
             if ok:
                 self._breaker_reset(db)
                 self._step(db, st, A.DONE, evidence=evidence, result_text=text[-MAX_RESULT_CHARS:])
@@ -795,7 +806,8 @@ class Supervisor:
             payload = EV.decode_envelope(job.get("result_summary"), self._verify)
         except EV.EvidenceError as exc:
             return {"violations": [exc.code], "workspace_touched": st["kind"] != "read"}
-        violations = EV.check_payload(payload, exp, bind)
+        personal = bool(getattr(self.cfg, "is_personal", False))
+        violations = EV.check_payload(payload, exp, bind, allow_same_user=personal)
         man = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else {}
         changed = man.get("changed") if isinstance(man.get("changed"), list) else None
         return {
