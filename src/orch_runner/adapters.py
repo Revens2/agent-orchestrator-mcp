@@ -19,6 +19,11 @@ from typing import Any
 import orch_protocol as P
 from orch_runner import desktop_patch as DP
 
+# Plateforme vue par les adapters (indirection testable : les tests simulent
+# POSIX en patchant `adapters.PLATFORM`, jamais `os.name` global qui casserait
+# pathlib sur Windows).
+PLATFORM = os.name
+
 
 @dataclass
 class Launch:
@@ -32,6 +37,29 @@ class Outcome:
     ok: bool
     summary: str | None
     error: str | None
+
+
+def _creationflags() -> int:
+    """CREATE_NO_WINDOW sur Windows uniquement (inconnu sous POSIX)."""
+    return 0x08000000 if PLATFORM == "nt" else 0
+
+
+def _check_executable(exe: str) -> str | None:
+    """Retourne None si l'exécutable est accepté, sinon la raison du refus."""
+    if not isinstance(exe, str) or not exe or "\x00" in exe:
+        return "exécutable invalide"
+    if not os.path.isabs(exe):
+        return "exécutable absent ou non absolu"
+    if PLATFORM == "nt":
+        if not (exe.lower().endswith(".exe") and os.path.isfile(exe)):
+            return "exécutable absent ou non .exe"
+        return None
+    # POSIX (Linux ARM64) : fichier régulier exécutable, pas d'exigence .exe.
+    if not os.path.isfile(exe):
+        return "exécutable absent"
+    if not os.access(exe, os.X_OK):
+        return "exécutable non exécutable (bit X absent)"
+    return None
 
 
 class Adapter:
@@ -53,13 +81,14 @@ class Adapter:
     # -- découverte
     def probe(self) -> dict[str, Any]:
         info: dict[str, Any] = {"id": self.id, "available": False, "modes": list(self.modes)}
-        if not (os.path.isabs(self.exe) and self.exe.lower().endswith(".exe") and os.path.isfile(self.exe)):
-            info["reason"] = "exécutable absent ou non .exe"
+        reason = _check_executable(self.exe)
+        if reason is not None:
+            info["reason"] = reason
             return info
         try:
             out = subprocess.run(
                 [self.exe, *self.version_args()], capture_output=True, text=True, timeout=20,
-                creationflags=0x08000000, encoding="utf-8", errors="replace",
+                creationflags=_creationflags(), encoding="utf-8", errors="replace",
             )
             info["version"] = (out.stdout or out.stderr).strip().splitlines()[0][:80] if (out.stdout or out.stderr) else ""
             info["available"] = out.returncode == 0
@@ -287,7 +316,7 @@ class OpenCode(Adapter):
                 out = subprocess.run(
                     [self.exe, "run", "--agent", "plan", *self._model(), "--format", "json", "--dir", tmp, "--", "Reply OK."],
                     capture_output=True, text=True, timeout=int(self.extra.get("probe_timeout_s", 120)),
-                    creationflags=0x08000000, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                    creationflags=_creationflags(), encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                 )
                 events = [d for d in map(_json, (out.stdout or "").splitlines()) if d]
                 errors = [d for d in events if d.get("type") == "error"]
@@ -396,17 +425,22 @@ class ClaudeDesktop(Adapter):
 
     def probe(self) -> dict[str, Any]:
         info: dict[str, Any] = {"id": self.id, "available": False, "modes": list(self.modes)}
+        if PLATFORM != "nt":
+            # MSIX + UIA : Windows uniquement, jamais disponible sous Linux.
+            info["reason"] = "windows-only (MSIX/UIA indisponible sous Linux)"
+            return info
         if not os.path.isfile(self._bridge):
             info["reason"] = "bridge introuvable"
             return info
-        if not (os.path.isabs(self.exe) and self.exe.lower().endswith(".exe") and os.path.isfile(self.exe)):
-            info["reason"] = "exécutable absent ou non .exe"
+        reason = _check_executable(self.exe)
+        if reason is not None:
+            info["reason"] = reason
             return info
         try:
             out = subprocess.run(
                 [self.exe, self._bridge, "--verify-only", "--profile", self._profile()],
                 capture_output=True, text=True, timeout=int(self.extra.get("verify_timeout_s", 90)),
-                creationflags=0x08000000, encoding="utf-8", errors="replace",
+                creationflags=_creationflags(), encoding="utf-8", errors="replace",
                 stdin=subprocess.DEVNULL,
             )
             tail = ((out.stdout or "") + (out.stderr or "")).strip().splitlines()
@@ -419,6 +453,8 @@ class ClaudeDesktop(Adapter):
         return info
 
     def build(self, prompt, mode, cwd, tmpdir):
+        if PLATFORM != "nt":
+            raise ValueError("claude-desktop : Windows uniquement (MSIX/UIA)")
         if mode not in self.modes:
             raise ValueError(f"claude-desktop : mode {mode} non supporté (attendus : {', '.join(self.modes)})")
         self._workspace_cwd = cwd

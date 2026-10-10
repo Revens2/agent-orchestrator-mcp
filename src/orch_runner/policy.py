@@ -19,12 +19,18 @@ from pathlib import Path
 import orch_protocol as P
 from orch_runner import winproc
 
+try:
+    from orch_runner import posproc
+except ImportError:  # pragma: no cover - vieux Python sans fcntl (Windows)
+    posproc = None  # type: ignore[assignment]
+
 # Hors AppData : les apps MSIX (ex. Claude Desktop) virtualisent AppData\Local pour leurs
 # processus enfants ; une tâche planifiée ne verrait alors ni config ni jeton.
 DEFAULT_HOME = Path(os.environ.get("ORCH_RUNNER_HOME", str(Path.home() / ".orch-runner")))
 
 # Variables transmises aux agents. Tout le reste de l'environnement du runner est retiré.
-ENV_ALLOW = (
+# Windows (inchangé) :
+ENV_ALLOW_WINDOWS = (
     "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP",
     "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
     "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES",
@@ -32,6 +38,16 @@ ENV_ALLOW = (
     "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "LANG", "TZ",
     "CLAUDE_CODE_GIT_BASH_PATH",
 )
+# POSIX (Linux ARM64) : PATH conservé (les CLIs node `codex`/`opencode`/`claude`
+# sont des scripts `#!/usr/bin/env node`), HOME/TMPDIR pour les caches outils.
+# Aucune clé d'API n'y figure : tout le reste est retiré comme sur Windows.
+ENV_ALLOW_POSIX = (
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "TMPDIR", "TEMP", "TMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+    "TERM",
+)
+# Compatibilité : nom historique = allowlist de la plateforme courante.
+ENV_ALLOW = ENV_ALLOW_WINDOWS if os.name == "nt" else ENV_ALLOW_POSIX
 
 
 class PolicyError(Exception):
@@ -71,6 +87,11 @@ class Config:
     # Re-probe des seuls runtimes indisponibles (backoff exponentiel borné).
     runtime_refresh_min_s: int = 60
     runtime_refresh_max_s: int = 900
+    # Linux : le groupe de processus n'est pas un Job Object (un descendant
+    # setsid/double-fork échappe au kill). Tant que cette isolation forte est
+    # impossible, workspace_write est REFUSÉ par défaut (fail-closed) ; passer
+    # à true assume explicitement ce risque. Sans effet sous Windows.
+    linux_allow_workspace_write: bool = False
 
     @staticmethod
     def load(path: Path | None = None) -> Config:
@@ -111,6 +132,7 @@ class Config:
             permission_policy=policy,
             runtime_refresh_min_s=max(10, int(raw.get("runtime_refresh_min_s", 60))),
             runtime_refresh_max_s=max(10, int(raw.get("runtime_refresh_max_s", 900))),
+            linux_allow_workspace_write=bool(raw.get("linux_allow_workspace_write", False)),
         )
 
 
@@ -118,10 +140,21 @@ class Config:
 def resolve_workspace(ws: Workspace) -> str:
     """Chemin canonique validé, ou PolicyError. Revalidé juste avant chaque lancement.
 
-    Refus : chemin relatif, UNC / \\\\?\\ / \\\\.\\, lecteur non fixe, `..`, dossier
-    absent, et tout lien symbolique / jonction sur le chemin (realpath doit
-    égaler le chemin configuré normalisé).
+    Windows (inchangé) : refus UNC et chemins device, lecteur non fixe, `..`,
+    dossier absent, et tout lien symbolique / jonction sur le chemin (realpath
+    doit égaler le chemin configuré normalisé).
+
+    POSIX (Linux) : absolu sans `..` ni NUL, hors préfixes système (/proc, /sys,
+    /dev, /run, /boot, /etc, /root, racine), dossier existant, realpath strict
+    égal au normalisé (aucun symlink/jonction sur le chemin), pas un point de
+    montage déguisé (lstat non-lien).
     """
+    if os.name == "nt":
+        return _resolve_workspace_windows(ws)
+    return _resolve_workspace_posix(ws)
+
+
+def _resolve_workspace_windows(ws: Workspace) -> str:
     raw = ws.path
     if raw.startswith(("\\\\", "//")):
         raise PolicyError("workspace_denied", "chemin UNC/device refusé")
@@ -142,6 +175,35 @@ def resolve_workspace(ws: Workspace) -> str:
         raise PolicyError("workspace_denied", "le workspace n'est pas un dossier")
     if getattr(st, "st_file_attributes", 0) & winproc.FILE_ATTRIBUTE_REPARSE_POINT:
         raise PolicyError("workspace_denied", "workspace = point d'analyse (reparse point)")
+    return real
+
+
+def _resolve_workspace_posix(ws: Workspace) -> str:
+    """Validation Linux (fail-closed). Voir `resolve_workspace`."""
+    raw = ws.path
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise PolicyError("workspace_denied", "chemin invalide")
+    if raw.startswith(("\\\\", "//")):
+        raise PolicyError("workspace_denied", "chemin UNC/device refusé")
+    if not os.path.isabs(raw) or ".." in Path(raw).parts:
+        raise PolicyError("workspace_denied", "chemin absolu sans '..' requis")
+    norm = os.path.normpath(raw)
+    if posproc is not None and not posproc.is_safe_path(norm):
+        raise PolicyError("workspace_denied", "chemin système refusé")
+    try:
+        real = os.path.realpath(raw, strict=True)
+    except OSError:
+        raise PolicyError("workspace_denied", "workspace introuvable")
+    if os.path.normpath(real) != norm:
+        raise PolicyError("workspace_denied", "lien symbolique dans le chemin du workspace")
+    try:
+        st = os.lstat(real)
+    except OSError:
+        raise PolicyError("workspace_denied", "workspace introuvable")
+    if not stat.S_ISDIR(st.st_mode):
+        raise PolicyError("workspace_denied", "le workspace n'est pas un dossier")
+    if stat.S_ISLNK(st.st_mode):
+        raise PolicyError("workspace_denied", "workspace = lien symbolique")
     return real
 
 
@@ -174,15 +236,45 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
 
 
 def generate_token(path: Path) -> str:
-    """Génère le jeton sur le PC, le stocke chiffré DPAPI (lié à l'utilisateur Windows).
-    Retourne UNIQUEMENT son empreinte SHA-256 à déclarer côté VPS : le jeton ne quitte jamais le PC."""
+    """Génère le jeton sur la machine du runner, le stocke localement.
+
+    Windows (inchangé) : chiffré DPAPI (lié à l'utilisateur Windows).
+    POSIX (Linux) : fichier brut mode 0600 (aucun DPAPI sous Linux).
+    Retourne UNIQUEMENT son empreinte SHA-256 à déclarer côté VPS : le jeton ne quitte jamais la machine."""
     token = secrets.token_urlsafe(48)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(_dpapi(token.encode(), True))
-    os.replace(tmp, path)
+    if os.name == "nt":
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(_dpapi(token.encode(), True))
+        os.replace(tmp, path)
+    else:
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(str(tmp), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, token.encode())
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     return hashlib.sha256(token.encode()).hexdigest()
 
 
 def load_token(path: Path) -> str:
-    return _dpapi(path.read_bytes(), False).decode()
+    if os.name == "nt":
+        return _dpapi(path.read_bytes(), False).decode()
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise PolicyError("token", "jeton : fichier régulier requis")
+    if st.st_mode & 0o077:
+        raise PolicyError("token", "jeton : permissions trop ouvertes (0600 requis)")
+    token = path.read_bytes().strip().decode()
+    if not token or len(token) < 32 or any(c.isspace() for c in token):
+        raise PolicyError("token", "jeton invalide")
+    return token

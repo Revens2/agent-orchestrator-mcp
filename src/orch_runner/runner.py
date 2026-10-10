@@ -3,8 +3,10 @@
 Boucles :
 - claim (long-poll 25 s) tant qu'il reste des slots ;
 - heartbeat (5 s) : présence, prolongation des bails, ordres cancel/abandon ;
-- un thread par job : validations locales -> starting -> processus suspendu dans
-  un Job Object -> running -> sortie bornée -> transition finale.
+- un thread par job : validations locales -> starting -> processus confiné
+  (Windows : Job Object suspendu puis repris ; Linux : groupe de processus
+  setsid, gel SIGSTOP best-effort puis SIGCONT) -> running -> sortie bornée
+  -> transition finale.
 Réconciliation : au (re)hello le runner déclare les jobs qu'il exécute réellement ;
 le broker marque `lost` ceux qu'il ne détient plus. Aucun prompt n'est relancé.
 """
@@ -13,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import platform
 import shutil
 import subprocess
 import threading
@@ -25,9 +29,17 @@ import httpx
 
 import orch_protocol as P
 from orch_protocol.redact import redact
-from orch_runner import winproc
+
+if os.name == "nt":
+    from orch_runner import winproc as procmod
+else:
+    from orch_runner import posproc as procmod
 from orch_runner.adapters import ADAPTERS, Adapter
 from orch_runner.policy import Config, PolicyError, child_env, load_token, resolve_workspace
+
+# Plateforme vue par le runner (indirection testable : patcher `runner.PLATFORM`,
+# jamais `os.name` global qui casserait pathlib sur Windows).
+PLATFORM = os.name
 
 VERSION = "0.2.0"
 log = logging.getLogger("orch.runner")
@@ -45,13 +57,12 @@ def _git_snapshot(path: str) -> dict[str, Any] | None:
     """Snapshot git borné d'un workspace (branch/HEAD/dirty), ou None si non
     observable (pas un dépôt, git absent, timeout). Jamais de secret : les trois
     champs seuls, sorties bornées, échec silencieux -> None."""
-    import os as _os
 
     def _run(args: list[str]) -> str | None:
         try:
             out = subprocess.run(
                 ["git", *args], cwd=path, capture_output=True, text=True, timeout=10,
-                creationflags=0x08000000 if _os.name == "nt" else 0,
+                creationflags=0x08000000 if os.name == "nt" else 0,
                 encoding="utf-8", errors="replace",
             )
         except Exception:  # noqa: BLE001 - snapshot best-effort : échec silencieux -> None
@@ -73,6 +84,14 @@ def _git_snapshot(path: str) -> dict[str, Any] | None:
 
 ABORT_CODES = {"stale_fencing", "state_conflict", "unknown_job", "invalid_transition"}
 RESYNC_CODES = {"superseded", "unknown_runner"}
+
+
+def workspace_write_allowed(cfg: Config) -> bool:
+    """Garde-fou POSIX : sans Job Object (isolation best-effort), workspace_write
+    est refusé sauf opt-in explicite `linux_allow_workspace_write`. Windows : inchangé."""
+    if PLATFORM == "nt":
+        return True
+    return bool(cfg.linux_allow_workspace_write)
 
 # Commande locale de reprise par runtime (affichée à ChatGPT Web avec l'ID).
 _RESUME_HINTS = {
@@ -145,7 +164,7 @@ class JobWorker(threading.Thread):
         self.cancel_event = threading.Event()
         self.abandon_event = threading.Event()
         self.state = P.CLAIMED
-        self.proc: winproc.JobProcess | None = None
+        self.proc: Any | None = None
         self._out_lock = threading.Lock()
         self._out: list[str] = []
         self._activity: str | None = None
@@ -310,6 +329,10 @@ class JobWorker(threading.Thread):
         adapter = ADAPTERS[job["runtime"]](rt.exe, rt.extra, cfg.permission_policy)
         if job["mode"] not in ws.modes or job["mode"] not in adapter.modes:
             return self._refuse("mode_denied", "mode non autorisé pour ce workspace/runtime")
+        if PLATFORM != "nt" and job["mode"] == "workspace_write" and not workspace_write_allowed(cfg):
+            # Isolation forte impossible sous Linux (groupe de processus
+            # best-effort, pas de Job Object) : fail-closed par défaut.
+            return self._refuse("workspace_write_restricted", "workspace_write désactivé sous Linux (linux_allow_workspace_write=false)")
         prompt = job.get("prompt")
         if not isinstance(prompt, str) or not prompt or "\x00" in prompt or len(prompt) > P.MAX_PROMPT_CHARS:
             return self._refuse("invalid_prompt", "prompt invalide")
@@ -324,9 +347,9 @@ class JobWorker(threading.Thread):
         tmpdir.mkdir(parents=True, exist_ok=True)
         try:
             launch = adapter.build(prompt, job["mode"], cwd, tmpdir)
-            self.proc = winproc.JobProcess(launch.argv, cwd, child_env(self.job_id, launch.env_extra))
+            self.proc = procmod.JobProcess(launch.argv, cwd, child_env(self.job_id, launch.env_extra))
             self.proc_started_at = time.time()
-        except (winproc.LaunchError, ValueError, OSError) as exc:
+        except (procmod.LaunchError, ValueError, OSError) as exc:
             shutil.rmtree(tmpdir, ignore_errors=True)
             return self._transition(P.FAILED, error=f"launch_failed: {exc}") and None
         log.info("job_spawned job_id=%s runtime=%s workspace=%s pid=%s", self.job_id, job["runtime"], job["workspace_id"], self.proc.pid)
@@ -496,7 +519,15 @@ class Runner:
             snap = _git_snapshot(path)
             if snap is not None:
                 env[ws.id] = snap
-        return {"version": VERSION, "max_parallel": self.config.max_parallel, "runtimes": runtimes, "workspaces": workspaces, "env": env}
+        return {
+            "version": VERSION,
+            "platform": f"{os.name}/{platform.machine()}",
+            "isolation": "job-object" if os.name == "nt" else procmod.ISOLATION,
+            "max_parallel": self.config.max_parallel,
+            "runtimes": runtimes,
+            "workspaces": workspaces,
+            "env": env,
+        }
 
     def held(self) -> list[dict[str, Any]]:
         """Jobs réellement détenus + télémétrie d'exécution (pid, vivant, enfants,
@@ -623,7 +654,8 @@ class Runner:
 
     def run(self) -> None:
         # Au démarrage aucun job n'est détenu : les dossiers temporaires restants viennent
-        # d'un runner tué (les processus sont morts avec leur Job Object).
+        # d'un runner tué (Windows : les processus sont morts avec leur Job Object ;
+        # Linux : close() a tué le groupe, sans garantie noyau — voir posproc).
         jobs_dir = Path(self.config.home) / "jobs"
         if jobs_dir.is_dir():
             for leftover in jobs_dir.iterdir():

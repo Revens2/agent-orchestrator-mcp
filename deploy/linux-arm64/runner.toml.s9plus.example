@@ -1,0 +1,52 @@
+# /home/ubuntu/.orch-runner/runner.toml — config locale du runner Linux ARM64 (hors Git, aucun secret ici).
+# Machine : Galaxy S9+ (s9plus, aarch64). Le broker n'est joignable que via NetBird
+# (S9 non pairé au 2026-10-10 : ce runner reste INACTIF tant que NetBird n'est pas
+# authentifié par l'humain ; ne jamais exposer le broker sans l'overlay).
+runner_id = "s9plus-arm64"
+broker_url = "http://10.x.x.x:8803"
+max_parallel = 1
+offline_kill_s = 120
+
+# unattended (défaut) : workspace_write sans aucune demande d'autorisation.
+# guarded : éditions seules, le reste refusé sans prompt ; opencode read_only uniquement.
+default_permission_policy = "guarded"
+
+# Isolation forte impossible sous Linux (groupe de processus best-effort, pas de
+# Job Object : un descendant setsid/double-fork échappe au kill). workspace_write
+# reste REFUSÉ (fail-closed) tant que cette ligne vaut false. Ne passer à true
+# qu'en assumant explicitement ce risque.
+linux_allow_workspace_write = false
+
+# Re-probe des seuls runtimes indisponibles (backoff borné).
+runtime_refresh_min_s = 60
+runtime_refresh_max_s = 900
+
+# Runtimes ARM64 natifs (binaires Node, pas de .exe). Chemins absolus requis ;
+# `codex` exige `node` dans le PATH transmis (voir ENV_ALLOW_POSIX : PATH conservé).
+[runtimes.opencode]
+enabled = true
+exe = "/home/ubuntu/.local/bin/opencode"
+model = "opencode/muse-spark-1.3-contributor-free"
+probe_generation = false   # true = génération "Reply OK." au démarrage (coût API) ; false = --version seul
+
+[runtimes.agy]
+enabled = false
+exe = "/home/ubuntu/.local/bin/agy"
+
+[runtimes.codex]
+enabled = false
+exe = "/home/ubuntu/.local/bin/codex"
+
+[runtimes.claude-code]
+enabled = false
+exe = "/home/ubuntu/.local/bin/claude"
+
+# claude-desktop : Windows uniquement (MSIX/UIA) — jamais sous Linux.
+[runtimes.claude-desktop]
+enabled = false
+exe = "/usr/bin/python3"
+
+[workspaces.s9plus]
+path = "/home/ubuntu/projects"
+modes = ["read_only"]
+description = "Workspace S9+ (lecture seule tant que workspace_write restreint)"

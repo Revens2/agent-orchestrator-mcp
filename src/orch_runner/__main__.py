@@ -6,12 +6,22 @@ import argparse
 import json
 import logging
 import logging.handlers
+import os
 import sys
 from pathlib import Path
 
 from orch_protocol.redact import redact
-from orch_runner import winproc
 from orch_runner.policy import DEFAULT_HOME, Config, generate_token
+
+if os.name == "nt":
+    from orch_runner import winproc
+    posproc = None  # type: ignore[assignment]
+else:
+    winproc = None  # type: ignore[assignment]
+    try:
+        from orch_runner import posproc
+    except ImportError:
+        posproc = None  # type: ignore[assignment]
 
 
 class RedactFilter(logging.Filter):
@@ -49,7 +59,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"jeton existant ({cfg.token_file}). Rotation : relancer avec --force.", file=sys.stderr)
             return 2
         digest = generate_token(cfg.token_file)
-        print("Jeton généré et chiffré DPAPI sur ce PC (il ne quitte jamais la machine).")
+        if os.name == "nt":
+            print("Jeton généré et chiffré DPAPI sur ce PC (il ne quitte jamais la machine).")
+        else:
+            print(f"Jeton généré en {cfg.token_file} (mode 0600, il ne quitte jamais la machine).")
         print("Empreinte à déclarer côté VPS dans ORCH_RUNNER_TOKENS :")
         print(f"{cfg.runner_id}:{digest}")
         return 0
@@ -69,7 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     setup_logging(cfg.home)
-    mutex = winproc.single_instance(cfg.runner_id)
+    if os.name == "nt":
+        mutex = winproc.single_instance(cfg.runner_id)
+    else:
+        cfg.home.mkdir(parents=True, exist_ok=True)
+        mutex = posproc.single_instance(cfg.home, cfg.runner_id) if posproc is not None else object()
     if mutex is None:
         logging.error("runner déjà actif pour %s : sortie", cfg.runner_id)
         return 3
