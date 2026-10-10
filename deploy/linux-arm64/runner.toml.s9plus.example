@@ -21,6 +21,14 @@ linux_allow_workspace_write = false
 runtime_refresh_min_s = 60
 runtime_refresh_max_s = 900
 
+# Proxy SOCKS loopback FACULTATIF (NetBird netstack : NB_SOCKS5_LISTENER_PORT sur
+# 127.0.0.1:1080, DNS non supporté côté NetBird = IP overlay directe ici).
+# Décommenter SEULEMENT si NetBird tourne en netstack SANS interface wt0
+# (le mode service classique avec wt0 n'a besoin d'AUCUN proxy).
+# Seul 127.0.0.1/::1 est accepté (toute autre adresse = erreur fail-closed) ;
+# requiert `httpx[socks]` dans le venv (extra `runner` de pyproject.toml).
+# socks_proxy = "socks5h://127.0.0.1:1080"
+
 # Runtimes ARM64 natifs (binaires Node, pas de .exe). Chemins absolus requis ;
 # `codex` exige `node` dans le PATH transmis (voir ENV_ALLOW_POSIX : PATH conservé).
 [runtimes.opencode]

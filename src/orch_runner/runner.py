@@ -131,12 +131,17 @@ class RemoteError(Exception):
 
 
 class BrokerClient:
-    def __init__(self, base_url: str, token: str, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(self, base_url: str, token: str, transport: httpx.BaseTransport | None = None,
+                 proxy: str | None = None) -> None:
+        # proxy = SOCKS loopback explicite seul (ex. NetBird netstack 127.0.0.1:1080),
+        # validé côté Config (validate_socks_proxy) ; None = direct (défaut).
+        # trust_env=False dans les deux cas : jamais de proxy système hérité.
         self.http = httpx.Client(
             base_url=base_url,
             headers={"authorization": f"Bearer {token}", "user-agent": f"orch-runner/{VERSION}"},
             timeout=httpx.Timeout(10.0, read=P.CLAIM_POLL_S + 15),
             transport=transport,
+            proxy=proxy,
             trust_env=False,  # jamais de proxy système entre le PC et le broker
         )
 
@@ -428,7 +433,8 @@ class JobWorker(threading.Thread):
 class Runner:
     def __init__(self, config: Config, client: BrokerClient | None = None) -> None:
         self.config = config
-        self.client = client or BrokerClient(config.broker_url, load_token(config.token_file))
+        self.client = client or BrokerClient(config.broker_url, load_token(config.token_file),
+                                              proxy=config.socks_proxy or None)
         self.epoch = -1
         self.workers: dict[str, JobWorker] = {}
         self.lock = threading.RLock()

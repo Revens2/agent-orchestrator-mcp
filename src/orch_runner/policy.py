@@ -57,6 +57,39 @@ class PolicyError(Exception):
         self.message = message
 
 
+def validate_socks_proxy(raw: str) -> str:
+    """Valide l'option `socks_proxy` (fail-closed), retourne l'URL normalisée ou "".
+
+    Accepté : "" (désactivé) ou `socks5[h]://127.0.0.1[:port]` / `socks5[h]://[::1][:port]`
+    (port défaut 1080, normalisé explicitement). Refusé : tout hôte non-loopback
+    (jamais de Bearer broker vers un proxy distant), tout schéma non-SOCKS, toute
+    userinfo (proxy sans authentification), chemin/query/fragment.
+    """
+    if not raw:
+        return ""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(raw.strip())
+    except ValueError:
+        raise PolicyError("config", "socks_proxy invalide")
+    if parts.scheme not in ("socks5", "socks5h"):
+        raise PolicyError("config", "socks_proxy : schéma socks5/socks5h requis")
+    if parts.username or parts.password or "@" in (parts.netloc or ""):
+        raise PolicyError("config", "socks_proxy : userinfo interdite (proxy sans authentification)")
+    host = (parts.hostname or "").lower().strip("[]")
+    if host not in ("127.0.0.1", "::1"):
+        raise PolicyError("config", "socks_proxy : seul le loopback 127.0.0.1/::1 est accepté")
+    try:
+        port = parts.port if parts.port is not None else 1080
+    except ValueError:
+        raise PolicyError("config", "socks_proxy : port invalide")
+    if not 1 <= port <= 65535:
+        raise PolicyError("config", "socks_proxy : port invalide")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise PolicyError("config", "socks_proxy : chemin/query refusés")
+    return f"{parts.scheme}://{parts.hostname}:{port}"
+
+
 @dataclass
 class Workspace:
     id: str
@@ -92,6 +125,12 @@ class Config:
     # impossible, workspace_write est REFUSÉ par défaut (fail-closed) ; passer
     # à true assume explicitement ce risque. Sans effet sous Windows.
     linux_allow_workspace_write: bool = False
+    # Proxy SOCKS loopback FACULTATIF (ex. NetBird netstack `NB_SOCKS5_LISTENER_PORT`
+    # sur 127.0.0.1:1080) : "" = désactivé (défaut, comportement inchangé,
+    # trust_env=False). Si renseigné, SEUL 127.0.0.1/::1 est accepté (fail-closed :
+    # jamais de credential broker vers un proxy distant), schémas socks5/socks5h
+    # seuls, sans userinfo (proxy sans authentification par design).
+    socks_proxy: str = ""
 
     @staticmethod
     def load(path: Path | None = None) -> Config:
@@ -133,6 +172,7 @@ class Config:
             runtime_refresh_min_s=max(10, int(raw.get("runtime_refresh_min_s", 60))),
             runtime_refresh_max_s=max(10, int(raw.get("runtime_refresh_max_s", 900))),
             linux_allow_workspace_write=bool(raw.get("linux_allow_workspace_write", False)),
+            socks_proxy=validate_socks_proxy(str(raw.get("socks_proxy", "") or "")),
         )
 
 

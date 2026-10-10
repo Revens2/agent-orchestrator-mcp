@@ -6,7 +6,7 @@ dependencies = []
 
 [project.optional-dependencies]
 server = ["mcp==2.2.0", "uvicorn", "starlette", "httpx", "anyio", "pydantic"]
-runner = ["httpx"]
+runner = ["httpx[socks]"]
 dev = ["pytest", "ruff"]
 
 [tool.pytest.ini_options]
