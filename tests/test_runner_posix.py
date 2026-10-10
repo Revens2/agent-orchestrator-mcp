@@ -90,7 +90,10 @@ def test_config_linux_flag(tmp_path):
     assert Config.load(tmp_path / "b.toml").linux_allow_workspace_write is True
 
 
-def test_workspace_write_allowed_windows():
+def test_workspace_write_allowed_windows(monkeypatch):
+    import orch_runner.runner as R
+
+    monkeypatch.setattr(R, "PLATFORM", "nt")
     cfg = Config("r", "http://10.0.0.1:1", Path("t"), 1, {}, {}, Path("h"))
     assert workspace_write_allowed(cfg) is True
 
