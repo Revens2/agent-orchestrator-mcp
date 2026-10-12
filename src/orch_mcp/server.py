@@ -31,6 +31,8 @@ from orch_mcp.store import Store
 log = logging.getLogger("orch_mcp")
 
 INSTRUCTIONS = (
+    "OpenCode est le runtime par défaut lorsque l’utilisateur ne précise aucun moteur. "
+    "Claude Code, Codex, Claude Desktop et autres runtimes doivent être demandés explicitement. "
     "Orchestrateur d'agents IA personnels (≠ MCP Astra). Lance de vrais agents existants "
     "(Claude Code, Codex, Antigravity, OpenCode, Claude Desktop — ce dernier via bridge UIA : "
     "read_only = réponse seule, workspace_write = patchs confinés appliqués par le runner) "
