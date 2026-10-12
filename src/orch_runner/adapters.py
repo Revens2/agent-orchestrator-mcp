@@ -425,6 +425,14 @@ class ClaudeDesktop(Adapter):
         argv = [self.exe, self._bridge, "--prompt-file", str(prompt_file), "--out-dir", str(tmpdir), "--profile", self._profile()]
         if self.extra.get("timeout_s"):
             argv += ["--timeout-s", str(int(self.extra["timeout_s"]))]
+        # Gestion des conversations (bridge --select / --new-chat) : par défaut
+        # la conversation courante ; `conversation` = reprendre le titre exact,
+        # `new_chat` = démarrer un chat neuf. Jamais interpolé en shell (argv).
+        select = str(self.extra.get("conversation") or "").strip()
+        if self.extra.get("new_chat"):
+            argv += ["--new-chat"]
+        elif select:
+            argv += ["--select", select]
         return Launch(argv, None)
 
     def on_line(self, line):
@@ -437,6 +445,10 @@ class ClaudeDesktop(Adapter):
         text = data.get("text") if isinstance(data.get("text"), str) else ""
         if kind == "result":
             self.last_text = text
+            conv = data.get("conversation")
+            if isinstance(conv, str) and conv.strip():
+                # Continuité inter-jobs : session = conversation servie.
+                self.session_id = f"desktop:{conv.strip()[:96]}"
             return text + "\n", text[:120] or "result"
         if kind == "activity":
             return None, text[:120] or "activity"

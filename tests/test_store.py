@@ -79,6 +79,36 @@ def test_create_refused_before_launch(env, kw, code):
     assert store.list_jobs() == []
 
 
+def test_runtime_unavailable_reports_reason_no_substitution(tmp_path):
+    """Agent indisponible + raison, sans substitution : aucun job créé, message
+    avec la raison du probe et l'interdiction de relancer sur un autre runtime."""
+    clock = Clock()
+    store = Store(tmp_path / "t.db", clock=clock)
+    info = {
+        "version": "test",
+        "max_parallel": 2,
+        "runtimes": [
+            {"id": "fake", "available": True},
+            {"id": "agy", "available": False, "reason": "runtime_not_ready: génération de test échouée (erreur fournisseur)"},
+        ],
+        "workspaces": [{"id": "demo", "modes": ["read_only", "workspace_write"]}],
+    }
+    store.hello("pc", info, [])
+    with pytest.raises(BrokerError) as e:
+        start(store, runtime="agy")
+    assert e.value.code == "runtime_unavailable"
+    assert "agent indisponible" in e.value.message
+    assert "génération de test échouée" in e.value.message
+    assert "Ne pas substituer" in e.value.message
+    assert store.list_jobs() == []
+    # runtime jamais annoncé : même contrat, raison = non annoncé.
+    with pytest.raises(BrokerError) as e2:
+        start(store, runtime="codex")
+    assert e2.value.code == "runtime_unavailable"
+    assert "non annoncé" in e2.value.message
+    assert store.list_jobs() == []
+
+
 def test_hostile_prompt_stored_verbatim(env):
     store, _, epoch = env
     hostile = '"; echo PWNED & whoami | powershell -c `$x` > NUL < %PATH% ^ \'q\'\n```bash\nrm -rf /\n```\n☃ é'

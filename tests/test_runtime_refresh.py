@@ -103,3 +103,26 @@ def test_probe_exception_is_treated_as_unavailable(tmp_path):
     runner._probe = boom
     assert runner.refresh_runtimes(now=runner._retry["opencode"]["next"]) is False
     assert runner._retry["opencode"]["delay"] == 120
+
+
+def test_cli_probe_without_init_runs(tmp_path, capsys):
+    """Régression : `python -m orch_runner probe` plantait (`lock` manquant,
+    Runner.__new__ sans __init__). Config sans runtime : aucun sous-processus."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "runner.toml").write_text(
+        "runner_id = \"pc\"\n"
+        "broker_url = \"http://10.0.0.1\"\n"
+        "max_parallel = 1\n"
+        "[workspaces.e2e]\n"
+        f"path = '{ws}'\n"
+        "modes = [\"read_only\"]\n",
+        encoding="utf-8",
+    )
+    from orch_runner.__main__ import main
+
+    assert main(["probe", "--config", str(tmp_path / "runner.toml")]) == 0
+    import json
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["runtimes"] == [] and out["max_parallel"] == 1

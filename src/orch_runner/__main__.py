@@ -7,6 +7,7 @@ import json
 import logging
 import logging.handlers
 import sys
+import threading
 from pathlib import Path
 
 from orch_protocol.redact import redact
@@ -65,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "probe":
         info = Runner.__new__(Runner)
         info.config = cfg
+        info.lock = threading.RLock()
+        info._retry = {}
         print(json.dumps(Runner.info(info), indent=1, ensure_ascii=False))
         return 0
 

@@ -202,6 +202,72 @@ def test_bridge_error_codes_stable():
         "input_not_found": B.E_INPUT,
         "response_timeout": B.E_TIMEOUT,
         "send_failed": B.E_SEND,
+        "conversation_not_found": B.E_CONV,
+        "new_chat_not_found": B.E_NEWCHAT,
     }
     for code, const in codes.items():
         assert const == code, (code, const)
+
+
+# ------------------------------------------------- conversations ---
+def test_find_conversations_filters_chrome_and_dedups():
+    els = [
+        {"ct": "ControlType.Button", "name": "Send", "aid": "", "text": "Send"},
+        {"ct": "ControlType.Edit", "name": "Prompt", "aid": "", "text": ""},
+        {"ct": "ControlType.Text", "name": "Caroline · Pro", "aid": "", "text": "Caroline · Pro"},
+        {"ct": "ControlType.Button", "name": "Nouveau chat", "aid": "", "text": ""},
+        {"ct": "ControlType.Button", "name": "Refacto Watchy", "aid": "", "text": ""},
+        {"ct": "ControlType.ListItem", "name": "", "aid": "", "text": "Debug NAS Nextcloud"},
+        {"ct": "ControlType.Button", "name": "Refacto Watchy", "aid": "", "text": ""},
+        {"ct": "ControlType.Button", "name": "Rechercher dans les chats", "aid": "", "text": ""},
+    ]
+    convs = B.find_conversations(els)
+    assert [c["title"] for c in convs] == ["Refacto Watchy", "Debug NAS Nextcloud"]
+
+
+def test_find_new_chat_fr_en_and_none():
+    fr = [{"ct": "ControlType.Button", "name": "Nouveau chat", "aid": "", "text": ""}]
+    assert (B.find_new_chat(fr) or {})["name"] == "Nouveau chat"
+    en = [{"ct": "ControlType.Button", "name": "New chat", "aid": "", "text": ""}]
+    assert (B.find_new_chat(en) or {})["name"] == "New chat"
+    assert B.find_new_chat([{"ct": "ControlType.Button", "name": "Send", "aid": "", "text": ""}]) is None
+
+
+def test_is_generating_and_active_title():
+    els = [
+        {"ct": "ControlType.Button", "name": "Arrêter la réponse", "aid": "", "text": ""},
+        {"ct": "ControlType.Text", "name": "", "aid": "", "text": "Refacto Watchy"},
+    ]
+    convs = [{"title": "Refacto Watchy", "aid": "", "name": ""}]
+    assert B.is_generating(els)
+    assert B.active_title(els, convs) == "Refacto Watchy"
+    assert not B.is_generating([{"ct": "ControlType.Button", "name": "Envoyer", "aid": "", "text": ""}])
+    assert B.active_title([{"ct": "ControlType.Text", "name": "", "aid": "", "text": "titre inconnu"}], convs) is None
+
+
+def test_adapter_build_conversation_argv(tmp_path):
+    hostile = '"; powershell -c calc & titre $(whoami)'
+    ad = A.ClaudeDesktop(PY, {"profile": "Caroline", "conversation": hostile})
+    launch = ad.build("Bonjour.", "read_only", CWD, tmp_path)
+    assert "--select" in launch.argv
+    assert hostile in launch.argv  # argv, jamais interpolé en shell
+    assert hostile not in " ".join(launch.argv[:7])
+    ad2 = A.ClaudeDesktop(PY, {"profile": "Caroline", "new_chat": True})
+    launch2 = ad2.build("Bonjour.", "read_only", CWD, tmp_path)
+    assert "--new-chat" in launch2.argv and "--select" not in launch2.argv
+    ad3 = A.ClaudeDesktop(PY, None)
+    launch3 = ad3.build("Bonjour.", "read_only", CWD, tmp_path)
+    assert "--new-chat" not in launch3.argv and "--select" not in launch3.argv
+
+
+def test_adapter_on_line_captures_conversation_session(tmp_path):
+    ad = A.ClaudeDesktop(PY, None)
+    text, _ = ad.on_line(json.dumps({"type": "result", "text": "voici la réponse", "conversation": "Refacto Watchy"}))
+    assert "voici la réponse" in text
+    assert ad.session_id == "desktop:Refacto Watchy"
+    out = ad.finish(0, tmp_path)
+    assert out.ok
+    # Sans conversation : pas de session inventée.
+    ad2 = A.ClaudeDesktop(PY, None)
+    ad2.on_line(json.dumps({"type": "result", "text": "ok"}))
+    assert ad2.session_id is None

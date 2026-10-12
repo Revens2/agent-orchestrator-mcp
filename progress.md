@@ -71,6 +71,52 @@ Base : main `a4aa694` (observabilité Telegram unifiée). Repo local aligné ava
 
 ---
 
+# Déploiement 2026-09-21 — no-substitution + conversations Desktop + fix probe
+
+Base : branche `feat/pc-fixe-bootstrap` (non commitée, déployée depuis l'arbre de travail).
+
+## Contenu
+
+1. **No-substitution inter-runtimes** (`src/orch_mcp/store.py`, `tools.py`) :
+   `runtime_unavailable` = « agent indisponible + raison du probe » (quota, auth,
+   offline…), consigne explicite de ne jamais relancer sur un autre runtime
+   (quotas séparés). Test `test_runtime_unavailable_reports_reason_no_substitution`.
+2. **Conversations Claude Desktop** (`claude_desktop_bridge.py`, `adapters.py`) :
+   `--list` (titres + active, lecture seule), `--state` (generating/composeur/hung),
+   `--select TITRE` / `--new-chat` avant envoi (échec fermé `conversation_not_found` /
+   `new_chat_not_found`), conversation servie → `session_id` (`desktop:<titre>`,
+   continuité inter-jobs). Extra runner : `[runtimes.claude-desktop] conversation / new_chat`.
+   6 nouveaux tests (47 passed desktop+patch, self-test 6/6 OK).
+3. **Fix `python -m orch_runner probe** (`__main__.py` : `Runner.__new__` sans
+   `__init__` → `AttributeError: lock`) : init `lock` + `_retry` ; test de régression.
+   Prouvé live : probe local OK (claude-code 2.1.278, agy 1.2.7, opencode 1.18.29,
+   claude-desktop `claude_desktop_not_running` + raison).
+
+## Déploiement
+
+- **VPS FAIT (2026-09-21 ~12:17 UTC+2)** : 0 job actif / 0 mission vérifié avant ;
+  backup `/root/orch-src-bak-20260921-121714` (src+deploy) + DB sqlite ;
+  tarball `src/+deploy/` md5 `9ea2ce01…` vérifié local/VPS ; `restart orch-mcp
+  orch-gateway` ; `/health` ok des deux côtés ; 4/4 md5 déployés == locaux.
+  Rollback : recopier le backup + restart.
+- **Runner PC FAIT (2 passes)** : `install-runner.ps1` à `active_jobs: []`
+  (epoch 437→438 puis →439 après la 2e passe pour le fix probe).
+- **E2E Desktop live EN ATTENTE** : app Desktop fermée (`claude_desktop_not_running`).
+  Dès l'app ouverte sur le profil Caroline : `--list`/`--state` puis
+  `ORCH_DESKTOP_E2E=1 pytest tests/test_claude_desktop_live.py -q` (prompt neutre).
+
+## Observations (non modifiées)
+
+- `runner.toml` demande `max_parallel = 10` mais `policy.py` plafonne à 8
+  (probe/broker annoncent 8). Voulu le 2026-09-14 (10 agents) : le plafond 8
+  limite côté Windows (2 agents dans le même workspace = cf. diagnostic double
+  worker). À trancher explicitement avant de relever.
+- `test_runner_windows.py` / `test_hermes_poller.py` pendent en local (processus
+  réels/sleeps longs ; hermes_poller pend aussi sur arbre pristine) : pré-existant,
+  hors périmètre.
+
+---
+
 # Mission CRITICAL — Follow-through automatique (wait répétés jusqu'au terminal)
 
 Base : main `8a0cbf9`. Le bug `wait_for_change` (job déjà terminal → attente

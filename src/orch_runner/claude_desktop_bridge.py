@@ -72,10 +72,17 @@ E_INPUT = "input_not_found"
 E_BUSY = "ui_busy"
 E_TIMEOUT = "response_timeout"
 E_SEND = "send_failed"
+E_CONV = "conversation_not_found"
+E_NEWCHAT = "new_chat_not_found"
 
 
 def emit(kind: str, text: str) -> None:
     print(json.dumps({"type": kind, "text": text}, ensure_ascii=False), flush=True)
+
+
+def emit_result(text: str, conversation: str = "") -> None:
+    """Résultat NDJSON consommé par l'adapter (conversation = continuité inter-jobs)."""
+    print(json.dumps({"type": "result", "text": text, "conversation": conversation}, ensure_ascii=False), flush=True)
 
 
 def fail(code: str, detail: str, out_dir: Path | None = None) -> int:
@@ -110,6 +117,17 @@ def _ctname(raw: str) -> str:
 # vrai bouton (régression E2E 2026-09-15 : l'envoi partait sur un faux bouton).
 _SEND_RX = re.compile(r"\b(envoyer|send|submit|transmettre)\b", re.IGNORECASE)
 _EDIT_KEYS = ("input", "message", "chat", "prompt", "composer", "ask", "search")
+
+# Barre latérale des conversations : on ne retient que les boutons/items au
+# texte non-chrome (ni envoi, ni recherche, ni profil, ni "nouveau chat").
+_CONV_SKIP_RX = re.compile(
+    r"\b(envoyer|send|submit|transmettre|prompt|rechercher|search|profil|profile"
+    r"|param|settings|nouveau chat|nouvelle conversation|new chat|aide|help)\b",
+    re.IGNORECASE,
+)
+_NEWCHAT_RX = re.compile(r"\b(nouveau chat|nouvelle conversation|new chat)\b", re.IGNORECASE)
+_STOP_RX = re.compile(r"\b(arrêter|arreter|stop)\b", re.IGNORECASE)
+_CONV_CTS = ("Button", "ListItem", "Hyperlink", "MenuItem")
 
 
 def find_input_and_send(elements: list[dict]) -> tuple[dict | None, dict | None]:
@@ -209,6 +227,64 @@ def response_finished(tail: str) -> bool:
     """Une annonce de fin de génération figure-t-elle dans la queue ?"""
     low = tail.lower()
     return any(m in low for m in RESPONSE_MARKS)
+
+
+def find_conversations(elements: list[dict]) -> list[dict]:
+    """Conversations de la barre latérale (heuristique fail-closed).
+
+    Ne retient que les boutons/items au texte non-chrome, dédupliqués dans
+    l'ordre d'apparition. Si l'UI est remodelée, retourne [] (jamais inventé) :
+    l'appelant échoue `conversation_not_found` au lieu de cliquer au hasard.
+    """
+    out: list[dict] = []
+    for e in elements:
+        if _ctname(str(e.get("ct", ""))) not in _CONV_CTS:
+            continue
+        title = str(e.get("text") or e.get("name") or "").strip()
+        if not title or len(title) > 120:
+            continue
+        if _SEND_RX.search(title) or _CONV_SKIP_RX.search(title):
+            continue
+        out.append({"title": title, "aid": str(e.get("aid") or ""), "name": str(e.get("name") or "")})
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for c in out:
+        if c["title"] not in seen:
+            seen.add(c["title"])
+            uniq.append(c)
+    return uniq
+
+
+def find_new_chat(elements: list[dict]) -> dict | None:
+    """Bouton « nouveau chat » (FR/EN), sinon None."""
+    for e in elements:
+        if _ctname(str(e.get("ct", ""))) not in ("Button", "MenuItem", "SplitButton"):
+            continue
+        if _NEWCHAT_RX.search(f"{e.get('name', '')} {e.get('text', '')}"):
+            return e
+    return None
+
+
+def is_generating(elements: list[dict]) -> bool:
+    """Génération en cours ? (bouton Arrêter/Stop présent, best-effort)."""
+    for e in elements:
+        if _ctname(str(e.get("ct", ""))) not in ("Button", "SplitButton"):
+            continue
+        if _STOP_RX.search(str(e.get("name", ""))):
+            return True
+    return False
+
+
+def active_title(elements: list[dict], conversations: list[dict]) -> str | None:
+    """Titre de la conversation ouverte (best-effort : en-tête == un titre connu)."""
+    known = {c["title"] for c in conversations}
+    for e in elements:
+        if _ctname(str(e.get("ct", ""))) not in ("Text", "Document", "Header", "TitleBar"):
+            continue
+        t = str(e.get("text") or e.get("name") or "").strip()
+        if t in known:
+            return t
+    return None
 
 
 # ---------------------------------------------------------------- windows ---
@@ -368,6 +444,42 @@ if (-not $invoked -and $method -eq 'ctrl_enter') {
 Write-Output ('{"ok": true, "detail": "' + $method + '"}')
 """
 
+# Clic UIA sans coordonnées : localisation par AutomationId puis Name, action
+# par InvokePattern, repli focus + Entrée. Entrées par env : ORCH_UIA_HWND,
+# ORCH_UIA_AID, ORCH_UIA_ANAME. Sortie : {"ok": bool, "detail": ...}.
+PS_CLICK = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName System.Windows.Forms
+$hwnd = [IntPtr]::new([int64]$env:ORCH_UIA_HWND)
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+if ($null -eq $root) { Write-Output '{"ok": false, "detail": "no_root"}'; exit 0 }
+$aidProp = [System.Windows.Automation.AutomationElement]::AutomationIdProperty
+$nameProp = [System.Windows.Automation.AutomationElement]::NameProperty
+function Find-ByProp($prop, $value) {
+  if (-not $value) { return $null }
+  $cond = New-Object System.Windows.Automation.PropertyCondition($prop, $value)
+  return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+}
+$el = Find-ByProp $aidProp $env:ORCH_UIA_AID
+if ($null -eq $el) { $el = Find-ByProp $nameProp $env:ORCH_UIA_ANAME }
+if ($null -eq $el) { Write-Output '{"ok": false, "detail": "not_found"}'; exit 0 }
+try {
+  $inv = [System.Windows.Automation.InvokePattern]$el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+  $inv.Invoke()
+  Write-Output '{"ok": true, "detail": "invoke"}'
+  exit 0
+} catch {}
+try {
+  $el.SetFocus()
+  Start-Sleep -Milliseconds 300
+  [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+  Write-Output '{"ok": true, "detail": "enter"}'
+} catch {
+  Write-Output '{"ok": false, "detail": "click_failed"}'
+}
+"""
+
 
 def package_id() -> str:
     """`Nom|Version` du package Desktop, ou chaîne vide (jamais d'exception)."""
@@ -518,6 +630,33 @@ def act_uia(hwnd: int, edit: dict, send: dict | None, text_file: Path, timeout_s
         raise OSError(f"{E_UIA}: act JSON illisible: {exc}") from exc
 
 
+def click_uia(hwnd: int, target: dict, timeout_s: int = 60) -> dict:
+    """Clique un élément repéré (aid puis name), sans coordonnées."""
+    env = dict(
+        os.environ,
+        ORCH_UIA_HWND=str(hwnd),
+        ORCH_UIA_AID=str(target.get("aid") or ""),
+        ORCH_UIA_ANAME=str(target.get("name") or target.get("title") or ""),
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_CLICK],
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        creationflags=0x08000000,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise OSError(f"{E_UIA}: click exit {proc.returncode}: {(proc.stderr or proc.stdout)[:500]}")
+    try:
+        return json.loads((proc.stdout or "").strip() or "{}")
+    except ValueError as exc:
+        raise OSError(f"{E_UIA}: click JSON illisible: {exc}") from exc
+
+
 class UiLock:
     """Verrou fichier exclusif (msvcrt) : sérialise l'accès à l'UI Desktop."""
 
@@ -591,6 +730,69 @@ def do_verify(profile: str) -> tuple[int, str, dict]:
     return hwnd, title, {"version": ver, "elements": len(elements)}
 
 
+def do_list(profile: str) -> dict:
+    """Conversations visibles (lecture seule : ni verrou, ni focus volé)."""
+    hwnd, title, info = do_verify(profile)
+    elements = inspect_uia(hwnd)
+    convs = find_conversations(elements)
+    return {
+        "conversations": [c["title"] for c in convs],
+        "active": active_title(elements, convs),
+        "count": len(convs),
+        "version": info["version"],
+    }
+
+
+def do_state(profile: str) -> dict:
+    """État Desktop (lecture seule) : dispo, conversation active, génération, composeur."""
+    hwnd, title, info = do_verify(profile)
+    elements = inspect_uia(hwnd)
+    convs = find_conversations(elements)
+    edit, _ = find_input_and_send(elements)
+    composer = str((edit or {}).get("text") or "").strip()
+    return {
+        "available": True,
+        "version": info["version"],
+        "active": active_title(elements, convs),
+        "conversations": len(convs),
+        "generating": is_generating(elements),
+        "composer_has_text": bool(composer),
+        "hung": is_hung(hwnd),
+    }
+
+
+def switch_conversation(hwnd: int, elements: list[dict], select: str | None, new_chat: bool) -> str | None:
+    """Bascule vers `select` (titre exact, repli insensible à la casse) ou vers
+    un nouveau chat. Retourne le titre visé, ou lève E_CONV / E_NEWCHAT."""
+    target: dict | None = None
+    wanted: str | None = None
+    if new_chat:
+        target = find_new_chat(elements)
+        if target is None:
+            raise OSError(f"{E_NEWCHAT}: bouton nouveau chat introuvable dans l'arbre UIA")
+        wanted = None
+    else:
+        assert select
+        convs = find_conversations(elements)
+        for c in convs:
+            if c["title"] == select:
+                target, wanted = c, c["title"]
+                break
+        if target is None:
+            lowered = select.lower()
+            for c in convs:
+                if c["title"].lower() == lowered:
+                    target, wanted = c, c["title"]
+                    break
+        if target is None:
+            raise OSError(f"{E_CONV}: conversation {select!r} introuvable ({len(convs)} visibles)")
+    res = click_uia(hwnd, target)
+    if not res.get("ok"):
+        raise OSError(f"{E_UIA}: clic conversation impossible ({res.get('detail')})")
+    time.sleep(2.0)
+    return wanted
+
+
 def do_drive(
     prompt_file: Path,
     out_dir: Path,
@@ -600,6 +802,8 @@ def do_drive(
     stable_s: float = 10.0,
     lock_timeout_s: float = 300.0,
     min_response_s: float = 25.0,
+    select: str | None = None,
+    new_chat: bool = False,
 ) -> str:
     prompt = prompt_file.read_text(encoding="utf-8", errors="replace")
     if not prompt.strip():
@@ -621,6 +825,15 @@ def do_drive(
         bring_to_front(hwnd)
         time.sleep(0.6)
         elements = inspect_uia(hwnd)
+        conversation: str | None = None
+        if new_chat or select:
+            emit("activity", f"bascule conversation (select={select!r}, new_chat={new_chat})…")
+            conversation = switch_conversation(hwnd, elements, select, new_chat)
+            time.sleep(1.0)
+            elements = inspect_uia(hwnd)
+            if conversation is None:
+                # Nouveau chat : le titre n'existe pas encore, on le relira en fin.
+                conversation = ""
         baseline = conversation_text(elements)
         edit, send = find_input_and_send(elements)
         if edit is None:
@@ -693,8 +906,16 @@ def do_drive(
         result = conversation_diff(baseline, current)
         if not result:
             raise OSError(f"{E_TIMEOUT}: aucune réponse détectée")
+        if not conversation:
+            # Titre de la conversation réellement servie (continuité inter-jobs).
+            try:
+                tail_elements = inspect_uia(hwnd)
+                tail_convs = find_conversations(tail_elements)
+                conversation = active_title(tail_elements, tail_convs) or ""
+            except OSError:
+                conversation = ""
         (out_dir / "last_message.txt").write_text(result, encoding="utf-8")
-        emit("result", result)
+        emit_result(result, conversation)
         print(f"SUMMARY:{result[:4000]}", flush=True)
         return result
     finally:
@@ -750,6 +971,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-response-s", type=float, default=25.0)
     ap.add_argument("--verify-only", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--list", action="store_true", help="liste les conversations visibles (lecture seule, JSON)")
+    ap.add_argument("--state", action="store_true", help="état Desktop (lecture seule, JSON)")
+    ap.add_argument("--select", default=None, help="basculer vers la conversation TITRE avant d'envoyer")
+    ap.add_argument("--new-chat", action="store_true", help="nouveau chat avant d'envoyer")
     ap.add_argument("--inspect-dump", type=Path, help="vérifie + écrit l'arbre UIA (elements.json), sans envoyer")
     args = ap.parse_args(argv)
 
@@ -765,6 +990,14 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             return fail(str(exc).split(":")[0] if str(exc).startswith("profile_mismatch") else "verify_failed", str(exc))
         emit("activity", f"verify OK: hwnd={hwnd} title={title!r} version={info['version']}")
+        return 0
+
+    if args.list or args.state:
+        try:
+            payload = do_list(args.profile) if args.list else do_state(args.profile)
+        except (OSError, ValueError) as exc:
+            return fail("inspect_failed", str(exc))
+        print(json.dumps(payload, ensure_ascii=False))
         return 0
 
     if args.inspect_dump:
@@ -787,7 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if not args.prompt_file or not args.out_dir:
-        ap.error("--prompt-file et --out-dir sont requis (ou --verify-only / --self-test / --inspect-dump)")
+        ap.error("--prompt-file et --out-dir sont requis (ou --verify-only / --self-test / --inspect-dump / --list / --state)")
     try:
         args.out_dir.mkdir(parents=True, exist_ok=True)
         do_drive(
@@ -799,6 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
             args.stable_s,
             args.lock_timeout_s,
             args.min_response_s,
+            select=args.select,
+            new_chat=args.new_chat,
         )
     except (OSError, ValueError) as exc:
         msg = str(exc)
@@ -818,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
                 E_BUSY,
                 E_TIMEOUT,
                 E_SEND,
+                E_CONV,
+                E_NEWCHAT,
             )
             else "bridge_failed"
         )

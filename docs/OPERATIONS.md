@@ -349,6 +349,20 @@ concurrent, attendre), `input_not_found` (UI remodelée : ré-inspecter),
 `response_timeout` (réponse non stabilisée), `hung` (relancer l'app).
 Limite assumée : le pilotage vole le focus de la session interactive.
 
+Gestion des conversations (bridge, sans envoi) :
+- `python src\orch_runner\claude_desktop_bridge.py --list` : titres visibles +
+  conversation active (JSON, lecture seule, ne vole pas le focus) ;
+- `--state` : version, active, `generating` (bouton Arrêter présent),
+  `composer_has_text`, `hung` ;
+- envoi ciblé : `--select "TITRE exact"` (repli insensible à la casse) ou
+  `--new-chat` ; échec fermé `conversation_not_found` / `new_chat_not_found`
+  (jamais de clic au hasard). La conversation servie est émise dans le NDJSON
+  `result` (`conversation`) → `session_id` (`desktop:<titre>`) pour la
+  continuité inter-jobs.
+- côté runner (`runner.toml`) : `[runtimes.claude-desktop] conversation = "…"`
+  (reprendre) ou `new_chat = true` (démarrer neuf) ; défaut = conversation
+  courante. Vérifier qu'aucun job Desktop ne tourne avant de changer ce réglage.
+
 Broker v2.2 (même déploiement `src/`, migration additive) : colonne
 `jobs.recovery_since` (`ADD COLUMN` idempotent, NULL = pas de recovery) ;
 `PROCESS_RECOVERY_S=60` — première observation négative (`proc_alive=0` ou
@@ -438,5 +452,5 @@ Les autres MCP (tasks, astra, calendar, github, vault) ne dépendent d'aucun com
 | tâche `Ready` sans processus, résultat `0x80070002` | runner installé dans AppData virtualisé | réinstaller dans `%USERPROFILE%\.orch-runner` |
 | job `failed` `workspace_denied` | chemin changé, jonction, lecteur réseau | corriger `runner.toml`, relancer |
 | job `lost` | runner tué/redémarré ou PC isolé > 60 s pendant l'exécution | vérifier l'état du workspace puis relancer volontairement |
-| `runtime_unavailable` | runtime désactivé, `--version` en échec, ou opencode `runtime_not_ready` (modèle/fournisseur) | `python -m orch_runner probe` ; changer `model` puis relancer |
+| `runtime_unavailable` | runtime désactivé, `--version` en échec, ou opencode `runtime_not_ready` (modèle/fournisseur) | `python -m orch_runner probe` ; changer `model` puis relancer. Le message donne la raison : la remonter telle quelle, ne JAMAIS substituer un autre runtime (quotas séparés) |
 | `/orch/mcp` 401 dans ChatGPT | jeton OAuth expiré | reconnecter le connecteur |

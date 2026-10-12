@@ -97,6 +97,10 @@ def register(mcp, store: Store) -> None:
             "sérialisé) : read_only = réponse seule ; workspace_write = voie patch confinée (le Desktop "
             "propose des diffs unifiés, le runner les applique bornés au workspace, sans exécuter de commande). "
             "Fournissez idempotency_key pour qu'un retry ne crée pas un second job. "
+            "SANS SUBSTITUTION DE RUNTIME : si cet appel renvoie error=runtime_unavailable, "
+            "remontez tel quel « agent indisponible + raison » à l'utilisateur et STOPPEZ — "
+            "ne relancez JAMAIS avec un autre runtime (agy, opencode, codex, claude-code, …) "
+            "sauf demande explicite de l'utilisateur, car chaque runtime a son propre quota. "
             + STATE_HELP
         ),
     )
@@ -259,7 +263,10 @@ def register(mcp, store: Store) -> None:
             "`completed` (exit 0) ne valide jamais la mission : le job terminal exit 0 passe la mission "
             "en needs_validation (inspectez agent_job_get/output/events puis agent_mission_validate), "
             "sinon incomplete. Aucun retry automatique. Validez avec agent_mission_validate ; ne "
-            "confondez jamais completed avec validated."
+            "confondez jamais completed avec validated. "
+            "SANS SUBSTITUTION DE RUNTIME : si cet appel renvoie error=runtime_unavailable, "
+            "remontez tel quel « agent indisponible + raison » et STOPPEZ — ne recréez jamais "
+            "la mission avec un autre runtime sauf demande explicite (quotas séparés par runtime)."
         ),
     )
     async def agent_mission_create(

@@ -1,0 +1,9 @@
+*.log
+dist/
+coverage/
+tmp/
+node_modules/
+.git/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

@@ -643,7 +643,21 @@ class Store:
                 raise BrokerError("unknown_runner", "runner inconnu : il ne s'est jamais connecté")
             rts = {r["id"]: r for r in json.loads(runner["runtimes_json"])}
             if runtime not in rts or not rts[runtime].get("available"):
-                raise BrokerError("runtime_unavailable", f"runtime {runtime} non autorisé ou indisponible sur {runner_id}")
+                # Pas de substitution silencieuse : l'appelant doit remonter
+                # « agent indisponible + raison » et ne jamais relancer avec un
+                # autre runtime sauf demande explicite (chaque runtime a son
+                # propre quota : un fallback auto vide les autres compteurs).
+                if runtime not in rts:
+                    detail = "non annoncé par le runner (non configuré ou désactivé)"
+                else:
+                    detail = str(rts[runtime].get("reason") or "")[:200].strip() or (
+                        "raison non détaillée par le runner (voir agent_runner_inspect)"
+                    )
+                raise BrokerError(
+                    "runtime_unavailable",
+                    f"agent indisponible : runtime {runtime} indisponible sur {runner_id} ({detail}). "
+                    "Ne pas substituer un autre runtime ; remonter l'indisponibilité et sa raison.",
+                )
             wss = {w["id"]: w for w in json.loads(runner["workspaces_json"])}
             if workspace_id not in wss:
                 raise BrokerError("workspace_denied", f"workspace {workspace_id} absent de l'allowlist de {runner_id}")
