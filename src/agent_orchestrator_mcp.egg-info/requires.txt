@@ -1,0 +1,15 @@
+
+[dev]
+pytest
+ruff
+
+[runner]
+httpx
+
+[server]
+mcp==2.2.0
+uvicorn
+starlette
+httpx
+anyio
+pydantic

@@ -12,7 +12,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +34,16 @@ class Outcome:
     ok: bool
     summary: str | None
     error: str | None
+    # Cause fournisseur classifiée (P.PROVIDER_*) ; None = non reconnue.
+    failure_class: str | None = None
+    retry_after_s: float | None = None
 
 
 class Adapter:
     id: str = ""
+    # Reprise d'une session existante (`resume_session_id`) supportée : annoncé
+    # au broker (probe -> hello) ; sinon le broker envoie un handoff complet.
+    supports_resume_session: bool = False
     # modes supportés par l'adapter, avant intersection avec la config du workspace
     modes: tuple[str, ...] = P.MODES
 
@@ -49,10 +57,17 @@ class Adapter:
         self.policy = policy
         self.session_id: str | None = None
         self.last_text: str | None = None
+        # Session runtime à reprendre (fournie par le broker, validée par le runner).
+        self.resume_session_id: str | None = None
+        # Cause fournisseur bloquante vue PENDANT l'exécution (ex. quota dont le
+        # runtime retente en silence) : le runner arrête alors le processus.
+        self.provider_block: str | None = None
 
     # -- découverte
     def probe(self) -> dict[str, Any]:
         info: dict[str, Any] = {"id": self.id, "available": False, "modes": list(self.modes)}
+        if self.supports_resume_session:
+            info["resume_session"] = True
         if not (os.path.isabs(self.exe) and self.exe.lower().endswith(".exe") and os.path.isfile(self.exe)):
             info["reason"] = "exécutable absent ou non .exe"
             return info
@@ -78,9 +93,34 @@ class Adapter:
         """(texte lisible à remonter, activité courte)."""
         return line, None
 
+    def on_stderr(self, line: str) -> None:
+        """Observation d'une ligne stderr (aucune par défaut)."""
+
     def finish(self, exit_code: int, tmpdir: Path) -> Outcome:
         ok = exit_code == 0
         return Outcome(ok, self.last_text, None if ok else f"exit code {exit_code}")
+
+
+def _retry_after_s(headers: object, message: object = None) -> float | None:
+    """Délai fournisseur : `retry-after-ms`, `retry-after` (secondes ou date
+    HTTP), sinon « It will reset in … » (message opencode Zen Go). None si absent."""
+    if isinstance(headers, dict):
+        low = {str(k).lower(): v for k, v in headers.items()}
+        try:
+            if low.get("retry-after-ms") is not None:
+                return P.finite_delay(float(low["retry-after-ms"]) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+        raw = low.get("retry-after")
+        if raw is not None:
+            try:
+                return P.finite_delay(float(raw))
+            except (TypeError, ValueError):
+                try:
+                    return P.finite_delay(parsedate_to_datetime(str(raw)).timestamp() - time.time())
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    pass
+    return P.parse_reset_in(message)
 
 
 def _json(line: str) -> dict | None:
@@ -242,6 +282,7 @@ class OpenCode(Adapter):
     """
 
     id = "opencode"
+    supports_resume_session = True
     MODE = {
         P.UNATTENDED: {"read_only": ["--agent", "plan"], "workspace_write": ["--agent", "build", "--auto"]},
         P.GUARDED: {"read_only": ["--agent", "plan"]},  # sans --auto, un prompt bloquerait le headless
@@ -253,6 +294,9 @@ class OpenCode(Adapter):
         self._prompt_title = "session opencode"
         self._qbuf = ""  # accumulation bornée pour le bloc [[QUESTION]]
         self.pending_question: tuple[str, list[str]] | None = None
+        self.error: str | None = None
+        self.provider_class: str | None = None
+        self.retry_after: float | None = None
 
     @property
     def modes(self):  # type: ignore[override]
@@ -269,8 +313,16 @@ class OpenCode(Adapter):
         # premier objectif réel, jamais renommé ensuite.
         title = P.display_title(prompt, fallback="session opencode")
         self._prompt_title = title
-        return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
-                       "--title", title, "--dir", cwd, "--", prompt], None)
+        # Reprise d'une session existante (mission en pause-quota) : l'ID est
+        # validé par le runner avant d'arriver ici (jamais un flag injecté).
+        session = ["--session", self.resume_session_id] if self.resume_session_id else []
+        # quota_watch_logs (opt-in runner.toml) : les erreurs fournisseur
+        # partent sur stderr pendant que opencode retente en silence (retry-after
+        # de plusieurs heures) ; le runner peut alors suspendre au lieu d'attendre
+        # le timeout. Coût : opencode.log limité au niveau ERROR pour ce run.
+        logs = ["--print-logs", "--log-level", "ERROR"] if self.extra.get("quota_watch_logs") else []
+        return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), *session, *logs,
+                       "--format", "json", "--title", title, "--dir", cwd, "--", prompt], None)
 
     def probe(self):
         """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
@@ -318,8 +370,18 @@ class OpenCode(Adapter):
             return line, None
         if data.get("type") == "error":
             err = data.get("error") if isinstance(data.get("error"), dict) else {}
-            msg = str((err.get("data") or {}).get("message") or err.get("name") or "error")
+            edata = err.get("data") if isinstance(err.get("data"), dict) else {}
+            msg = str(edata.get("message") or err.get("name") or "error")
             self.error = msg[:500]
+            # Classification typée (APIError opencode) : nom + message + corps
+            # fournisseur ; statusCode pris en compte seulement pour APIError.
+            name = str(err.get("name") or "")
+            body = edata.get("responseBody") if isinstance(edata.get("responseBody"), str) else ""
+            status = edata.get("statusCode") if name == "APIError" else None
+            cls = P.classify_provider_error(f"{name}\n{msg}\n{body[:4000]}", status)
+            if cls is not None:
+                self.provider_class = cls
+                self.retry_after = _retry_after_s(edata.get("responseHeaders"), msg)
             self._tail.append(msg[:500])
             del self._tail[:-30]
             return f"[error] {msg}\n", f"error: {msg[:100]}"
@@ -332,8 +394,25 @@ class OpenCode(Adapter):
             return part["text"] + "\n", part["text"][:120]
         return None, str(data.get("type") or "event")[:120]
 
+    def on_stderr(self, line):
+        # Seules les lignes ERROR de --print-logs (quota_watch_logs) sont lues ;
+        # seul un QUOTA exact déclenche l'arrêt : un rate limit court est laissé
+        # au retry natif d'opencode.
+        if not self.extra.get("quota_watch_logs") or "level=ERROR" not in line:
+            return
+        # Modèle secondaire (titre, résumé : `small=true` / `agent=title`) :
+        # observé en réel (2026-10-09) en « Insufficient account funds » pendant
+        # un run principal SAIN. Seul le modèle de l'agent principal compte.
+        if "small=true" in line or "agent=title" in line:
+            return
+        if P.classify_provider_error(line) == P.PROVIDER_QUOTA and self.provider_block is None:
+            self.provider_block = P.PROVIDER_QUOTA
+            self.provider_class = P.PROVIDER_QUOTA
+            self.retry_after = P.parse_reset_in(line)
+            self.error = self.error or line.strip()[-500:]
+
     def finish(self, exit_code, tmpdir):
-        error = getattr(self, "error", None)
+        error = self.error
         if exit_code != 0:
             # Session reconnue corrompue : signature EXACTE uniquement (jamais
             # un simple mot "error"). La session est abandonnée ; le retry
@@ -345,8 +424,15 @@ class OpenCode(Adapter):
                     f"(nouvelle session) avec l'objectif « {self._prompt_title} »"
                 )
                 return Outcome(False, handoff, f"{P.SESSION_CORRUPTED_PREFIX}{sign}")
-        ok = exit_code == 0 and error is None
-        return Outcome(ok, self.last_text, None if ok else (f"exit code {exit_code}" + (f", {error}" if error else "")))
+        ok = exit_code == 0 and error is None and self.provider_block is None
+        if ok:
+            return Outcome(True, self.last_text, None)
+        detail = f"exit code {exit_code}" + (f", {error}" if error else "")
+        cls = self.provider_class
+        if cls is not None:
+            return Outcome(False, self.last_text, P.format_provider_error(cls, detail, self.retry_after),
+                           failure_class=cls, retry_after_s=self.retry_after)
+        return Outcome(False, self.last_text, detail)
 
 
 class ClaudeDesktop(Adapter):
@@ -484,6 +570,7 @@ class Fake(Adapter):
     """Fixture de test : `python fake_agent.py`, script piloté par le prompt (stdin)."""
 
     id = "fake"
+    supports_resume_session = True
 
     def __init__(self, exe, extra=None, policy=P.UNATTENDED):
         super().__init__(exe or sys.executable, extra, policy)
@@ -493,12 +580,33 @@ class Fake(Adapter):
 
     def build(self, prompt, mode, cwd, tmpdir):
         script = str(Path(__file__).with_name("fake_agent.py"))
-        return Launch([self.exe, "-u", script, mode], prompt, {"PYTHONIOENCODING": "utf-8"})
+        env = {"PYTHONIOENCODING": "utf-8"}
+        if self.resume_session_id:
+            env["ORCH_FAKE_RESUME_SESSION"] = self.resume_session_id
+        return Launch([self.exe, "-u", script, mode], prompt, env)
 
     def on_line(self, line):
         if line.startswith("SUMMARY:"):
             self.last_text = line[8:].strip()
+        elif line.startswith("SESSION:"):
+            self.session_id = line[8:].strip() or self.session_id
+        elif line.startswith("PROVIDER_ERROR:"):
+            # `PROVIDER_ERROR:<message exact fournisseur>|<retry_after_s>`
+            msg, _, retry = line[15:].strip().partition("|")
+            self._provider = (P.classify_provider_error(msg), float(retry) if retry else None, msg)
         return line, line.strip()[:120] or None
+
+    def on_stderr(self, line):
+        if line.startswith("PROVIDER_BLOCK:") and P.classify_provider_error(line) == P.PROVIDER_QUOTA:
+            self.provider_block = P.PROVIDER_QUOTA
+            self._provider = (P.PROVIDER_QUOTA, None, line[15:].strip())
+
+    def finish(self, exit_code, tmpdir):
+        cls, retry, msg = getattr(self, "_provider", (None, None, None))
+        if cls is not None and (exit_code != 0 or self.provider_block):
+            return Outcome(False, self.last_text, P.format_provider_error(cls, f"exit code {exit_code}, {msg}", retry),
+                           failure_class=cls, retry_after_s=retry)
+        return super().finish(exit_code, tmpdir)
 
 
 ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, Codex, Agy, OpenCode, Fake, ClaudeDesktop)}

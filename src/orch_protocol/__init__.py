@@ -7,6 +7,7 @@ runner importent ce module ; aucune des deux parties n'invente sa propre règle.
 
 from __future__ import annotations
 
+import math
 import re
 
 PROTOCOL_VERSION = 1
@@ -128,11 +129,20 @@ EV_STALLED = "stalled"
 # nouvelle session propre via mission_retry, handoff minimal (pas de transcript).
 EV_SESSION_CORRUPTED = "session_corrupted"
 EV_SESSION_RECREATED = "session_recreated"
+# Pause-quota (mission) : détection fournisseur, pause durable, réveil, reprise.
+EV_PROVIDER_QUOTA_DETECTED = "provider_quota_detected"
+EV_MISSION_PAUSED = "mission_paused"
+EV_QUOTA_RETRY_SCHEDULED = "quota_retry_scheduled"
+EV_MISSION_RESUMED = "mission_resumed"
+EV_RESUME_FAILED = "resume_failed"
+EV_PAUSE_CANCELLED = "pause_cancelled"
 EVENT_KINDS = frozenset({
     EV_JOB_CLAIMED, EV_RUNTIME_SPAWNED, EV_PROCESS_RUNNING, EV_OUTPUT_PROGRESS,
     EV_ACTIVITY, EV_PROCESS_EXIT, EV_RUNNER_DISCONNECT, EV_LEASE_EXPIRED,
     EV_REQUEUED, EV_CANCEL_REQUESTED, EV_TIMEOUT_MARKED, EV_SUSPECTED_STALL, EV_STALLED,
     EV_SESSION_CORRUPTED, EV_SESSION_RECREATED,
+    EV_PROVIDER_QUOTA_DETECTED, EV_MISSION_PAUSED, EV_QUOTA_RETRY_SCHEDULED,
+    EV_MISSION_RESUMED, EV_RESUME_FAILED, EV_PAUSE_CANCELLED,
 })
 MAX_EVENTS_PER_JOB = 500
 OUTPUT_PROGRESS_STEP_CHARS = 65_536
@@ -144,10 +154,19 @@ MISSION_VALIDATED = "validated"
 MISSION_INCOMPLETE = "incomplete"
 MISSION_BLOCKED = "blocked"
 MISSION_FAILED = "failed"
+# Pause durable : le fournisseur du modèle est indisponible (quota/forfait
+# épuisé, rate limit). La tentative est close (job `failed` préfixé
+# PROVIDER_UNAVAILABLE_PREFIX) ; la mission attend puis repart sur un NOUVEAU
+# job lié. Ni terminal, ni réussie, ni validable.
+MISSION_WAITING_FOR_QUOTA = "waiting_for_quota"
+# Annulation explicite de la mission (y compris pendant une pause) : terminal.
+MISSION_CANCELLED = "cancelled"
 MISSION_STATES = frozenset({
     MISSION_EXECUTING, MISSION_NEEDS_VALIDATION, MISSION_VALIDATED,
     MISSION_INCOMPLETE, MISSION_BLOCKED, MISSION_FAILED,
+    MISSION_WAITING_FOR_QUOTA, MISSION_CANCELLED,
 })
+MISSION_FINAL = frozenset({MISSION_VALIDATED, MISSION_FAILED, MISSION_CANCELLED})
 MAX_MISSION_ATTEMPTS = 5
 MAX_OBJECTIVE_CHARS = 4_000
 MAX_CRITERIA = 20
@@ -187,6 +206,155 @@ def match_corruption(text: object) -> str | None:
         if sign in text:
             return sign
     return None
+
+
+# --- fournisseur indisponible (pause-quota de mission) -----------------------
+# Causes DISTINCTES : seules quota/rate_limit mettent la mission en pause
+# durable ; auth/modèle/réseau/inconnu restent des échecs ordinaires (classe
+# visible dans `error`). Signatures EXACTES issues des erreurs fournisseurs
+# documentées ; un texte libre ambigu n'est JAMAIS promu en quota.
+PROVIDER_QUOTA = "quota_exhausted"
+PROVIDER_RATE_LIMIT = "rate_limited"
+PROVIDER_AUTH = "auth_required"
+PROVIDER_MODEL_UNAVAILABLE = "model_unavailable"
+PROVIDER_CLASSES = frozenset({PROVIDER_QUOTA, PROVIDER_RATE_LIMIT, PROVIDER_AUTH, PROVIDER_MODEL_UNAVAILABLE})
+PAUSE_CLASSES = frozenset({PROVIDER_QUOTA, PROVIDER_RATE_LIMIT})
+PROVIDER_UNAVAILABLE_PREFIX = "provider_unavailable:"
+PROVIDER_ERROR_PREFIX = "provider_error:"
+
+# Sources : opencode provider/error.ts (parseStreamError), retry.ts (Zen
+# FreeUsageLimitError/GoUsageLimitError), fixture Codex `usage_limit_reached` ;
+# codes d'erreur API publics OpenAI (`insufficient_quota`) / Anthropic.
+QUOTA_SIGNS = (
+    "insufficient_quota",                        # code OpenAI (body/stream)
+    "Quota exceeded. Check your plan and billing details",  # opencode parseStreamError
+    "You exceeded your current quota",           # message OpenAI APICallError
+    "Your credit balance is too low",            # Anthropic, crédits épuisés
+    "usage_limit_reached",                       # Codex/ChatGPT (type d'erreur)
+    "The usage limit has been reached",          # Codex/ChatGPT (message)
+    "GoUsageLimitError",                         # opencode Zen Go (body)
+    "usage limit` reached",                      # opencode Zen Go (message réécrit)
+    "FreeUsageLimitError",                       # opencode Zen free tier (body)
+    "Free usage exceeded",                       # opencode Zen free tier (message)
+)
+RATE_LIMIT_SIGNS = (
+    "rate_limit_error",                          # type d'erreur Anthropic
+    "rate_limit_exceeded",                       # code OpenAI
+)
+AUTH_SIGNS = (
+    "ProviderAuthError",                         # nom d'erreur opencode
+    "invalid_api_key",
+    "authentication_error",
+)
+MODEL_UNAVAILABLE_SIGNS = (
+    "ProviderModelNotFoundError",                # nom d'erreur opencode
+    "model_not_found",
+)
+
+# Politique de réveil : backoff borné (base par cause, x2 par pause, plafond),
+# retry_after fournisseur respecté s'il est fourni (borné), durée totale de
+# pause et nombre de pauses consécutives plafonnés (=> incomplete, humain).
+PAUSE_BACKOFF_BASE_S = {PROVIDER_QUOTA: 900, PROVIDER_RATE_LIMIT: 120}
+PAUSE_BACKOFF_MAX_S = 6 * 3_600
+PAUSE_MIN_DELAY_S = 60
+MAX_PAUSE_TOTAL_S = 7 * 86_400
+MAX_CONSECUTIVE_PAUSES = 12
+PAUSE_JITTER_RATIO = 0.1
+
+
+def classify_provider_error(text: object, status_code: object = None) -> str | None:
+    """Classe fournisseur depuis une erreur EXACTE, sinon None.
+
+    Ordre : quota avant rate limit (un 429 `insufficient_quota` est un quota).
+    `status_code` n'est pris en compte que s'il vient d'une erreur fournisseur
+    typée (APIError) : 429 seul => rate_limited, 401/403 seul => auth_required.
+    Jamais de déduction depuis un mot isolé ("limit", "error", "429" en texte).
+    """
+    s = text if isinstance(text, str) else ""
+    for signs, cls in (
+        (QUOTA_SIGNS, PROVIDER_QUOTA),
+        (RATE_LIMIT_SIGNS, PROVIDER_RATE_LIMIT),
+        (AUTH_SIGNS, PROVIDER_AUTH),
+        (MODEL_UNAVAILABLE_SIGNS, PROVIDER_MODEL_UNAVAILABLE),
+    ):
+        if any(sign in s for sign in signs):
+            return cls
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        if status_code == 429:
+            return PROVIDER_RATE_LIMIT
+        if status_code in (401, 403):
+            return PROVIDER_AUTH
+    return None
+
+
+_RESET_IN_RE = re.compile(r"reset in\s+((?:\d+\s*(?:days?|hours?|minutes?|seconds?)[\s,]*(?:and\s+)?)+)", re.IGNORECASE)
+_RESET_UNIT_RE = re.compile(r"(\d+)\s*(day|hour|minute|second)", re.IGNORECASE)
+_RESET_UNIT_S = {"day": 86_400, "hour": 3_600, "minute": 60, "second": 1}
+
+
+def parse_reset_in(text: object) -> float | None:
+    """Délai annoncé « It will reset in 5 hours 23 minutes » (opencode Zen Go),
+    en secondes ; None si absent. Ne lit jamais une date libre."""
+    if not isinstance(text, str):
+        return None
+    m = _RESET_IN_RE.search(text)
+    if m is None:
+        return None
+    total = sum(int(n) * _RESET_UNIT_S[u.lower()] for n, u in _RESET_UNIT_RE.findall(m.group(1)))
+    return float(total) if total > 0 else None
+
+
+def finite_delay(value: object) -> float | None:
+    """Délai fournisseur exploitable : nombre fini > 0, plafonné à MAX_PAUSE_TOTAL_S."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return None
+    return float(min(value, MAX_PAUSE_TOTAL_S))
+
+
+def format_provider_error(cls: str, message: str | None, retry_after_s: float | None = None) -> str:
+    """`error` d'un job clos pour cause fournisseur (contrat runner -> broker).
+
+    `provider_unavailable:<classe>[ retry_after_s=N] | msg` pour une cause de
+    pause, `provider_error:<classe> | msg` sinon. Délai RELATIF (pas d'horloge
+    PC transmise : le broker l'ancre sur la sienne)."""
+    if cls in PAUSE_CLASSES:
+        head = PROVIDER_UNAVAILABLE_PREFIX + cls
+        retry = finite_delay(retry_after_s)
+        if retry is not None:
+            head += f" retry_after_s={int(retry)}"
+    else:
+        head = PROVIDER_ERROR_PREFIX + cls
+    return head + (f" | {message}" if message else "")
+
+
+def parse_provider_pause(error: object) -> tuple[str, float | None] | None:
+    """(classe, retry_after_s|None) si `error` porte une cause de PAUSE, sinon None."""
+    if not isinstance(error, str) or not error.startswith(PROVIDER_UNAVAILABLE_PREFIX):
+        return None
+    head = error[len(PROVIDER_UNAVAILABLE_PREFIX):].split(" | ", 1)[0].split()
+    if not head or head[0] not in PAUSE_CLASSES:
+        return None
+    retry: float | None = None
+    for tok in head[1:]:
+        if tok.startswith("retry_after_s="):
+            try:
+                retry = finite_delay(float(tok.split("=", 1)[1]))
+            except ValueError:
+                retry = None
+    return head[0], retry
+
+
+def pause_delay_s(cls: str, pause_count: int, retry_after_s: float | None, jitter: float = 0.0) -> float:
+    """Délai avant réveil. retry_after fiable => respecté (borné) ; sinon
+    backoff exponentiel borné. `jitter` ∈ [0,1] (aléa fourni par l'appelant)."""
+    retry = finite_delay(retry_after_s)
+    if retry is not None:
+        base = retry
+    else:
+        base = PAUSE_BACKOFF_BASE_S.get(cls, PAUSE_BACKOFF_BASE_S[PROVIDER_QUOTA]) * (2 ** max(0, min(pause_count, 16)))
+        base = min(base, PAUSE_BACKOFF_MAX_S)
+    base = max(PAUSE_MIN_DELAY_S, min(base, MAX_PAUSE_TOTAL_S))
+    return base + base * PAUSE_JITTER_RATIO * max(0.0, min(1.0, jitter))
 # display_title dérive un titre court et stable du premier objectif réel.
 # Stable par construction (fonction pure du texte source : pas de renommage
 # en boucle), sans migration (calculé à la lecture, identités/source_hash

@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: agent-orchestrator-mcp
+Version: 0.1.0
+Requires-Python: >=3.11
+Provides-Extra: server
+Requires-Dist: mcp==2.2.0; extra == "server"
+Requires-Dist: uvicorn; extra == "server"
+Requires-Dist: starlette; extra == "server"
+Requires-Dist: httpx; extra == "server"
+Requires-Dist: anyio; extra == "server"
+Requires-Dist: pydantic; extra == "server"
+Provides-Extra: runner
+Requires-Dist: httpx; extra == "runner"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"

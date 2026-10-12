@@ -43,6 +43,7 @@ def test_tool_surface_has_no_shell(client):
     assert names == {"agent_runner_list", "agent_workspace_list", "agent_job_start", "agent_job_get", "agent_job_output", "agent_job_cancel", "agent_job_list",
                      "agent_job_events", "agent_runner_inspect", "agent_job_wait",
                      "agent_mission_create", "agent_mission_get", "agent_mission_wait", "agent_mission_retry", "agent_mission_validate",
+                     "agent_mission_resume", "agent_mission_cancel",
                      "infra_alert_list", "infra_alert_get",
                      "agent_question_list", "agent_question_get", "agent_question_answer"}
     for t in tools:
@@ -126,3 +127,30 @@ def test_invalid_runtime_rejected_by_schema(client):
     c, _ = client
     res = rpc(c, "tools/call", {"name": "agent_job_start", "arguments": {"runner_id": "pc", "runtime": "bash", "workspace_id": "demo", "prompt": "x"}})
     assert res.get("error") or res["result"].get("isError")
+
+
+def test_quota_pause_contract_via_mcp(client):
+    """Pause-quota : wait rend la main (must_follow=false), get/resume/cancel via MCP."""
+    import orch_protocol as P
+
+    c, store = client
+    m = call(c, "agent_mission_create", {"objective": "obj", "acceptance_criteria": ["ok"],
+                                         "runner_id": "pc", "runtime": "fake", "workspace_id": "demo"})
+    epoch = store.hello("pc", {"runtimes": [{"id": "fake", "available": True}],
+                               "workspaces": [{"id": "demo", "modes": ["read_only"], "description": "d"}]}, [])
+    [j] = store.claim("pc", epoch, 1)
+    store.transition("pc", epoch, j["job_id"], j["fencing"], "claimed", "starting")
+    store.transition("pc", epoch, j["job_id"], j["fencing"], "starting", "running")
+    store.transition("pc", epoch, j["job_id"], j["fencing"], "running", "failed", exit_code=1,
+                     error=P.format_provider_error(P.PROVIDER_QUOTA, "insufficient_quota", 3600))
+    w = call(c, "agent_mission_wait", {"mission_id": m["mission_id"], "timeout_s": 30})
+    assert w["mission_state"] == "waiting_for_quota" and w["must_follow"] is False
+    assert w["until"] == "state_change" and w["resume_after"]
+    g = call(c, "agent_mission_get", {"mission_id": m["mission_id"]})
+    assert g["pause"]["reason"] == "quota_exhausted"
+    r = call(c, "agent_mission_resume", {"mission_id": m["mission_id"]})
+    assert r["state"] == "executing" and r["resumes"] == 1
+    assert call(c, "agent_mission_resume", {"mission_id": m["mission_id"]})["error"] == "mission_not_paused"
+    x = call(c, "agent_mission_cancel", {"mission_id": m["mission_id"]})
+    assert x["state"] == "cancelled" and x["job_cancel"] == "cancelled"
+    assert call(c, "agent_mission_cancel", {"mission_id": "ghost"})["error"] == "unknown_mission"

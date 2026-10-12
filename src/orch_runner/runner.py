@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 import threading
@@ -72,6 +73,12 @@ def _git_snapshot(path: str) -> dict[str, Any] | None:
     }
 
 ABORT_CODES = {"stale_fencing", "state_conflict", "unknown_job", "invalid_transition"}
+# Session runtime à reprendre (fournie par le broker) : identifiant opaque,
+# jamais un flag (pas de `-` initial), borné.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+# Arrêt du processus sur cause fournisseur bloquante (quota vu pendant que le
+# runtime retente en silence) : raison interne, jamais un état de job.
+_PROVIDER_STOP = "provider_unavailable"
 RESYNC_CODES = {"superseded", "unknown_runner"}
 
 # Commande locale de reprise par runtime (affichée à ChatGPT Web avec l'ID).
@@ -259,6 +266,10 @@ class JobWorker(threading.Thread):
             if is_stderr:
                 self._stderr_tail = (self._stderr_tail + line)[-4000:]
                 text, activity = "[stderr] " + line, None
+                try:
+                    adapter.on_stderr(line)
+                except Exception:  # noqa: BLE001 - un parseur ne doit jamais tuer la collecte
+                    log.debug("stderr_parse_error job_id=%s", self.job_id)
             else:
                 try:
                     text, activity = adapter.on_line(line)
@@ -308,6 +319,11 @@ class JobWorker(threading.Thread):
         if ws is None:
             return self._refuse("workspace_denied", "workspace absent de l'allowlist locale")
         adapter = ADAPTERS[job["runtime"]](rt.exe, rt.extra, cfg.permission_policy)
+        resume_sid = job.get("resume_session_id")
+        if isinstance(resume_sid, str) and _SESSION_ID_RE.fullmatch(resume_sid):
+            adapter.resume_session_id = resume_sid
+        elif resume_sid is not None:
+            log.warning("job_resume_session_ignored job_id=%s (identifiant invalide)", self.job_id)
         if job["mode"] not in ws.modes or job["mode"] not in adapter.modes:
             return self._refuse("mode_denied", "mode non autorisé pour ce workspace/runtime")
         prompt = job.get("prompt")
@@ -371,6 +387,12 @@ class JobWorker(threading.Thread):
                 self.proc.kill_tree(1)
             elif time.monotonic() - started > int(job["timeout_s"]) and reason is None:
                 reason = P.TIMEOUT
+                self.proc.kill_tree(1)
+            elif adapter.provider_block and reason is None:
+                # Quota reconnu pendant que le runtime attend en silence : la
+                # mission passera en pause durable au lieu d'un timeout.
+                reason = _PROVIDER_STOP
+                log.warning("job_provider_block job_id=%s class=%s", self.job_id, adapter.provider_block)
                 self.proc.kill_tree(1)
             if time.monotonic() - last_flush >= 1.0:
                 self._flush()

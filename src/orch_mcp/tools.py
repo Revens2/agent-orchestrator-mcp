@@ -300,7 +300,12 @@ def register(mcp, store: Store) -> None:
 
     @mcp.tool(
         name="agent_mission_get",
-        description="État d'une mission : objectif, critères, tentatives, job courant, validation.",
+        description=(
+            "État d'une mission : objectif, critères, tentatives, job courant, validation. "
+            "state=waiting_for_quota : fournisseur du modèle indisponible (quota/forfait/rate limit) ; "
+            "travail conservé, bloc `pause` (reason, resume_after, pause_count). Reprise automatique "
+            "planifiée ; utilisable depuis une NOUVELLE conversation avec le mission_id."
+        ),
     )
     async def agent_mission_get(
         mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
@@ -321,7 +326,10 @@ def register(mcp, store: Store) -> None:
             "should_continue=true — Y COMPRIS woke_by=timeout — RAPPELER agent_mission_wait avec "
             "since_seq=last_event_seq dans le MÊME tour, sans répondre à l'utilisateur. Ne répondez "
             "qu'après mission terminale validée (ou blocage réel : waiting_for_user, entrée requise, "
-            "failed/timeout/cancelled/lost à remonter explicitement)."
+            "failed/timeout/cancelled/lost à remonter explicitement). EXCEPTION PAUSE-QUOTA : "
+            "mission_state=waiting_for_quota (woke_by=paused, must_follow=false, until=state_change) "
+            "=> NE PAS rappeler : dites à l'utilisateur « mission conservée, en attente de quota, "
+            "reprise prévue à resume_after » et TERMINEZ le tour ; suivi ultérieur via agent_mission_get."
         ),
     )
     async def agent_mission_wait(
@@ -346,6 +354,42 @@ def register(mcp, store: Store) -> None:
     ) -> dict:
         try:
             return await anyio.to_thread.run_sync(store.retry_mission, mission_id, prompt)
+        except BrokerError as exc:
+            return _err(exc)
+
+    @mcp.tool(
+        name="agent_mission_resume",
+        description=(
+            "Reprend MAINTENANT une mission en pause-quota (waiting_for_quota), sans attendre "
+            "resume_after — ex. l'utilisateur a rétabli son forfait. Crée un nouveau job lié (même "
+            "session opencode si possible, sinon handoff : vérification du workspace, aucune action "
+            "rejouée). `runtime` = bascule vers un autre runtime UNIQUEMENT si l'utilisateur l'a "
+            "explicitement autorisé (coût possible) ; limité aux runtimes annoncés par le runner."
+        ),
+    )
+    async def agent_mission_resume(
+        mission_id: Annotated[str, Field(description="Identifiant de la mission en pause.")],
+        runtime: Annotated[RuntimeT | None, Field(description="Autre runtime, sur autorisation explicite de l'utilisateur (défaut : même runtime).")] = None,
+    ) -> dict:
+        try:
+            m = await anyio.to_thread.run_sync(lambda: store.resume_mission(mission_id, runtime))
+        except BrokerError as exc:
+            return _err(exc)
+        return m if m is not None else {"error": "unknown_mission", "mission_id": mission_id}
+
+    @mcp.tool(
+        name="agent_mission_cancel",
+        description=(
+            "Annule durablement une mission (y compris en pause-quota : aucune reprise ultérieure). "
+            "Tentative active : annulation demandée au runner. Mission déjà validated/failed/cancelled : "
+            "already_finished."
+        ),
+    )
+    async def agent_mission_cancel(
+        mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
+    ) -> dict:
+        try:
+            return await anyio.to_thread.run_sync(store.cancel_mission, mission_id)
         except BrokerError as exc:
             return _err(exc)
 
@@ -464,5 +508,6 @@ TOOLS_READ = frozenset({"agent_runner_list", "agent_workspace_list", "agent_job_
                         "infra_alert_list", "infra_alert_get", "agent_question_list", "agent_question_get"})
 TOOLS_WRITE = frozenset({"agent_job_start", "agent_job_cancel",
                          "agent_mission_create", "agent_mission_retry", "agent_mission_validate",
+                         "agent_mission_resume", "agent_mission_cancel",
                          "agent_question_answer"})
 _ = P

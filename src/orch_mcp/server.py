@@ -71,6 +71,8 @@ def build_app(store: Store, runner_auth: RunnerAuth, reaper_interval_s: float = 
         while True:
             try:
                 stats = await anyio.to_thread.run_sync(store.reap)
+                # Réveil des missions en pause-quota échues (état durable en base).
+                stats["missions_resumed"] = await anyio.to_thread.run_sync(store.wake_paused_missions)
                 if any(stats.values()):
                     log.info("reaper %s", stats)
                 state["last_reap"] = time.time()

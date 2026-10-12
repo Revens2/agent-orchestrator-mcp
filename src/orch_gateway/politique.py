@@ -40,7 +40,9 @@ OUTILS_ECRITURE: frozenset[str] = frozenset(
     {
         "agent_job_cancel",
         "agent_job_start",
+        "agent_mission_cancel",
         "agent_mission_create",
+        "agent_mission_resume",
         "agent_mission_retry",
         "agent_mission_validate",
         "agent_question_answer",

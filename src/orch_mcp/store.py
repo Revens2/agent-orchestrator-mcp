@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
+import re
 import sqlite3
 import threading
 import time
@@ -36,6 +38,10 @@ FOLLOW_UNTIL = "terminal"
 FOLLOW_WAIT_S = 25
 FOLLOW_NEXT_WAIT = "agent_job_wait"
 FOLLOW_NEXT_DONE = "agent_job_get"
+# Pause-quota : la mission ne bougera pas avant resume_after ; le tour ChatGPT
+# doit SE TERMINER (pas de wait maintenu des heures) et reprendre plus tard.
+FOLLOW_UNTIL_PAUSED = "state_change"
+RUNTIME_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 def follow_for_job(state: str, last_event_seq: int, wait_timeout_s: float = P.WAIT_DEFAULT_S) -> dict[str, Any]:
@@ -313,6 +319,25 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
             if "recovery_since" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN recovery_since REAL")
+            # Reprise d'une session runtime existante (mission en pause-quota).
+            if "resume_session_id" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN resume_session_id TEXT")
+            mcols = {r["name"] for r in self._db.execute("PRAGMA table_info(missions)").fetchall()}
+            # Pause-quota durable (NULL/0 = jamais en pause : bases v1 compatibles).
+            if "pause_reason" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN pause_reason TEXT")
+            if "paused_at" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN paused_at REAL")
+            if "pause_started_at" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN pause_started_at REAL")
+            if "resume_after" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN resume_after REAL")
+            if "pause_count" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0")
+            if "resumes" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0")
+            if "pause_base_prompt" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN pause_base_prompt TEXT")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -590,6 +615,31 @@ class Store:
             return out
 
     # ------------------------------------------------------------------- jobs
+    def _job_args(self, runtime: str, mode: str, prompt: str, timeout_s: int | None) -> int:
+        """Validation sans état commune (création directe, retry, reprise)."""
+        if runtime not in P.RUNTIMES:
+            raise BrokerError("invalid_runtime", f"runtime inconnu ; autorisés : {', '.join(P.RUNTIMES)}")
+        if mode not in P.MODES:
+            raise BrokerError("invalid_mode", f"mode inconnu ; autorisés : {', '.join(P.MODES)}")
+        if not isinstance(prompt, str) or not prompt.strip() or "\x00" in prompt or len(prompt) > P.MAX_PROMPT_CHARS:
+            raise BrokerError("invalid_prompt", "prompt invalide")
+        timeout_s = int(timeout_s or P.DEFAULT_TIMEOUT_S)
+        if not 30 <= timeout_s <= P.MAX_TIMEOUT_S:
+            raise BrokerError("invalid_timeout", f"timeout_s entre 30 et {P.MAX_TIMEOUT_S}")
+        return timeout_s
+
+    def _linked_job(self, db, runner_id: str, runtime: str, workspace_id: str, prompt: str, mode: str,
+                    timeout_s: int | None, resume_session_id: str | None = None) -> dict[str, Any]:
+        """Tentative liée à une mission, créée DANS la transaction de la mission :
+        jamais de job `queued` sans mission (plantage/course entre deux transactions)."""
+        timeout_s = self._job_args(runtime, mode, prompt, timeout_s)
+        req_hash = hashlib.sha256(
+            json.dumps([runner_id, runtime, workspace_id, mode, timeout_s, prompt], ensure_ascii=False).encode()
+        ).hexdigest()
+        job, _ = self._insert_job(db, runner_id, runtime, workspace_id, prompt, mode, timeout_s, None, req_hash,
+                                  resume_session_id)
+        return job
+
     def create_job(
         self,
         runner_id: str,
@@ -599,6 +649,7 @@ class Store:
         mode: str,
         timeout_s: int | None = None,
         idempotency_key: str | None = None,
+        resume_session_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Crée un job `queued`. Retourne (job, created). Refuse avant toute exécution
         si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé."""
@@ -630,36 +681,45 @@ class Store:
         req_hash = hashlib.sha256(
             json.dumps([runner_id, runtime, workspace_id, mode, timeout_s, prompt], ensure_ascii=False).encode()
         ).hexdigest()
-        now = self.clock()
         with self._tx() as db:
-            if idempotency_key:
-                existing = db.execute("SELECT * FROM jobs WHERE idem_key=?", (idempotency_key,)).fetchone()
-                if existing is not None:
-                    if existing["idem_hash"] != req_hash:
-                        raise BrokerError("idempotency_conflict", "idempotency_key déjà utilisée pour une autre requête")
-                    return self._job_view(existing), False
-            runner = db.execute("SELECT * FROM runners WHERE id=?", (runner_id,)).fetchone()
-            if runner is None:
-                raise BrokerError("unknown_runner", "runner inconnu : il ne s'est jamais connecté")
-            rts = {r["id"]: r for r in json.loads(runner["runtimes_json"])}
-            if runtime not in rts or not rts[runtime].get("available"):
-                raise BrokerError("runtime_unavailable", f"runtime {runtime} non autorisé ou indisponible sur {runner_id}")
-            wss = {w["id"]: w for w in json.loads(runner["workspaces_json"])}
-            if workspace_id not in wss:
-                raise BrokerError("workspace_denied", f"workspace {workspace_id} absent de l'allowlist de {runner_id}")
-            if mode not in wss[workspace_id].get("modes", []):
-                raise BrokerError("mode_denied", f"mode {mode} non autorisé pour le workspace {workspace_id}")
-            job_id = str(uuid.uuid4())
-            db.execute(
-                """INSERT INTO jobs(id, runner_id, runtime, workspace_id, mode, prompt, prompt_chars, idem_key, idem_hash,
-                     state, timeout_s, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job_id, runner_id, runtime, workspace_id, mode, prompt, len(prompt), idempotency_key, req_hash,
-                 P.QUEUED, timeout_s, now, now),
-            )
-            self._log_transition(db, job_id, None, P.QUEUED, "mcp")
-            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            return self._job_view(row), True
+            return self._insert_job(db, runner_id, runtime, workspace_id, prompt, mode, timeout_s,
+                                    idempotency_key, req_hash, resume_session_id)
+
+    def _insert_job(
+        self, db, runner_id: str, runtime: str, workspace_id: str, prompt: str, mode: str, timeout_s: int,
+        idempotency_key: str | None, req_hash: str, resume_session_id: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Partie transactionnelle de create_job (arguments déjà validés) : permet
+        de créer un job DANS la transaction d'une mission (reprise/retry atomiques)."""
+        now = self.clock()
+        if idempotency_key:
+            existing = db.execute("SELECT * FROM jobs WHERE idem_key=?", (idempotency_key,)).fetchone()
+            if existing is not None:
+                if existing["idem_hash"] != req_hash:
+                    raise BrokerError("idempotency_conflict", "idempotency_key déjà utilisée pour une autre requête")
+                return self._job_view(existing), False
+        runner = db.execute("SELECT * FROM runners WHERE id=?", (runner_id,)).fetchone()
+        if runner is None:
+            raise BrokerError("unknown_runner", "runner inconnu : il ne s'est jamais connecté")
+        rts = {r["id"]: r for r in json.loads(runner["runtimes_json"])}
+        if runtime not in rts or not rts[runtime].get("available"):
+            raise BrokerError("runtime_unavailable", f"runtime {runtime} non autorisé ou indisponible sur {runner_id}")
+        wss = {w["id"]: w for w in json.loads(runner["workspaces_json"])}
+        if workspace_id not in wss:
+            raise BrokerError("workspace_denied", f"workspace {workspace_id} absent de l'allowlist de {runner_id}")
+        if mode not in wss[workspace_id].get("modes", []):
+            raise BrokerError("mode_denied", f"mode {mode} non autorisé pour le workspace {workspace_id}")
+        job_id = str(uuid.uuid4())
+        db.execute(
+            """INSERT INTO jobs(id, runner_id, runtime, workspace_id, mode, prompt, prompt_chars, idem_key, idem_hash,
+                 state, timeout_s, created_at, updated_at, resume_session_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id, runner_id, runtime, workspace_id, mode, prompt, len(prompt), idempotency_key, req_hash,
+             P.QUEUED, timeout_s, now, now, resume_session_id),
+        )
+        self._log_transition(db, job_id, None, P.QUEUED, "mcp")
+        row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return self._job_view(row), True
 
     def claim(self, runner_id: str, epoch: int, free_slots: int) -> list[dict[str, Any]]:
         now = self.clock()
@@ -702,6 +762,9 @@ class Store:
                         "prompt": fresh["prompt"],
                         "timeout_s": fresh["timeout_s"],
                         "lease_s": P.LEASE_S,
+                        # Champ optionnel (protocole v1 inchangé) : session runtime
+                        # à reprendre ; un ancien runner l'ignore (nouvelle session).
+                        **({"resume_session_id": fresh["resume_session_id"]} if fresh["resume_session_id"] else {}),
                     }
                 )
             return claimed
@@ -783,6 +846,8 @@ class Store:
                     # session abandonnée (jamais réutilisée : le retry crée un
                     # nouveau job = nouvelle session + handoff, pas de transcript).
                     self._emit(db, job_id, P.EV_SESSION_CORRUPTED, error[:500])
+                if dst == P.FAILED and P.parse_provider_pause(error) is not None:
+                    self._emit(db, job_id, P.EV_PROVIDER_QUOTA_DETECTED, error[:500])
                 self._mission_on_job_terminal(db, job_id, dst)
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
@@ -1069,11 +1134,11 @@ class Store:
             db.execute("DELETE FROM events WHERE received_at < ?", (now - retention.output_s,))
             db.execute("DELETE FROM job_events WHERE at < ?", (now - retention.output_s,))
             db.execute(
-                "DELETE FROM mission_attempts WHERE mission_id IN (SELECT id FROM missions WHERE state IN ('validated','failed') AND updated_at < ?)",
+                "DELETE FROM mission_attempts WHERE mission_id IN (SELECT id FROM missions WHERE state IN ('validated','failed','cancelled') AND updated_at < ?)",
                 (now - retention.meta_s,),
             )
             db.execute(
-                "DELETE FROM missions WHERE state IN ('validated','failed') AND updated_at < ?",
+                "DELETE FROM missions WHERE state IN ('validated','failed','cancelled') AND updated_at < ?",
                 (now - retention.meta_s,),
             )
             a = db.execute(
@@ -1167,6 +1232,8 @@ class Store:
                 "validation_state": row["validation_state"],
                 "validation_note": row["validation_note"],
                 "attempt_job_ids": [a["job_id"] for a in attempts],
+                "resumes": row["resumes"],
+                "pause": self._pause_view(row),
                 "created_at": _iso(row["created_at"]),
                 "updated_at": _iso(row["updated_at"]),
             }
@@ -1181,7 +1248,8 @@ class Store:
                 raise BrokerError("unknown_mission", "mission inconnue")
             if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE):
                 raise BrokerError("mission_not_retryable", f"mission {m['state']} : retry refusé")
-            if int(m["attempts"]) >= int(m["max_attempts"]):
+            # Les reprises après pause-quota ne consomment pas de tentative.
+            if int(m["attempts"]) - int(m["resumes"] or 0) >= int(m["max_attempts"]):
                 raise BrokerError("max_attempts_reached", "plus de tentatives autorisées")
             cur = db.execute("SELECT state FROM jobs WHERE id=?", (m["current_job_id"],)).fetchone() if m["current_job_id"] else None
             if cur is None or cur["state"] not in P.TERMINAL:
@@ -1207,18 +1275,20 @@ class Store:
                         f"{P.MAX_CONSECUTIVE_CORRUPTIONS} sessions corrompues d'affilée : "
                         "corriger la cause (config/plugin/auth opencode) avant tout retry",
                     )
-        job, _ = self.create_job(
-            job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
-            prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
-            job_spec["mode"], job_spec["timeout_s"],
-        )
-        now = self.clock()
-        with self._tx() as db:
-            attempt_no = int(m["attempts"]) + 1
-            db.execute(
-                "UPDATE missions SET attempts=?, current_job_id=?, state=?, validation_state=NULL, updated_at=? WHERE id=?",
-                (attempt_no, job["job_id"], P.MISSION_EXECUTING, now, mission_id),
+            job = self._linked_job(
+                db, job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
+                prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
+                job_spec["mode"], job_spec["timeout_s"],
             )
+            now = self.clock()
+            attempt_no = int(m["attempts"]) + 1
+            cur = db.execute(
+                """UPDATE missions SET attempts=?, current_job_id=?, state=?, validation_state=NULL, updated_at=?
+                   WHERE id=? AND state=? AND current_job_id=?""",
+                (attempt_no, job["job_id"], P.MISSION_EXECUTING, now, mission_id, m["state"], m["current_job_id"]),
+            )
+            if cur.rowcount != 1:  # impossible sous BEGIN IMMEDIATE ; garde-fou explicite
+                raise BrokerError("retry_conflict", "la mission a changé d'état pendant le retry")
             db.execute(
                 "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
                 (mission_id, attempt_no, job["job_id"], now),
@@ -1256,17 +1326,265 @@ class Store:
 
     def _mission_on_job_terminal(self, db, job_id: str, job_state: str) -> None:
         """Hook : un job terminal fait progresser sa mission, sans jamais valider.
-        exit 0 -> needs_validation ; sinon -> incomplete. Pas de retry automatique."""
+        exit 0 -> needs_validation ; fournisseur indisponible (quota/rate limit
+        reconnu) -> waiting_for_quota (pause durable) ; sinon -> incomplete.
+        Pas de retry automatique hors réveil de pause."""
         m = db.execute(
-            "SELECT id, state FROM missions WHERE current_job_id=? AND state=?", (job_id, P.MISSION_EXECUTING)
+            "SELECT * FROM missions WHERE current_job_id=? AND state=?", (job_id, P.MISSION_EXECUTING)
         ).fetchone()
         if m is None:
             return
+        now = self.clock()
+        if job_state == P.FAILED:
+            j = db.execute("SELECT error FROM jobs WHERE id=?", (job_id,)).fetchone()
+            pause = P.parse_provider_pause(j["error"] if j else None)
+            if pause is not None and self._schedule_pause(db, m, job_id, pause[0], pause[1], now):
+                return
         nxt = P.MISSION_NEEDS_VALIDATION if job_state == P.COMPLETED else P.MISSION_INCOMPLETE
+        # Toute issue hors pause clôt la série de pauses consécutives.
         db.execute(
-            "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
+            """UPDATE missions SET state=?, pause_count=0, pause_started_at=NULL, resume_after=NULL,
+                 pause_base_prompt=NULL, updated_at=? WHERE id=?""",
+            (nxt, now, m["id"]),
         )
         log.info("mission_progress mission_id=%s job %s -> %s", m["id"], job_state, nxt)
+
+    # ---------------------------------------------------------- pause-quota
+    def _schedule_pause(self, db, m: sqlite3.Row, job_id: str, cls: str, retry_after_s: float | None, now: float) -> bool:
+        """Met (ou remet) la mission en `waiting_for_quota` avec un réveil borné.
+        False si les plafonds (pauses consécutives / durée totale) sont atteints :
+        l'appelant laisse alors la mission en `incomplete` (décision humaine)."""
+        count = int(m["pause_count"] or 0)
+        started = float(m["pause_started_at"]) if m["pause_started_at"] is not None else now
+        if count >= P.MAX_CONSECUTIVE_PAUSES or now - started >= P.MAX_PAUSE_TOTAL_S:
+            db.execute(
+                "UPDATE missions SET pause_reason=?, resume_after=NULL, updated_at=? WHERE id=?", (cls, now, m["id"])
+            )
+            self._emit(
+                db, job_id, P.EV_RESUME_FAILED,
+                f"pause plafonnée ({count} pauses, {int(now - started)} s) : intervention humaine requise",
+            )
+            log.warning("mission_pause_exhausted mission_id=%s reason=%s pauses=%s", m["id"], cls, count)
+            return False
+        if m["pause_base_prompt"] is None:
+            # Instructions de la tentative interrompue (prompt initial OU prompt
+            # corrigé d'un retry), copiées à la 1re pause : la purge des prompts
+            # de jobs (7 j) ne les efface pas pendant la pause.
+            base = db.execute("SELECT prompt FROM jobs WHERE id=?", (job_id,)).fetchone()
+            db.execute("UPDATE missions SET pause_base_prompt=? WHERE id=?", (base["prompt"] if base else None, m["id"]))
+        delay = P.pause_delay_s(cls, count, retry_after_s, self._jitter())
+        # Jamais au-delà de la durée totale autorisée : dernier réveil à la borne.
+        resume_after = min(now + delay, started + P.MAX_PAUSE_TOTAL_S)
+        db.execute(
+            """UPDATE missions SET state=?, pause_reason=?, paused_at=?, pause_started_at=?, resume_after=?,
+                 pause_count=?, updated_at=? WHERE id=?""",
+            (P.MISSION_WAITING_FOR_QUOTA, cls, now, started, resume_after, count + 1, now, m["id"]),
+        )
+        if m["state"] != P.MISSION_WAITING_FOR_QUOTA:
+            self._emit(db, job_id, P.EV_MISSION_PAUSED, f"mission {m['id']} en pause : {cls}")
+        source = "retry_after fournisseur" if retry_after_s else "backoff"
+        self._emit(
+            db, job_id, P.EV_QUOTA_RETRY_SCHEDULED,
+            f"reprise prévue {_iso(resume_after)} ({source}, pause n°{count + 1})",
+        )
+        log.info(
+            "mission_paused mission_id=%s reason=%s resume_after=%s pauses=%s",
+            m["id"], cls, _iso(resume_after), count + 1,
+        )
+        return True
+
+    def _jitter(self) -> float:
+        return random.random()
+
+    @staticmethod
+    def _pause_view(row: sqlite3.Row) -> dict[str, Any] | None:
+        if row["state"] != P.MISSION_WAITING_FOR_QUOTA:
+            return None
+        return {
+            "reason": row["pause_reason"],
+            "paused_at": _iso(row["paused_at"]),
+            "since": _iso(row["pause_started_at"]),
+            "resume_after": _iso(row["resume_after"]),
+            "pause_count": row["pause_count"],
+            "max_pauses": P.MAX_CONSECUTIVE_PAUSES,
+            "resume_policy": (
+                "auto : nouveau job lié à resume_after (même session si possible) ; "
+                "agent_mission_resume pour reprendre maintenant ; agent_mission_cancel pour abandonner"
+            ),
+        }
+
+    @staticmethod
+    def _resume_prompt(m: sqlite3.Row, base_prompt: str | None, cls: str | None, same_session: bool, switched: bool) -> str:
+        """Prompt de reprise : jamais de transcript, consigne anti-rejeu explicite."""
+        head = (
+            f"[reprise orchestrateur] La tentative précédente a été interrompue (fournisseur indisponible : "
+            f"{cls or 'inconnu'}). Avant toute écriture, vérifie l'état actuel du workspace (fichiers, git status, "
+            "artefacts) : NE REJOUE AUCUNE action déjà effectuée ; reprends à la première étape non terminée."
+        )
+        if same_session:
+            return f"{head}\nContinue la mission dans cette session. Objectif : {m['objective']}"[: P.MAX_PROMPT_CHARS]
+        note = "Changement de runtime autorisé par l'utilisateur. " if switched else ""
+        body = base_prompt if isinstance(base_prompt, str) and base_prompt.strip() else m["objective"]
+        text = (
+            f"{head}\n{note}La session précédente n'est pas reprise (reprise exacte non garantie) : "
+            "reconstruis le contexte depuis le workspace.\n\n--- Instructions initiales ---\n"
+        )
+        return (text + body)[: P.MAX_PROMPT_CHARS]
+
+    @staticmethod
+    def _runner_resumes_session(db, runner_id: str, runtime: str) -> bool:
+        """Le runner annonce-t-il la reprise de session pour ce runtime ? Un runner
+        ancien (champ absent) relancerait une session neuve avec un prompt court :
+        dans ce cas, handoff complet."""
+        row = db.execute("SELECT runtimes_json FROM runners WHERE id=?", (runner_id,)).fetchone()
+        if row is None:
+            return False
+        for rt in json.loads(row["runtimes_json"]):
+            if isinstance(rt, dict) and rt.get("id") == runtime:
+                return rt.get("resume_session") is True
+        return False
+
+    def resume_mission(self, mission_id: str, runtime: str | None = None, *, scheduled: bool = False) -> dict[str, Any] | None:
+        """Reprend une mission `waiting_for_quota` par un NOUVEAU job lié (le job
+        en pause reste terminal : immutabilité/fencing intacts). Même session
+        runtime si le runner l'annonce (opencode `--session`), sinon handoff.
+
+        Une seule transaction (BEGIN IMMEDIATE) : contrôle d'état, création du
+        job, rattachement à la mission et événements sont atomiques — jamais de
+        job `queued` orphelin qu'un runner pourrait prendre, jamais deux reprises.
+
+        `runtime` (optionnel, appel utilisateur uniquement) : bascule explicite
+        vers un autre runtime annoncé par le runner (allowlist runner) ; jamais
+        décidée par le broker. `scheduled=True` : réveil automatique (n'agit que
+        si `resume_after` est échu ; un échec replanifie au lieu de lever)."""
+        now = self.clock()
+        with self._tx() as db:
+            m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if m is None:
+                raise BrokerError("unknown_mission", "mission inconnue")
+            if m["state"] != P.MISSION_WAITING_FOR_QUOTA:
+                if scheduled:
+                    return None
+                raise BrokerError("mission_not_paused", f"mission {m['state']} : reprise refusée (pas en pause)")
+            if scheduled and (m["resume_after"] is None or float(m["resume_after"]) > now):
+                return None
+            prev = db.execute(
+                """SELECT runner_id, runtime, workspace_id, mode, timeout_s, runtime_session_id, resume_session_id
+                   FROM jobs WHERE id=?""",
+                (m["current_job_id"],),
+            ).fetchone()
+            if prev is None:
+                if not scheduled:
+                    raise BrokerError("attempt_missing", "tentative en pause introuvable")
+                # Déterministe : ne jamais retenter à chaque tick.
+                db.execute(
+                    "UPDATE missions SET state=?, resume_after=NULL, updated_at=? WHERE id=?",
+                    (P.MISSION_INCOMPLETE, now, mission_id),
+                )
+                log.warning("mission_wake_attempt_missing mission_id=%s", mission_id)
+                return None
+            target = runtime or prev["runtime"]
+            switched = target != prev["runtime"]
+            sid = None
+            if not switched and self._runner_resumes_session(db, prev["runner_id"], target):
+                cand = prev["runtime_session_id"] or prev["resume_session_id"]
+                sid = cand if isinstance(cand, str) and RUNTIME_SESSION_RE.fullmatch(cand) else None
+            prompt = self._resume_prompt(m, m["pause_base_prompt"], m["pause_reason"], sid is not None, switched)
+            try:
+                job = self._linked_job(
+                    db, prev["runner_id"], target, prev["workspace_id"], prompt, prev["mode"], prev["timeout_s"],
+                    resume_session_id=sid,
+                )
+            except BrokerError as exc:
+                if not scheduled:
+                    raise
+                # Runner/runtime indisponible au réveil (ex. probe opencode échouée
+                # car quota toujours épuisé) : nouvelle pause bornée, jamais de boucle serrée.
+                self._emit(db, m["current_job_id"], P.EV_RESUME_FAILED, f"reprise impossible : {exc.code}")
+                if not self._schedule_pause(db, m, m["current_job_id"], m["pause_reason"] or P.PROVIDER_QUOTA, None, now):
+                    db.execute(
+                        "UPDATE missions SET state=?, updated_at=? WHERE id=?", (P.MISSION_INCOMPLETE, now, mission_id)
+                    )
+                return None
+            db.execute(
+                """UPDATE missions SET state=?, current_job_id=?, attempts=attempts+1, resumes=resumes+1,
+                     resume_after=NULL, updated_at=? WHERE id=?""",
+                (P.MISSION_EXECUTING, job["job_id"], now, mission_id),
+            )
+            db.execute(
+                "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
+                (mission_id, int(m["attempts"]) + 1, job["job_id"], now),
+            )
+            if sid:
+                how = f"même session {sid}"
+            elif switched:
+                how = f"handoff vers le runtime {target}"
+            else:
+                how = "handoff (nouvelle session)"
+            who = "réveil planifié" if scheduled else "demande explicite"
+            self._emit(
+                db, job["job_id"], P.EV_MISSION_RESUMED,
+                f"reprise ({who}) après {m['pause_reason']} ; {how} ; tentative précédente {m['current_job_id']}",
+            )
+            self._emit(db, m["current_job_id"], P.EV_MISSION_RESUMED, f"reprise par le job {job['job_id']} ({how})")
+        log.info("mission_resumed mission_id=%s job_id=%s session=%s scheduled=%s", mission_id, job["job_id"], bool(sid), scheduled)
+        return self.get_mission(mission_id)
+
+    def wake_paused_missions(self) -> int:
+        """Réveil des missions en pause échues (appelé par la boucle du serveur).
+        État persistant (resume_after en base) : survit au redémarrage du broker."""
+        now = self.clock()
+        with self._lock:
+            ids = [r["id"] for r in self._db.execute(
+                """SELECT id FROM missions WHERE state=? AND resume_after IS NOT NULL AND resume_after <= ?
+                   ORDER BY resume_after LIMIT 20""",
+                (P.MISSION_WAITING_FOR_QUOTA, now),
+            ).fetchall()]
+        woke = 0
+        for mission_id in ids:
+            try:
+                if self.resume_mission(mission_id, scheduled=True) is not None:
+                    woke += 1
+            except BrokerError as exc:
+                log.warning("mission_wake_failed mission_id=%s code=%s", mission_id, exc.code)
+            except Exception:  # une mission ne doit jamais bloquer la boucle
+                log.exception("mission_wake_error mission_id=%s", mission_id)
+        return woke
+
+    def cancel_mission(self, mission_id: str) -> dict[str, Any]:
+        """Annulation durable d'une mission, immédiate en pause (aucun réveil
+        ultérieur). Tentative active : annulation demandée au runner (comme
+        agent_job_cancel). CAS sur l'état : une reprise concurrente perd."""
+        now = self.clock()
+        job_result = None
+        with self._tx() as db:
+            m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if m is None:
+                raise BrokerError("unknown_mission", "mission inconnue")
+            if m["state"] in P.MISSION_FINAL:
+                return {"mission_id": mission_id, "result": "already_finished", "state": m["state"]}
+            # Mission d'abord : le hook de fin de job n'agit que sur `executing`.
+            db.execute(
+                "UPDATE missions SET state=?, validation_state=?, resume_after=NULL, updated_at=? WHERE id=? AND state=?",
+                (P.MISSION_CANCELLED, P.MISSION_CANCELLED, now, mission_id, m["state"]),
+            )
+            job_id = m["current_job_id"]
+            row = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone() if job_id else None
+            if row is not None and row["state"] not in P.TERMINAL:
+                if row["state"] == P.QUEUED:
+                    self._set_terminal(db, job_id, P.QUEUED, P.CANCELLED, "mcp", error="mission annulée avant prise en charge")
+                    job_result = "cancelled"
+                else:
+                    db.execute("UPDATE jobs SET cancel_requested=1, updated_at=? WHERE id=?", (now, job_id))
+                    job_result = "cancel_requested"
+                self._emit(db, job_id, P.EV_CANCEL_REQUESTED, f"mission annulée (job {row['state']})")
+            elif job_id and m["state"] == P.MISSION_WAITING_FOR_QUOTA:
+                self._emit(db, job_id, P.EV_PAUSE_CANCELLED, "mission annulée pendant la pause : aucune reprise")
+            log.info("mission_cancelled mission_id=%s from=%s job=%s", mission_id, m["state"], job_result)
+        out = self.get_mission(mission_id) or {"mission_id": mission_id}
+        out["result"] = "cancelled"
+        out["job_cancel"] = job_result
+        return out
 
     # ------------------------------------------------------- alertes infra
     @staticmethod
@@ -1809,6 +2127,7 @@ class Store:
             }
             out.update(follow_for_wait(view["state"], woke_by, seq))
             out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+            out.update(self._pause_hint(job_id, view["state"]))
             return out
 
         with self._lock:
@@ -1854,6 +2173,7 @@ class Store:
         }
         out.update(follow_for_wait(view["state"], woke_by, seq))
         out["last_event_seq"] = seq  # curseur à réutiliser en since_seq
+        out.update(self._pause_hint(job_id, view["state"]))
         return out
 
     def wait_for_mission(
@@ -1870,10 +2190,16 @@ class Store:
         job_id = m["current_job_id"]
         if not job_id:
             return {"mission_id": mission_id, "error": "no_attempt", **m}
+        if m["state"] == P.MISSION_WAITING_FOR_QUOTA:
+            # Retour IMMÉDIAT : rien ne bougera avant resume_after (heures
+            # possibles). Le tour ChatGPT doit se terminer, pas boucler.
+            return self._paused_follow(m, since_seq)
         w = self.wait_for_change(job_id, since_seq, timeout_s)
         if w is None:
             return None
         m2 = self.get_mission(mission_id) or m
+        if m2["state"] == P.MISSION_WAITING_FOR_QUOTA:
+            return self._paused_follow(m2, w["last_event_seq"])
         state = m2["state"]
         pursuing = state == P.MISSION_EXECUTING and not w["terminal"]
         if pursuing:
@@ -1897,6 +2223,61 @@ class Store:
             "until": FOLLOW_UNTIL,
             "wait_timeout_s": FOLLOW_WAIT_S,
             "current_job_id": job_id,
+        }
+
+    def _pause_hint(self, job_id: str, state: str) -> dict[str, Any]:
+        """Job `failed` dont la mission est en pause-quota : le signaler au
+        caller de agent_job_wait (sinon il croirait à un échec définitif)."""
+        if state != P.FAILED:
+            return {}
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, resume_after FROM missions WHERE current_job_id=? AND state=?",
+                (job_id, P.MISSION_WAITING_FOR_QUOTA),
+            ).fetchone()
+        if row is None:
+            return {}
+        return {
+            "mission_id": row["id"],
+            "mission_state": P.MISSION_WAITING_FOR_QUOTA,
+            "resume_after": _iso(row["resume_after"]),
+            "next_tool": "agent_mission_get",
+        }
+
+    def _paused_follow(self, m: dict[str, Any], since_seq: int) -> dict[str, Any]:
+        """Bloc de suivi d'une mission en pause-quota : NON terminale mais
+        actionnable. must_follow=false : répondre à l'utilisateur et terminer le
+        tour ; reprendre plus tard (même ou nouvelle conversation) via mission_id."""
+        job_id = m["current_job_id"]
+        job = m.get("current_job") or {}
+        pause = m.get("pause") or {}
+        seq = self._last_seq(job_id)
+        return {
+            "mission_id": m["mission_id"],
+            "mission_state": m["state"],
+            "job_id": job_id,
+            "job_state": job.get("state"),
+            "woke_by": "paused",
+            "terminal": False,
+            "attempt_terminal": True,
+            "should_continue": False,
+            "must_follow": False,
+            "next_tool": "agent_mission_get",
+            # Le prochain wait portera sur un NOUVEAU job (seq repartant de 0).
+            "since_seq": -1,
+            "last_event_seq": seq,
+            "until": FOLLOW_UNTIL_PAUSED,
+            "wait_timeout_s": FOLLOW_WAIT_S,
+            "current_job_id": job_id,
+            "pause_reason": pause.get("reason"),
+            "resume_after": pause.get("resume_after"),
+            "pause": pause,
+            "message": (
+                "Mission conservée, en attente du fournisseur (quota/limite). Reprise automatique à "
+                f"{pause.get('resume_after')} via un nouveau job lié. Terminez le tour : suivez plus tard "
+                "avec agent_mission_get (même ou nouvelle conversation) ; agent_mission_resume pour "
+                "reprendre maintenant, agent_mission_cancel pour abandonner."
+            ),
         }
 
     def _last_seq(self, job_id: str) -> int:

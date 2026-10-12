@@ -213,6 +213,57 @@ Anti-boucle : 2 corruptions consécutives sur la même mission ⇒ `retry` refus
 (`session_corruption_loop`, cause config/plugin/auth à corriger) ; `max_attempts` borne le reste.
 Journal : `agent_job_events` (`session_corrupted`, `session_recreated`).
 
+## Quota fournisseur épuisé (pause-quota de mission)
+
+Un quota/forfait épuisé n'est ni un stall, ni une corruption, ni un timeout : la
+MISSION passe en pause durable, la tentative est close, la reprise est un nouveau job lié.
+
+Chaîne :
+1. Détection (runner) : signature EXACTE (`classify_provider_error`, `orch_protocol`) sur
+   l'événement `error` d'`opencode run --format json` (`name`, `data.message`,
+   `data.responseBody`, `data.statusCode` pour `APIError`). Causes distinctes :
+   `quota_exhausted`, `rate_limited` (pause) ; `auth_required`, `model_unavailable`
+   (échec ordinaire `provider_error:<classe>`) ; texte ambigu ⇒ aucune classe.
+   Un 429 de la sidebar ChatGPT n'a rien à voir avec le fournisseur OpenCode.
+2. Job `failed`, `error = provider_unavailable:<classe>[ retry_after_s=N] | …`
+   (`retry-after-ms` / `retry-after` / « It will reset in … » si fournis) ;
+   événement `provider_quota_detected`. Le job reste terminal (immuable).
+3. Mission `waiting_for_quota` (`mission_paused`, `quota_retry_scheduled`) :
+   `resume_after` = retry_after fournisseur (≥ 60 s) sinon backoff 15 min ×2
+   (rate limit : 2 min ×2), plafond 6 h, jitter 10 %. Au-delà de 12 pauses
+   consécutives ou 7 jours ⇒ `incomplete` (humain). Aucun slot runner occupé.
+4. Réveil : boucle reaper du broker (`wake_paused_missions`, état en base ⇒ survit au
+   redémarrage broker/runner). Nouveau job lié, `resume_session_id` = session opencode
+   précédente si le runner annonce `resume_session` (runner à jour ; sinon handoff complet)
+   ⇒ `opencode run --session <id>` + consigne « vérifier le workspace, ne rien
+   rejouer » ; sans session : handoff (prompt initial + même consigne). Runtime
+   indisponible au réveil (probe en échec car quota) ⇒ nouvelle pause, jamais de boucle serrée.
+   Les reprises ne consomment pas `max_attempts`.
+
+Suivi ChatGPT : `agent_mission_wait` rend la main IMMÉDIATEMENT (`woke_by=paused`,
+`must_follow=false`, `until=state_change`, `resume_after`) ⇒ répondre « mission
+conservée, en attente de quota » et terminer le tour. Plus tard (même ou nouvelle
+conversation) : `agent_mission_get` (bloc `pause`). `agent_mission_resume` reprend tout
+de suite (forfait rétabli) ; `runtime=<autre>` = bascule UNIQUEMENT sur autorisation
+explicite de l'utilisateur (runtimes annoncés par le runner ; aucun changement de modèle
+payant automatique). `agent_mission_cancel` annule durablement (aucune reprise).
+
+Quota retenté EN SILENCE par opencode (Zen `FreeUsageLimitError`/`GoUsageLimitError` :
+opencode attend `retry-after`, parfois des heures, sans rien émettre en JSON) : activer
+dans `runner.toml` (runtime opencode) `quota_watch_logs = true` ⇒ `--print-logs
+--log-level ERROR` ; une ligne `level=ERROR` portant une signature de QUOTA arrête le
+processus et met la mission en pause au lieu d'attendre le timeout (un rate limit court
+reste au retry natif). Coût : `opencode.log` limité au niveau ERROR pour ces runs ;
+une ligne ERROR d'un sous-agent/modèle secondaire portant une signature de quota arrête aussi le run.
+À valider sur un vrai épuisement avant de l'activer par défaut (format du log non capturé).
+
+Diagnostic : `agent_job_events` du job en pause (`provider_quota_detected`,
+`mission_paused`, `quota_retry_scheduled`, `resume_failed`, `mission_resumed`,
+`pause_cancelled`) ; `agent_job_get.error` porte la classe et la ligne fournisseur expurgée.
+Rollback : redéployer la version précédente ; colonnes ajoutées (NULL/0) ignorées par
+l'ancien code ; une mission restée `waiting_for_quota` se clôt alors via `agent_mission_validate`
+impossible ⇒ la passer à la main en `incomplete` (`UPDATE missions SET state='incomplete'`).
+
 ## Questions en attente (Photon/iMessage + inbox ChatGPT)
 
 État explicite `waiting_for_user` (table `pending_questions`), jamais deviné
