@@ -29,7 +29,7 @@ def call(c, name, args):
 @pytest.fixture
 def client(tmp_path):
     store = Store(tmp_path / "m.db")
-    store.hello("pc", {"runtimes": [{"id": "fake", "available": True}], "workspaces": [{"id": "demo", "modes": ["read_only"], "description": "d"}]}, [])
+    store.hello("pc", {"runtimes": [{"id": "fake", "available": True}, {"id": "opencode", "available": True}], "workspaces": [{"id": "demo", "modes": ["read_only"], "description": "d"}]}, [])
     app = build_app(store, RunnerAuth({}, ["10.200.0.0/16"]))
     with TestClient(app, base_url="http://127.0.0.1:8802") as c:
         rpc(c, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
@@ -126,3 +126,14 @@ def test_invalid_runtime_rejected_by_schema(client):
     c, _ = client
     res = rpc(c, "tools/call", {"name": "agent_job_start", "arguments": {"runner_id": "pc", "runtime": "bash", "workspace_id": "demo", "prompt": "x"}})
     assert res.get("error") or res["result"].get("isError")
+def test_default_runtime_opencode_and_explicit_overrides(client):
+    c, _ = client
+    available = {t["name"]: t for t in rpc(c, "tools/list")["result"]["tools"]}
+    for name in ("agent_job_start", "agent_mission_create"):
+        assert "runtime" not in available[name]["inputSchema"].get("required", [])
+    created = call(c, "agent_job_start", {"runner_id": "pc", "workspace_id": "demo", "prompt": "default"})
+    assert call(c, "agent_job_get", {"job_id": created["job_id"]})["runtime"] == "opencode"
+    explicit = call(c, "agent_job_start", {"runner_id": "pc", "runtime": "fake", "workspace_id": "demo", "prompt": "explicit"})
+    assert call(c, "agent_job_get", {"job_id": explicit["job_id"]})["runtime"] == "fake"
+    mission = call(c, "agent_mission_create", {"objective": "default mission", "acceptance_criteria": ["ok"], "runner_id": "pc", "workspace_id": "demo"})
+    assert call(c, "agent_job_get", {"job_id": mission["current_job_id"]})["runtime"] == "opencode"

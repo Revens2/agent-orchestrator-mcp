@@ -102,9 +102,9 @@ def register(mcp, store: Store) -> None:
     )
     async def agent_job_start(
         runner_id: Annotated[str, Field(description="Identifiant du runner (voir agent_runner_list).")],
-        runtime: Annotated[RuntimeT, Field(description="Runtime d'agent à utiliser.")],
         workspace_id: Annotated[str, Field(description="Identifiant de workspace allowlisté (pas un chemin).")],
         prompt: Annotated[str, Field(description="Mission donnée à l'agent (texte libre, transmis intact).")],
+        runtime: Annotated[RuntimeT, Field(description="Runtime d'agent à utiliser (OpenCode par défaut si omis).")] = "opencode",
         mode: Annotated[ModeT, Field(description="read_only = analyse sans écriture ; workspace_write = peut modifier le workspace.")] = "read_only",
         timeout_s: Annotated[int | None, Field(description="Durée max en secondes (30..14400, défaut 3600).")] = None,
         idempotency_key: Annotated[str | None, Field(description="Clé unique (8..128 car.) pour dédupliquer les retries.")] = None,
@@ -266,8 +266,8 @@ def register(mcp, store: Store) -> None:
         objective: Annotated[str, Field(description="Objectif de la mission (1..4000 car.).")],
         acceptance_criteria: Annotated[list[str], Field(description="Critères d'acceptation (1..20, non vides).")],
         runner_id: Annotated[str, Field(description="Identifiant du runner.")],
-        runtime: Annotated[RuntimeT, Field(description="Runtime d'agent à utiliser.")],
         workspace_id: Annotated[str, Field(description="Identifiant de workspace allowlisté.")],
+        runtime: Annotated[RuntimeT, Field(description="Runtime d'agent à utiliser (OpenCode par défaut si omis).")] = "opencode",
         mode: Annotated[ModeT, Field(description="read_only ou workspace_write.")] = "read_only",
         max_attempts: Annotated[int, Field(description="Tentatives max (1..5, défaut 2).")] = 2,
         timeout_s: Annotated[int | None, Field(description="Durée max par tentative (30..14400).")] = None,
