@@ -270,7 +270,7 @@ class OpenCode(Adapter):
         title = P.display_title(prompt, fallback="session opencode")
         self._prompt_title = title
         return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
-                       "--title", title, "--dir", cwd, "--", prompt], None)
+                       "--title", title, "--", prompt], None)
 
     def probe(self):
         """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
@@ -285,8 +285,8 @@ class OpenCode(Adapter):
             # une generation REUSSIE en "generation de test echouee".
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                 out = subprocess.run(
-                    [self.exe, "run", "--agent", "plan", *self._model(), "--format", "json", "--dir", tmp, "--", "Reply OK."],
-                    capture_output=True, text=True, timeout=int(self.extra.get("probe_timeout_s", 120)),
+                    [self.exe, "run", "--agent", "plan", *self._model(), "--format", "json", "--", "Reply OK."],
+                    capture_output=True, text=True, cwd=tmp, timeout=int(self.extra.get("probe_timeout_s", 120)),
                     creationflags=0x08000000, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                 )
                 events = [d for d in map(_json, (out.stdout or "").splitlines()) if d]
