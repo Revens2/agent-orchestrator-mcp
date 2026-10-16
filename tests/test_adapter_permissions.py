@@ -54,6 +54,8 @@ def test_opencode():
     ww = argv("opencode", "workspace_write", extra={"model": "opencode/m"})
     assert after(ww, "--agent") == "build" and "--auto" in ww and after(ww, "-m") == "opencode/m"
     assert ww[-2:] == ["--", "Create E2E_PERMISSION_TEST.txt containing exactly OK."]
+    # opencode run 1.19 no longer supports --dir; the runner process supplies cwd.
+    assert "--dir" not in ww
     ro = argv("opencode", "read_only")
     assert after(ro, "--agent") == "plan" and "--auto" not in ro and "-m" not in ro
     guarded = ADAPTERS["opencode"]("x", None, P.GUARDED)
