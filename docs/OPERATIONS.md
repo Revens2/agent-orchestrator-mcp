@@ -213,6 +213,29 @@ Anti-boucle : 2 corruptions consécutives sur la même mission ⇒ `retry` refus
 (`session_corruption_loop`, cause config/plugin/auth à corriger) ; `max_attempts` borne le reste.
 Journal : `agent_job_events` (`session_corrupted`, `session_recreated`).
 
+## Quota fournisseur épuisé (pause-quota, issue #6)
+
+Un quota/forfait/crédit épuisé n'est ni un timeout, ni un stall, ni une corruption.
+Chaîne : adapter (`opencode`, `fake`) reconnaît une signature EXACTE dans un
+événement d'erreur typé (`match_quota` : `insufficient_quota`, `usage_limit_reached`,
+`credit balance is too low`… jamais un `429`/`rate_limit` seul) → le runner tue
+l'arbre immédiatement (slot libéré, pas d'attente de `timeout_s`) → job `failed`
+(`quota_exhausted:<signe>[;retry_after_s=N]`, jamais `completed`) → événements
+`provider_quota_detected` + `mission_paused` → mission `waiting_for_quota`
+(persistée, survit aux redémarrages ; bloc `pause` dans `agent_mission_get` :
+`reason`, `since`, `resume_after` si le fournisseur l'annonce, `resume_ready`).
+`agent_mission_wait` rend la main (`must_follow=false`, `paused=true`) : le tour
+ChatGPT se termine, aucun appel n'est maintenu pendant le reset.
+Reprise : `agent_mission_retry` (même depuis une nouvelle conversation) crée une
+tentative liée qui relance la MÊME session (`opencode run --session <id>`),
+événement `mission_resumed`, sans entamer `max_attempts`. Refus `quota_not_reset`
+avant `resume_after` sauf `force=true` (changement de modèle/forfait décidé par
+l'utilisateur, jamais automatique). Anti-boucle : 10 reprises quota max par
+mission (`quota_resume_loop`). Abandon : `agent_mission_validate` blocked/failed
+(jamais `validated` depuis la pause). Rollback : ancien `src` (colonnes ajoutées
+ignorées ; l'ancien code ne sait ni reprendre ni valider `waiting_for_quota` :
+repasser ces missions en `incomplete` avant rollback).
+
 ## Questions en attente (Photon/iMessage + inbox ChatGPT)
 
 État explicite `waiting_for_user` (table `pending_questions`), jamais deviné

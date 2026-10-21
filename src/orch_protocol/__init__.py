@@ -128,11 +128,17 @@ EV_STALLED = "stalled"
 # nouvelle session propre via mission_retry, handoff minimal (pas de transcript).
 EV_SESSION_CORRUPTED = "session_corrupted"
 EV_SESSION_RECREATED = "session_recreated"
+# Pause-quota (issue #6) : quota fournisseur épuisé => tentative close (failed
+# `quota_exhausted:`), mission suspendue durablement, reprise explicite.
+EV_PROVIDER_QUOTA_DETECTED = "provider_quota_detected"
+EV_MISSION_PAUSED = "mission_paused"
+EV_MISSION_RESUMED = "mission_resumed"
 EVENT_KINDS = frozenset({
     EV_JOB_CLAIMED, EV_RUNTIME_SPAWNED, EV_PROCESS_RUNNING, EV_OUTPUT_PROGRESS,
     EV_ACTIVITY, EV_PROCESS_EXIT, EV_RUNNER_DISCONNECT, EV_LEASE_EXPIRED,
     EV_REQUEUED, EV_CANCEL_REQUESTED, EV_TIMEOUT_MARKED, EV_SUSPECTED_STALL, EV_STALLED,
     EV_SESSION_CORRUPTED, EV_SESSION_RECREATED,
+    EV_PROVIDER_QUOTA_DETECTED, EV_MISSION_PAUSED, EV_MISSION_RESUMED,
 })
 MAX_EVENTS_PER_JOB = 500
 OUTPUT_PROGRESS_STEP_CHARS = 65_536
@@ -144,9 +150,12 @@ MISSION_VALIDATED = "validated"
 MISSION_INCOMPLETE = "incomplete"
 MISSION_BLOCKED = "blocked"
 MISSION_FAILED = "failed"
+# Suspendue : quota fournisseur épuisé. Ni réussie, ni échouée ; aucun processus
+# ni appel MCP maintenu. Reprise = agent_mission_retry (même session runtime).
+MISSION_WAITING_FOR_QUOTA = "waiting_for_quota"
 MISSION_STATES = frozenset({
     MISSION_EXECUTING, MISSION_NEEDS_VALIDATION, MISSION_VALIDATED,
-    MISSION_INCOMPLETE, MISSION_BLOCKED, MISSION_FAILED,
+    MISSION_INCOMPLETE, MISSION_BLOCKED, MISSION_FAILED, MISSION_WAITING_FOR_QUOTA,
 })
 MAX_MISSION_ATTEMPTS = 5
 MAX_OBJECTIVE_CHARS = 4_000
@@ -187,6 +196,59 @@ def match_corruption(text: object) -> str | None:
         if sign in text:
             return sign
     return None
+
+
+# --- quota fournisseur épuisé (pause durable de mission, issue #6) -----------
+# Codes/messages EXACTS des fournisseurs pour un quota/forfait/crédit épuisé.
+# Volontairement absents : `429`, `rate_limit`, `RESOURCE_EXHAUSTED`, `Too Many
+# Requests` (limitation transitoire ou ambiguë => échec ordinaire, jamais une
+# pause quota inventée). Un 429 ChatGPT Web n'atteint jamais ce code.
+QUOTA_SIGNS = (
+    "insufficient_quota",               # OpenAI : code d'erreur
+    "You exceeded your current quota",  # OpenAI : message
+    "billing_hard_limit_reached",       # OpenAI : plafond de facturation
+    "usage_limit_reached",              # abonnement ChatGPT (codex/opencode) : type d'erreur
+    "You've hit your usage limit",      # abonnement ChatGPT : message
+    "credit balance is too low",        # Anthropic : crédits épuisés
+)
+QUOTA_EXHAUSTED_PREFIX = "quota_exhausted:"
+QUOTA_RETRY_AFTER_KEY = "retry_after_s="
+# Reprises quota (n'entament pas max_attempts) : borne anti-boucle par mission.
+MAX_QUOTA_RESUMES = 10
+# Délai de reset annoncé par le fournisseur retenu au plus (au-delà : incohérent).
+MAX_QUOTA_RETRY_AFTER_S = 31 * 86_400
+
+
+def match_quota(text: object) -> str | None:
+    """Première signature quota exacte trouvée, sinon None (jamais sur un 429 seul)."""
+    if not isinstance(text, str):
+        return None
+    for sign in QUOTA_SIGNS:
+        if sign in text:
+            return sign
+    return None
+
+
+def quota_error(sign: str, retry_after_s: int | None = None) -> str:
+    """Erreur de job normalisée : `quota_exhausted:<signe>[;retry_after_s=N]`."""
+    err = f"{QUOTA_EXHAUSTED_PREFIX}{sign}"
+    if retry_after_s is not None and 0 < int(retry_after_s) <= MAX_QUOTA_RETRY_AFTER_S:
+        err += f";{QUOTA_RETRY_AFTER_KEY}{int(retry_after_s)}"
+    return err
+
+
+def parse_quota_error(error: object) -> tuple[str, int | None] | None:
+    """(signe, retry_after_s|None) si `error` est une erreur quota normalisée."""
+    if not isinstance(error, str) or not error.startswith(QUOTA_EXHAUSTED_PREFIX):
+        return None
+    head = error[len(QUOTA_EXHAUSTED_PREFIX):].split(" | ", 1)[0]
+    sign, _, rest = head.partition(";")
+    retry: int | None = None
+    if rest.startswith(QUOTA_RETRY_AFTER_KEY):
+        digits = rest[len(QUOTA_RETRY_AFTER_KEY):].split(";", 1)[0].strip()
+        if digits.isdigit() and 0 < int(digits) <= MAX_QUOTA_RETRY_AFTER_S:
+            retry = int(digits)
+    return sign.strip(), retry
 # display_title dérive un titre court et stable du premier objectif réel.
 # Stable par construction (fonction pure du texte source : pas de renommage
 # en boucle), sans migration (calculé à la lecture, identités/source_hash
@@ -313,6 +375,14 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 def valid_id(value: object) -> bool:
     """Identifiant opaque sûr : minuscules, chiffres, `-`, `_`, 1..64 car."""
     return isinstance(value, str) and bool(_ID_RE.fullmatch(value))
+
+
+_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def valid_session_id(value: object) -> bool:
+    """ID de session runtime réutilisable en argv (`--session`) : pas d'option, pas d'espace."""
+    return isinstance(value, str) and bool(_SESSION_RE.fullmatch(value))
 
 
 def clip(text: str | None, limit: int) -> str | None:

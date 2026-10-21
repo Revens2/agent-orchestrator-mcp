@@ -321,7 +321,11 @@ def register(mcp, store: Store) -> None:
             "should_continue=true — Y COMPRIS woke_by=timeout — RAPPELER agent_mission_wait avec "
             "since_seq=last_event_seq dans le MÊME tour, sans répondre à l'utilisateur. Ne répondez "
             "qu'après mission terminale validée (ou blocage réel : waiting_for_user, entrée requise, "
-            "failed/timeout/cancelled/lost à remonter explicitement)."
+            "failed/timeout/cancelled/lost à remonter explicitement). EXCEPTION mission_state="
+            "waiting_for_quota (paused=true, must_follow=false) : quota fournisseur épuisé, mission "
+            "conservée — NE PAS rappeler, répondre à l'utilisateur (mission_id + pause.resume_after) "
+            "et terminer le tour ; reprise ultérieure, même depuis une autre conversation, via "
+            "agent_mission_get puis agent_mission_retry."
         ),
     )
     async def agent_mission_wait(
@@ -337,15 +341,19 @@ def register(mcp, store: Store) -> None:
         description=(
             "Nouvelle tentative de la MÊME mission (nouveau job). Exige : mission needs_validation ou "
             "incomplete, tentative précédente terminale, attempts < max_attempts. Décision explicite "
-            "après examen du journal — jamais de relance aveugle de mission d'écriture."
+            "après examen du journal — jamais de relance aveugle de mission d'écriture. Mission "
+            "waiting_for_quota : REPRISE de la même session runtime (n'entame pas max_attempts), "
+            "refusée avant pause.resume_after (quota_not_reset) sauf force=true après changement "
+            "explicite de modèle/forfait par l'utilisateur."
         ),
     )
     async def agent_mission_retry(
         mission_id: Annotated[str, Field(description="Identifiant de la mission.")],
         prompt: Annotated[str | None, Field(description="Prompt ajusté (défaut = objectif).")] = None,
+        force: Annotated[bool, Field(description="Mission waiting_for_quota : reprendre avant resume_after.")] = False,
     ) -> dict:
         try:
-            return await anyio.to_thread.run_sync(store.retry_mission, mission_id, prompt)
+            return await anyio.to_thread.run_sync(store.retry_mission, mission_id, prompt, bool(force))
         except BrokerError as exc:
             return _err(exc)
 

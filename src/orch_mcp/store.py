@@ -313,6 +313,18 @@ class Store:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN stall_at REAL")
             if "recovery_since" not in cols:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN recovery_since REAL")
+            # Pause-quota (issue #6) : session runtime à reprendre (NULL = nouvelle session).
+            if "resume_session_id" not in cols:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN resume_session_id TEXT")
+            mcols = {r["name"] for r in self._db.execute("PRAGMA table_info(missions)").fetchall()}
+            if "pause_reason" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN pause_reason TEXT")
+            if "paused_at" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN paused_at REAL")
+            if "resume_after" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN resume_after REAL")
+            if "quota_resumes" not in mcols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN quota_resumes INTEGER NOT NULL DEFAULT 0")
             log.info("migrated jobs columns ok")
 
     def _emit(self, db, job_id: str, kind: str, detail: str | None = None) -> int:
@@ -599,9 +611,13 @@ class Store:
         mode: str,
         timeout_s: int | None = None,
         idempotency_key: str | None = None,
+        resume_session_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Crée un job `queued`. Retourne (job, created). Refuse avant toute exécution
-        si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé."""
+        si runner, runtime, workspace ou mode sont hors de ce que le runner a annoncé.
+        `resume_session_id` (interne, reprise pause-quota) : session runtime à poursuivre."""
+        if resume_session_id is not None and not P.valid_session_id(resume_session_id):
+            raise BrokerError("invalid_resume_session", "resume_session_id invalide")
         if not P.valid_id(runner_id):
             raise BrokerError("invalid_runner", "runner_id invalide")
         if runtime not in P.RUNTIMES:
@@ -652,10 +668,10 @@ class Store:
             job_id = str(uuid.uuid4())
             db.execute(
                 """INSERT INTO jobs(id, runner_id, runtime, workspace_id, mode, prompt, prompt_chars, idem_key, idem_hash,
-                     state, timeout_s, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     state, timeout_s, created_at, updated_at, resume_session_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job_id, runner_id, runtime, workspace_id, mode, prompt, len(prompt), idempotency_key, req_hash,
-                 P.QUEUED, timeout_s, now, now),
+                 P.QUEUED, timeout_s, now, now, resume_session_id),
             )
             self._log_transition(db, job_id, None, P.QUEUED, "mcp")
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -691,19 +707,21 @@ class Store:
                 self._log_transition(db, row["id"], P.QUEUED, P.CLAIMED, f"runner:{runner_id}")
                 self._emit(db, row["id"], P.EV_JOB_CLAIMED, f"pris par {runner_id}")
                 fresh = db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
-                claimed.append(
-                    {
-                        "protocol_version": P.PROTOCOL_VERSION,
-                        "job_id": fresh["id"],
-                        "fencing": fresh["fencing"],
-                        "runtime": fresh["runtime"],
-                        "workspace_id": fresh["workspace_id"],
-                        "mode": fresh["mode"],
-                        "prompt": fresh["prompt"],
-                        "timeout_s": fresh["timeout_s"],
-                        "lease_s": P.LEASE_S,
-                    }
-                )
+                spec = {
+                    "protocol_version": P.PROTOCOL_VERSION,
+                    "job_id": fresh["id"],
+                    "fencing": fresh["fencing"],
+                    "runtime": fresh["runtime"],
+                    "workspace_id": fresh["workspace_id"],
+                    "mode": fresh["mode"],
+                    "prompt": fresh["prompt"],
+                    "timeout_s": fresh["timeout_s"],
+                    "lease_s": P.LEASE_S,
+                }
+                if fresh["resume_session_id"]:
+                    # champ optionnel (protocole v1 inchangé : absent = nouvelle session)
+                    spec["resume_session_id"] = fresh["resume_session_id"]
+                claimed.append(spec)
             return claimed
 
     def transition(
@@ -783,7 +801,11 @@ class Store:
                     # session abandonnée (jamais réutilisée : le retry crée un
                     # nouveau job = nouvelle session + handoff, pas de transcript).
                     self._emit(db, job_id, P.EV_SESSION_CORRUPTED, error[:500])
-                self._mission_on_job_terminal(db, job_id, dst)
+                elif dst == P.FAILED and P.parse_quota_error(error) is not None:
+                    # Quota fournisseur épuisé : tentative close (jamais completed),
+                    # la mission sera suspendue (waiting_for_quota), pas incomplete.
+                    self._emit(db, job_id, P.EV_PROVIDER_QUOTA_DETECTED, error[:500])
+                self._mission_on_job_terminal(db, job_id, dst, error)
             return self._job_view(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def record_runner_question(
@@ -1167,27 +1189,65 @@ class Store:
                 "validation_state": row["validation_state"],
                 "validation_note": row["validation_note"],
                 "attempt_job_ids": [a["job_id"] for a in attempts],
+                "quota_resumes": int(row["quota_resumes"] or 0),
+                "pause": self._pause_view(row),
                 "created_at": _iso(row["created_at"]),
                 "updated_at": _iso(row["updated_at"]),
             }
 
-    def retry_mission(self, mission_id: str, prompt: str | None = None) -> dict[str, Any]:
+    def _pause_view(self, row) -> dict[str, Any] | None:
+        """Bloc pause-quota d'une mission (None si non suspendue). Récupérable depuis
+        une NOUVELLE conversation via agent_mission_get : aucun appel maintenu."""
+        if row["state"] != P.MISSION_WAITING_FOR_QUOTA:
+            return None
+        resume_after = row["resume_after"]
+        return {
+            "reason": row["pause_reason"],
+            "since": _iso(row["paused_at"]),
+            "resume_after": _iso(resume_after),
+            "resume_ready": resume_after is None or self.clock() >= float(resume_after),
+            "resume_tool": "agent_mission_retry",
+            "quota_resumes_left": max(0, P.MAX_QUOTA_RESUMES - int(row["quota_resumes"] or 0)),
+        }
+
+    def retry_mission(self, mission_id: str, prompt: str | None = None, force: bool = False) -> dict[str, Any]:
         """Nouvelle tentative de la MÊME mission (nouveau job). Exige : mission en
         needs_validation/incomplete, tentative précédente terminale, attempts < max.
-        Jamais de relance aveugle : l'appelant MCP décide après examen du journal."""
+        Jamais de relance aveugle : l'appelant MCP décide après examen du journal.
+
+        Mission `waiting_for_quota` : REPRISE (pas un échec de l'agent) — même
+        session runtime si connue, n'entame pas max_attempts (borné par
+        MAX_QUOTA_RESUMES), refusée avant `resume_after` sauf `force=True`
+        (l'utilisateur a changé de modèle/forfait ou levé le quota lui-même)."""
+        now = self.clock()
         with self._tx() as db:
             m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
             if m is None:
                 raise BrokerError("unknown_mission", "mission inconnue")
-            if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE):
+            paused = m["state"] == P.MISSION_WAITING_FOR_QUOTA
+            if not paused and m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE):
                 raise BrokerError("mission_not_retryable", f"mission {m['state']} : retry refusé")
-            if int(m["attempts"]) >= int(m["max_attempts"]):
+            quota_resumes = int(m["quota_resumes"] or 0)
+            if paused:
+                if quota_resumes >= P.MAX_QUOTA_RESUMES:
+                    raise BrokerError(
+                        "quota_resume_loop",
+                        f"{P.MAX_QUOTA_RESUMES} reprises après quota : vérifier le forfait/modèle avant toute reprise",
+                    )
+                if not force and m["resume_after"] is not None and now < float(m["resume_after"]):
+                    raise BrokerError(
+                        "quota_not_reset",
+                        f"quota annoncé disponible après {_iso(m['resume_after'])} ; "
+                        "réessayer plus tard, ou force=true après changement explicite de modèle/forfait",
+                    )
+            elif int(m["attempts"]) - quota_resumes >= int(m["max_attempts"]):
                 raise BrokerError("max_attempts_reached", "plus de tentatives autorisées")
             cur = db.execute("SELECT state FROM jobs WHERE id=?", (m["current_job_id"],)).fetchone() if m["current_job_id"] else None
             if cur is None or cur["state"] not in P.TERMINAL:
                 raise BrokerError("attempt_still_active", "la tentative en cours n'est pas terminée")
             job_spec = db.execute(
-                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error FROM jobs WHERE id=?", (m["current_job_id"],)
+                "SELECT runner_id, runtime, workspace_id, mode, timeout_s, error, runtime_session_id FROM jobs WHERE id=?",
+                (m["current_job_id"],),
             ).fetchone()
             prev_corrupted = bool(job_spec and isinstance(job_spec["error"], str)
                                   and job_spec["error"].startswith(P.SESSION_CORRUPTED_PREFIX))
@@ -1207,23 +1267,52 @@ class Store:
                         f"{P.MAX_CONSECUTIVE_CORRUPTIONS} sessions corrompues d'affilée : "
                         "corriger la cause (config/plugin/auth opencode) avant tout retry",
                     )
+        resume_sid = None
+        next_prompt = prompt if isinstance(prompt, str) and prompt.strip() else m["objective"]
+        if paused:
+            sid = job_spec["runtime_session_id"]
+            resume_sid = sid if P.valid_session_id(sid) else None
+            if not (isinstance(prompt, str) and prompt.strip()):
+                # Écritures déjà faites : jamais rejouées à l'aveugle.
+                next_prompt = (
+                    f"{m['objective']}\n\n[orchestrator] Reprise après pause quota fournisseur : poursuis là où "
+                    "la tentative précédente s'est arrêtée, ne refais pas les étapes déjà faites et vérifie "
+                    "l'état des fichiers avant toute écriture."
+                )
         job, _ = self.create_job(
             job_spec["runner_id"], job_spec["runtime"], job_spec["workspace_id"],
-            prompt if isinstance(prompt, str) and prompt.strip() else m["objective"],
-            job_spec["mode"], job_spec["timeout_s"],
+            next_prompt, job_spec["mode"], job_spec["timeout_s"], resume_session_id=resume_sid,
         )
         now = self.clock()
         with self._tx() as db:
             attempt_no = int(m["attempts"]) + 1
-            db.execute(
-                "UPDATE missions SET attempts=?, current_job_id=?, state=?, validation_state=NULL, updated_at=? WHERE id=?",
-                (attempt_no, job["job_id"], P.MISSION_EXECUTING, now, mission_id),
+            # CAS sur (état, tentative courante) : deux reprises concurrentes ne
+            # créent jamais deux tentatives actives ; le perdant est annulé.
+            cur = db.execute(
+                """UPDATE missions SET attempts=?, current_job_id=?, state=?, validation_state=NULL,
+                     quota_resumes=?, pause_reason=NULL, paused_at=NULL, resume_after=NULL, updated_at=?
+                   WHERE id=? AND state=? AND current_job_id IS ?""",
+                (attempt_no, job["job_id"], P.MISSION_EXECUTING, quota_resumes + (1 if paused else 0), now,
+                 mission_id, m["state"], m["current_job_id"]),
             )
-            db.execute(
-                "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
-                (mission_id, attempt_no, job["job_id"], now),
-            )
-            if prev_corrupted:
+            won = cur.rowcount == 1
+            if not won:
+                # Pas de raise dans la tx (il annulerait aussi l'annulation) :
+                # tentative orpheline annulée ici, erreur levée après COMMIT.
+                self._set_terminal(db, job["job_id"], P.QUEUED, P.CANCELLED, "mcp", "reprise concurrente : tentative annulée")
+            else:
+                db.execute(
+                    "INSERT INTO mission_attempts(mission_id, attempt_no, job_id, at) VALUES (?,?,?,?)",
+                    (mission_id, attempt_no, job["job_id"], now),
+                )
+            if won and paused:
+                self._emit(
+                    db, job["job_id"], P.EV_MISSION_RESUMED,
+                    f"reprise après pause quota (job {m['current_job_id']}) ; "
+                    + (f"même session {resume_sid}" if resume_sid else "session inconnue : nouvelle session, reprise exacte non garantie")
+                    + (" ; force" if force else ""),
+                )
+            if won and prev_corrupted:
                 # Nouvelle session propre, une seule fois par retry : handoff
                 # minimal durable (objectif + job précédent + prochaine action),
                 # jamais le transcript corrompu.
@@ -1233,6 +1322,8 @@ class Store:
                     f"reprendre l'objectif « {P.display_title(m['objective'], fallback='mission')} » "
                     "via progress et fichiers concernés",
                 )
+        if not won:
+            raise BrokerError("state_conflict", "mission modifiée en parallèle : tentative non créée")
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
     def validate_mission(self, mission_id: str, verdict: str, note: str | None = None) -> dict[str, Any]:
@@ -1245,26 +1336,50 @@ class Store:
             m = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
             if m is None:
                 raise BrokerError("unknown_mission", "mission inconnue")
-            if m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
+            if m["state"] == P.MISSION_WAITING_FOR_QUOTA:
+                # Abandon d'une mission suspendue (pause ≠ succès) : jamais `validated`.
+                if verdict == "validated":
+                    raise BrokerError("mission_not_validatable", "mission waiting_for_quota : reprendre avant de valider")
+            elif m["state"] not in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
                 raise BrokerError("mission_not_validatable", f"mission {m['state']} : validation refusée")
             clean_note = P.clip(redact(note.strip()), 2_000) if isinstance(note, str) and note.strip() else None
             db.execute(
-                "UPDATE missions SET state=?, validation_state=?, validation_note=?, updated_at=? WHERE id=?",
+                """UPDATE missions SET state=?, validation_state=?, validation_note=?, pause_reason=NULL,
+                     paused_at=NULL, resume_after=NULL, updated_at=? WHERE id=?""",
                 (verdict, verdict, clean_note, now, mission_id),
             )
         return self.get_mission(mission_id) or {"error": "internal", "mission_id": mission_id}
 
-    def _mission_on_job_terminal(self, db, job_id: str, job_state: str) -> None:
+    def _mission_on_job_terminal(self, db, job_id: str, job_state: str, error: str | None = None) -> None:
         """Hook : un job terminal fait progresser sa mission, sans jamais valider.
-        exit 0 -> needs_validation ; sinon -> incomplete. Pas de retry automatique."""
+        exit 0 -> needs_validation ; quota fournisseur épuisé -> waiting_for_quota
+        (pause durable, reprise explicite) ; sinon -> incomplete. Pas de retry automatique."""
         m = db.execute(
             "SELECT id, state FROM missions WHERE current_job_id=? AND state=?", (job_id, P.MISSION_EXECUTING)
         ).fetchone()
         if m is None:
             return
+        now = self.clock()
+        quota = P.parse_quota_error(error) if job_state == P.FAILED else None
+        if quota is not None:
+            sign, retry_after_s = quota
+            resume_after = now + retry_after_s if retry_after_s else None
+            db.execute(
+                """UPDATE missions SET state=?, pause_reason=?, paused_at=?, resume_after=?, updated_at=?
+                   WHERE id=? AND state=?""",
+                (P.MISSION_WAITING_FOR_QUOTA, f"quota_exhausted:{sign}"[:200], now, resume_after, now,
+                 m["id"], P.MISSION_EXECUTING),
+            )
+            self._emit(
+                db, job_id, P.EV_MISSION_PAUSED,
+                f"mission {m['id']} waiting_for_quota ({sign})"
+                + (f" ; reprise possible après {_iso(resume_after)}" if resume_after else " ; date de reset inconnue"),
+            )
+            log.info("mission_paused mission_id=%s job=%s sign=%s", m["id"], job_id, sign)
+            return
         nxt = P.MISSION_NEEDS_VALIDATION if job_state == P.COMPLETED else P.MISSION_INCOMPLETE
         db.execute(
-            "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, self.clock(), m["id"])
+            "UPDATE missions SET state=?, updated_at=? WHERE id=?", (nxt, now, m["id"])
         )
         log.info("mission_progress mission_id=%s job %s -> %s", m["id"], job_state, nxt)
 
@@ -1876,13 +1991,23 @@ class Store:
         m2 = self.get_mission(mission_id) or m
         state = m2["state"]
         pursuing = state == P.MISSION_EXECUTING and not w["terminal"]
+        extra: dict[str, Any] = {}
         if pursuing:
             nxt = "agent_mission_wait"
+        elif state == P.MISSION_WAITING_FOR_QUOTA:
+            # Pause durable : NE PAS rappeler dans ce tour (un reset de forfait peut
+            # prendre des heures). Répondre à l'utilisateur, reprendre plus tard —
+            # éventuellement depuis une autre conversation — via agent_mission_get
+            # puis agent_mission_retry.
+            nxt = "agent_mission_get"
+            extra = {"paused": True, "pause": m2.get("pause"), "follow_up": "state_change",
+                     "resume_tool": "agent_mission_retry"}
         elif state in (P.MISSION_NEEDS_VALIDATION, P.MISSION_INCOMPLETE, P.MISSION_BLOCKED):
             nxt = "agent_mission_validate"
         else:
             nxt = "agent_mission_get"
         return {
+            **extra,
             "mission_id": mission_id,
             "mission_state": state,
             "job_id": job_id,

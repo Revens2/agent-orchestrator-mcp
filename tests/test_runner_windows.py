@@ -266,6 +266,33 @@ def test_e2e_timeout(stack):
     assert job["state"] == "timeout"
 
 
+def test_e2e_quota_suspends_mission_then_resumes_same_session(stack):
+    """Issue #6 : fournisseur muet après quota (processus vivant). Le runner doit
+    conclure tout de suite (pas de timeout), la mission passe waiting_for_quota,
+    le wait MCP rend la main, puis la reprise relance la MÊME session."""
+    broker, *_ = stack
+    store = broker.store
+    t0 = time.time()
+    m = store.create_mission(
+        "Refondre la doc", ["ok"], max_attempts=1, runner_id="pc", runtime="fake", workspace_id="e2e",
+        mode="workspace_write", timeout_s=600,
+        prompt="session fake-ses-1\nprint 1\nquota insufficient_quota\nprint 2\n",
+    )
+    job1 = wait_state(store, m["current_job_id"], P.TERMINAL, timeout=30)
+    assert time.time() - t0 < 30  # bien avant timeout_s=600 : slot libéré
+    assert job1["state"] == "failed" and job1["error"].startswith(P.QUOTA_EXHAUSTED_PREFIX)
+    assert job1["runtime_session_id"] == "fake-ses-1" and "line 1" not in (job1["output_tail"] or "")
+    mission = store.get_mission(m["mission_id"])
+    assert mission["state"] == P.MISSION_WAITING_FOR_QUOTA
+    w = store.wait_for_mission(m["mission_id"], -1, 30)
+    assert w["must_follow"] is False and w["paused"] is True
+    resumed = store.retry_mission(m["mission_id"])
+    job2 = wait_state(store, resumed["current_job_id"], P.TERMINAL, timeout=30)
+    assert job2["state"] == "completed"
+    assert "RESUMED:fake-ses-1" in job2["output_tail"]
+    assert store.get_mission(m["mission_id"])["state"] == P.MISSION_NEEDS_VALIDATION
+
+
 def test_e2e_concurrency_limit_and_queue(stack):
     broker, *_ = stack
     ids = [submit(broker.store, f"sleep 3\nprint {i}\n") for i in range(5)]

@@ -70,6 +70,11 @@ ChatGPT Web ──HTTPS + OAuth 2.1 (DCR, PKCE, consentement phrase de passe)─
 > `runtime_process_health` pour diagnostiquer la cause observable, et `agent_job_events`
 > le journal (`lease_expired`, `runner_disconnect`, …).
 >
+> **Quota fournisseur épuisé** : processus arrêté sans attendre le timeout, job `failed`
+> (`quota_exhausted:…`), mission `waiting_for_quota` durable ; `agent_mission_wait` rend la
+> main (`must_follow=false`) et `agent_mission_retry` reprend la même session plus tard
+> (cf. `docs/OPERATIONS.md`).
+>
 > **Stalls** : processus vivant + silence d'activité/output ≥ 10 min → événement
 > `suspected_stall`, ≥ 30 min → `stalled`. Notification seule : jamais de relance ni
 > d'annulation automatique (surtout pas pour une mission d'écriture).

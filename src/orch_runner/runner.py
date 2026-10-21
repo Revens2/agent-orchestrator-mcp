@@ -71,6 +71,7 @@ def _git_snapshot(path: str) -> dict[str, Any] | None:
         "dirty": bool(porcelain) if porcelain is not None else None,
     }
 
+QUOTA = "quota"  # raison d'arrêt locale (pas un état de job)
 ABORT_CODES = {"stale_fencing", "state_conflict", "unknown_job", "invalid_transition"}
 RESYNC_CODES = {"superseded", "unknown_runner"}
 
@@ -308,6 +309,13 @@ class JobWorker(threading.Thread):
         if ws is None:
             return self._refuse("workspace_denied", "workspace absent de l'allowlist locale")
         adapter = ADAPTERS[job["runtime"]](rt.exe, rt.extra, cfg.permission_policy)
+        resume_sid = job.get("resume_session_id")
+        if resume_sid is not None:
+            # Reprise après pause-quota : la session vient du broker, revalidée ici.
+            if not P.valid_session_id(resume_sid):
+                return self._refuse("invalid_resume_session", "resume_session_id invalide")
+            adapter.resume_session_id = resume_sid
+            self.session_id = resume_sid
         if job["mode"] not in ws.modes or job["mode"] not in adapter.modes:
             return self._refuse("mode_denied", "mode non autorisé pour ce workspace/runtime")
         prompt = job.get("prompt")
@@ -369,6 +377,14 @@ class JobWorker(threading.Thread):
             if self.cancel_event.is_set() and reason is None:
                 reason = P.CANCELLED
                 self.proc.kill_tree(1)
+            elif adapter.quota_exhausted is not None and reason is None:
+                # Quota fournisseur épuisé (signature exacte, événement typé) :
+                # le processus ne progressera plus. On libère le slot tout de
+                # suite au lieu d'attendre le timeout ; la mission est suspendue
+                # côté broker et reprendra la même session (issue #6).
+                reason = QUOTA
+                log.warning("job_quota_exhausted job_id=%s sign=%s", self.job_id, adapter.quota_exhausted)
+                self.proc.kill_tree(1)
             elif time.monotonic() - started > int(job["timeout_s"]) and reason is None:
                 reason = P.TIMEOUT
                 self.proc.kill_tree(1)
@@ -392,6 +408,9 @@ class JobWorker(threading.Thread):
             self._transition(P.CANCELLED, exit_code=exit_code, result_summary=summary, error="annulé : arbre de processus terminé")
         elif reason == P.TIMEOUT:
             self._transition(P.TIMEOUT, exit_code=exit_code, result_summary=summary, error=f"timeout {job['timeout_s']} s : arbre terminé")
+        elif outcome.error and outcome.error.startswith(P.QUOTA_EXHAUSTED_PREFIX):
+            # Jamais `completed` (même exit 0) ; erreur normalisée lue par le broker.
+            self._transition(P.FAILED, exit_code=exit_code, result_summary=summary, error=outcome.error)
         elif outcome.ok and exit_code == 0:
             self._transition(P.COMPLETED, exit_code=0, result_summary=summary)
         else:

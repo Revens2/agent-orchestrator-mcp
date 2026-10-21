@@ -49,6 +49,14 @@ class Adapter:
         self.policy = policy
         self.session_id: str | None = None
         self.last_text: str | None = None
+        # Pause-quota (issue #6) : signature exacte observée dans un événement
+        # d'erreur TYPÉ du runtime ; le runner arrête alors le processus au lieu
+        # d'attendre le timeout. None = aucun quota reconnu (jamais deviné).
+        self.quota_exhausted: str | None = None
+        self.quota_retry_after_s: int | None = None
+        # Reprise d'une session runtime existante (fournie par le broker après
+        # pause-quota) ; ignorée par les adapters qui ne la supportent pas.
+        self.resume_session_id: str | None = None
 
     # -- découverte
     def probe(self) -> dict[str, Any]:
@@ -92,6 +100,29 @@ def _json(line: str) -> dict | None:
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _retry_after_s(err: dict) -> int | None:
+    """Délai de reset annoncé par le fournisseur, s'il est explicite et numérique :
+    en-tête `retry-after` (secondes) ou corps `resets_in_seconds`. Sinon None
+    (jamais de date inventée ; une date HTTP n'est pas interprétée)."""
+    data = err.get("data") if isinstance(err.get("data"), dict) else {}
+    headers = data.get("responseHeaders") if isinstance(data.get("responseHeaders"), dict) else {}
+    candidates: list[object] = [v for k, v in headers.items() if str(k).lower() == "retry-after"]
+    body = data.get("responseBody")
+    if isinstance(body, str):
+        body = _json(body)
+    if isinstance(body, dict):
+        inner = body.get("error") if isinstance(body.get("error"), dict) else body
+        candidates.append(inner.get("resets_in_seconds"))
+    for value in candidates:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int | float) or (isinstance(value, str) and value.strip().isdigit()):
+            secs = int(float(value))
+            if 0 < secs <= P.MAX_QUOTA_RETRY_AFTER_S:
+                return secs
+    return None
 
 
 class ClaudeCode(Adapter):
@@ -269,8 +300,17 @@ class OpenCode(Adapter):
         # premier objectif réel, jamais renommé ensuite.
         title = P.display_title(prompt, fallback="session opencode")
         self._prompt_title = title
+        if self.resume_session_id is not None:
+            # Reprise après pause-quota : même session (contexte conservé), pas de
+            # nouveau titre. ID revalidé localement (jamais une option en argv).
+            if not P.valid_session_id(self.resume_session_id):
+                raise ValueError("opencode : resume_session_id invalide")
+            self.session_id = self.resume_session_id
+            session = ["--session", self.resume_session_id]
+        else:
+            session = ["--title", title]
         return Launch([self.exe, "run", *self.MODE[self.policy][mode], *self._model(), "--format", "json",
-                       "--title", title, "--dir", cwd, "--", prompt], None)
+                       *session, "--dir", cwd, "--", prompt], None)
 
     def probe(self):
         """--version ne prouve pas qu'un modèle répond : génération minimale (au démarrage du runner seulement)."""
@@ -322,6 +362,13 @@ class OpenCode(Adapter):
             self.error = msg[:500]
             self._tail.append(msg[:500])
             del self._tail[:-30]
+            # Quota épuisé : signature exacte dans l'événement d'erreur typé
+            # (message ou corps fournisseur), jamais sur un simple 429.
+            sign = P.match_quota(msg) or P.match_quota(json.dumps(err, ensure_ascii=False)[:8_000])
+            if sign is not None and self.quota_exhausted is None:
+                self.quota_exhausted = sign
+                self.quota_retry_after_s = _retry_after_s(err)
+                return f"[error] {msg}\n", f"quota: {sign}"
             return f"[error] {msg}\n", f"error: {msg[:100]}"
         sid = data.get("sessionID") or (data.get("part") or {}).get("sessionID")
         if isinstance(sid, str):
@@ -334,6 +381,16 @@ class OpenCode(Adapter):
 
     def finish(self, exit_code, tmpdir):
         error = getattr(self, "error", None)
+        if self.quota_exhausted is not None:
+            # Pause-quota : tentative close NON réussie, session conservée pour
+            # la reprise (agent_mission_retry => `opencode run --session <id>`).
+            handoff = (
+                f"quota fournisseur épuisé ({self.quota_exhausted}) ; mission suspendue, "
+                f"reprendre via agent_mission_retry (même session) pour « {self._prompt_title} »"
+            )
+            if self.last_text:
+                handoff += f"\n---\ndernier message : {self.last_text[-2_000:]}"
+            return Outcome(False, handoff, P.quota_error(self.quota_exhausted, self.quota_retry_after_s))
         if exit_code != 0:
             # Session reconnue corrompue : signature EXACTE uniquement (jamais
             # un simple mot "error"). La session est abandonnée ; le retry
@@ -493,12 +550,27 @@ class Fake(Adapter):
 
     def build(self, prompt, mode, cwd, tmpdir):
         script = str(Path(__file__).with_name("fake_agent.py"))
-        return Launch([self.exe, "-u", script, mode], prompt, {"PYTHONIOENCODING": "utf-8"})
+        env = {"PYTHONIOENCODING": "utf-8"}
+        if self.resume_session_id is not None:
+            if not P.valid_session_id(self.resume_session_id):
+                raise ValueError("fake : resume_session_id invalide")
+            env["FAKE_RESUME_SESSION"] = self.resume_session_id
+            self.session_id = self.resume_session_id
+        return Launch([self.exe, "-u", script, mode], prompt, env)
 
     def on_line(self, line):
         if line.startswith("SUMMARY:"):
             self.last_text = line[8:].strip()
+        elif line.startswith("SESSION:"):
+            self.session_id = line[8:].strip() or self.session_id
+        elif line.startswith("QUOTA:") and self.quota_exhausted is None:
+            self.quota_exhausted = P.match_quota(line[6:])
         return line, line.strip()[:120] or None
+
+    def finish(self, exit_code, tmpdir):
+        if self.quota_exhausted is not None:
+            return Outcome(False, f"quota fournisseur épuisé ({self.quota_exhausted})", P.quota_error(self.quota_exhausted))
+        return super().finish(exit_code, tmpdir)
 
 
 ADAPTERS: dict[str, type[Adapter]] = {a.id: a for a in (ClaudeCode, Codex, Agy, OpenCode, Fake, ClaudeDesktop)}
