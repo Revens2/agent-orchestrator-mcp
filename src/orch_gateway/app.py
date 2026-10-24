@@ -18,7 +18,7 @@ import os
 from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend, RequireAuthMiddleware
 from mcp.server.auth.provider import ProviderTokenVerifier
 from mcp.server.auth.routes import build_resource_metadata_url, create_auth_routes, create_protected_resource_routes
-from mcp.server.auth.settings import ClientRegistrationOptions
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.middleware.authentication import AuthenticationMiddleware
@@ -103,6 +103,9 @@ def construire_application(
                 valid_scopes=PORTEES,
                 default_scopes=[PORTEE],
             ),
+            # Revocation RFC 7009 (vault-mcp#11) : un client retire SES jetons ; revoquer
+            # un jeton revoque sa famille. Annoncee dans les metadonnees.
+            revocation_options=RevocationOptions(enabled=True),
         ),
         *create_protected_resource_routes(
             resource_url=AnyHttpUrl(resource_url_str),
