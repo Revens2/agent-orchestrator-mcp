@@ -23,9 +23,11 @@ import fcntl
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    TokenError,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
@@ -66,9 +69,86 @@ def portees_du_jeton_statique() -> list[str]:
 # Un code d'autorisation ne doit vivre que le temps d'un aller-retour de redirection.
 DUREE_CODE_S = 90
 DUREE_ACCES_S = 3600
-DUREE_RAFRAICHISSEMENT_S = 10 * 365 * 24 * 3600  # pas de limite pratique (23/09)
+# Duree GLISSANTE d'un jeton de rafraichissement (vault-mcp#11) : chaque rotation en
+# emet un nouveau valable cette duree, sans jamais depasser la duree absolue de sa
+# famille. Un client inactif plus longtemps doit re-consentir.
+DUREE_RAFRAICHISSEMENT_S = 30 * 24 * 3600
+# Duree ABSOLUE d'une famille de jetons (une famille = un consentement humain et
+# toutes ses rotations). Au-dela, re-consentement obligatoire, meme pour un client
+# actif : une fuite ne vaut jamais persistance illimitee.
+DUREE_MAX_FAMILLE_S = 90 * 24 * 3600
+# Fenetre pendant laquelle un jeton de rafraichissement DEJA consomme reste
+# echangeable (requete rejouee apres une reponse perdue). Defaut 60 s : un client
+# (ChatGPT) qui rejoue son refresh apres une reponse perdue ne perd pas sa session.
+# 0 = rotation stricte : tout rejeu revoque la famille entiere. Plafonnee : une
+# grace longue annulerait la detection de vol.
+GRACE_REJEU_DEFAUT_S = 60
+GRACE_REJEU_MAX_S = 300
 # Au-dela, une demande de consentement laissee ouverte est abandonnee.
 DUREE_DEMANDE_S = 600
+
+_journal = logging.getLogger(__name__)
+
+
+def _duree_env(nom: str, defaut: int, minimum: int, maximum: int | None = None) -> int:
+    """Lit une duree en secondes ; valeur invalide ou hors bornes -> defaut (journalise).
+
+    Fail-safe : une faute de frappe ne doit ni desactiver l'expiration ni la rendre
+    infinie, elle retombe sur la valeur par defaut.
+    """
+    brut = os.environ.get(nom, "").strip()
+    if not brut:
+        return defaut
+    try:
+        valeur = int(brut)
+    except ValueError:
+        _journal.warning("%s invalide, defaut %ss applique", nom, defaut)
+        return defaut
+    if valeur < minimum or (maximum is not None and valeur > maximum):
+        _journal.warning("%s hors bornes, defaut %ss applique", nom, defaut)
+        return defaut
+    return valeur
+
+
+def duree_max_famille_s() -> int:
+    """`ORCH_GW_OAUTH_REFRESH_MAX_LIFETIME_S`, defaut 90 jours, minimum 1 heure."""
+    return _duree_env("ORCH_GW_OAUTH_REFRESH_MAX_LIFETIME_S", DUREE_MAX_FAMILLE_S, 3600)
+
+
+def duree_rafraichissement_s() -> int:
+    """`ORCH_GW_OAUTH_REFRESH_TTL_S`, defaut 30 jours, jamais au-dela de la duree
+    absolue de famille."""
+    glissante = _duree_env("ORCH_GW_OAUTH_REFRESH_TTL_S", DUREE_RAFRAICHISSEMENT_S, 3600)
+    return min(glissante, duree_max_famille_s())
+
+
+def grace_rejeu_s() -> int:
+    """`ORCH_GW_OAUTH_REFRESH_REUSE_GRACE_S`, defaut 60 s, 0 = strict, maximum 300 s."""
+    return _duree_env(
+        "ORCH_GW_OAUTH_REFRESH_REUSE_GRACE_S", GRACE_REJEU_DEFAUT_S, 0, GRACE_REJEU_MAX_S
+    )
+
+
+def _empreinte(jeton: str) -> str:
+    """Les jetons consommes ne sont conserves que par empreinte : un vol du fichier
+    d'etat ne doit pas livrer des jetons rejouables."""
+    return hashlib.sha256(jeton.encode()).hexdigest()
+
+
+def _dans_la_grace(consomme: dict[str, Any], grace_s: int) -> bool:
+    """Grace 0 = aucune tolerance, meme dans la seconde du premier echange.
+
+    La grace ne sert qu'UNE fois par jeton (`grace_utilisee`) et ne couvre jamais
+    un successeur remplace (`remplace`) : sans cela, des rejeux successifs dans la
+    fenetre multiplieraient les refresh valides d'une meme famille."""
+    if (
+        grace_s <= 0
+        or consomme.get("revoque")
+        or consomme.get("grace_utilisee")
+        or consomme.get("remplace")
+    ):
+        return False
+    return int(time.time()) - int(consomme.get("consomme_a", 0)) <= grace_s
 
 ITERATIONS_PBKDF2 = 600_000
 
@@ -197,6 +277,12 @@ def _lire(cible: Path, defaut: Any) -> Any:
         raise EtatOAuthCorrompu(f"etat OAuth JSON invalide ({cible})") from exc
 
 
+# `consommes` : empreinte d'un jeton de rafraichissement deja echange -> sa famille.
+# C'est ce qui permet de reconnaitre un rejeu (et donc un vol probable) au lieu de
+# le confondre avec un jeton inconnu.
+CATEGORIES_ETAT = ("demandes", "codes", "acces", "rafraichissements", "consommes")
+
+
 class MagasinOAuth:
     """Etat persistant : demandes de consentement, codes, jetons.
 
@@ -248,7 +334,7 @@ class MagasinOAuth:
     # --- etat ------------------------------------------------------------------------
     def _etat(self) -> dict[str, dict[str, Any]]:
         etat: dict[str, dict[str, Any]] = _lire(self._fichier_etat, {})
-        for cle in ("demandes", "codes", "acces", "rafraichissements"):
+        for cle in CATEGORIES_ETAT:
             etat.setdefault(cle, {})
         return etat
 
@@ -256,7 +342,7 @@ class MagasinOAuth:
         """Read-modify-write de l'etat.json sous verrou, purge des expires incluse."""
 
         def _corps(etat: dict[str, dict[str, Any]]) -> Any:
-            for cle in ("demandes", "codes", "acces", "rafraichissements"):
+            for cle in CATEGORIES_ETAT:
                 etat.setdefault(cle, {})
             resultat = modification(etat)
             self._purger(etat)
@@ -266,12 +352,23 @@ class MagasinOAuth:
 
     @staticmethod
     def _purger(etat: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        """Retire ce qui a expire : le fichier ne grossit pas indefiniment."""
+        """Retire ce qui a expire : le fichier ne grossit pas indefiniment.
+
+        Borne aussi les jetons de rafraichissement herites (vault-mcp#11) : un jeton emis
+        avec une duree superieure a la duree glissante courante (10 ans, tweak du 23/09,
+        ou une duree reduite par configuration) est ramene a `maintenant + duree
+        glissante`. Ramenage idempotent : la borne ne recule plus une fois appliquee.
+        """
         maintenant = int(time.time())
-        for cle in ("demandes", "codes", "acces", "rafraichissements"):
+        for cle in CATEGORIES_ETAT:
             etat[cle] = {
                 k: v for k, v in etat.get(cle, {}).items() if v.get("expire_a", 0) > maintenant
             }
+        plafond = maintenant + duree_rafraichissement_s()
+        for donnees in etat["rafraichissements"].values():
+            borne = min(plafond, donnees.get("famille_expire_a") or plafond)
+            if donnees.get("expire_a", 0) > borne:
+                donnees["expire_a"] = borne
         return etat
 
     def poser_demande(self, donnees: dict[str, Any]) -> str:
@@ -326,6 +423,217 @@ class MagasinOAuth:
             etat["rafraichissements"].pop(jeton, None)
 
         self._modifier_etat(_revoquer)
+
+    @staticmethod
+    def _retirer_famille(etat: dict[str, dict[str, Any]], famille: str) -> int:
+        """Retire tous les jetons vivants (acces + rafraichissement) d'une famille et
+        marque ses jetons consommes `revoque` : sans ce marqueur, un refresh consomme
+        dans la fenetre de grace ressusciterait la famille revoquee."""
+        retires = 0
+        for cle in ("acces", "rafraichissements"):
+            vivants = etat[cle]
+            for jeton in [j for j, d in vivants.items() if d.get("famille") == famille]:
+                del vivants[jeton]
+                retires += 1
+        for marque in etat["consommes"].values():
+            if marque.get("famille") == famille:
+                marque["revoque"] = True
+        return retires
+
+    def tourner(
+        self,
+        ancien: str,
+        client_id: str,
+        grace_s: int,
+        emettre: Callable[[dict[str, Any], dict[str, dict[str, Any]]], OAuthToken],
+    ) -> OAuthToken | None:
+        """Rotation ATOMIQUE d'un jeton de rafraichissement (un seul verrou).
+
+        - jeton vivant : il passe en `consommes` (par empreinte) puis
+          `emettre(base)` pose la paire suivante dans la meme famille ;
+        - jeton consomme depuis <= `grace_s`, UNE seule fois : la paire emise lors
+          de la consommation (jamais recue : reponse perdue) est REMPLACEE par une
+          nouvelle, famille conservee. Le successeur remplace passe en `consommes`
+          marque `remplace` : s'il est presente plus tard, c'est un rejeu et la
+          famille tombe. Une famille n'a donc jamais deux refresh vivants ;
+        - sinon : None. Deux echanges concurrents du meme jeton ne produisent donc
+          jamais deux paires hors grace.
+
+        `emettre(base, etat)` mute `etat` et retourne le resultat a propager.
+        """
+
+        def _tourner(etat: dict[str, dict[str, Any]]) -> OAuthToken | None:
+            maintenant = int(time.time())
+            empreinte = _empreinte(ancien)
+            base = etat["rafraichissements"].get(ancien)
+            if base is None or base.get("client_id") != client_id:
+                consomme = etat["consommes"].get(empreinte)
+                if (
+                    consomme is None
+                    or consomme.get("client_id") != client_id
+                    or not _dans_la_grace(consomme, grace_s)
+                    or consomme["famille_expire_a"] <= maintenant
+                    or not self._remplacer_successeur(etat, consomme, maintenant)
+                ):
+                    return None
+                consomme["grace_utilisee"] = True
+                resultat = emettre(consomme, etat)
+                consomme["successeur"] = _empreinte(resultat.refresh_token or "")
+                consomme["successeur_acces"] = _empreinte(resultat.access_token)
+                return resultat
+            del etat["rafraichissements"][ancien]
+            famille = base.get("famille") or secrets.token_urlsafe(16)
+            famille_expire_a = base.get("famille_expire_a") or (
+                maintenant + duree_max_famille_s()
+            )
+            base = {**base, "famille": famille, "famille_expire_a": famille_expire_a}
+            etat["consommes"][empreinte] = {
+                "client_id": client_id,
+                "scopes": base["scopes"],
+                "famille": famille,
+                "famille_expire_a": famille_expire_a,
+                "consomme_a": maintenant,
+                # Conserve tant que le jeton aurait ete valide : au-dela, un rejeu
+                # serait de toute facon refuse comme expire.
+                "expire_a": base.get("expire_a", maintenant),
+            }
+            if base["famille_expire_a"] <= maintenant:
+                return None
+            resultat = emettre(base, etat)
+            etat["consommes"][empreinte]["successeur"] = _empreinte(resultat.refresh_token or "")
+            etat["consommes"][empreinte]["successeur_acces"] = _empreinte(resultat.access_token)
+            return resultat
+
+        resultat: OAuthToken | None = self._modifier_etat(_tourner)
+        return resultat
+
+    @staticmethod
+    def _remplacer_successeur(
+        etat: dict[str, dict[str, Any]], consomme: dict[str, Any], maintenant: int
+    ) -> bool:
+        """Retire la paire emise lors de la consommation de `consomme` et garde son
+        refresh en `consommes` marque `remplace` (sa presentation ulterieure = rejeu).
+
+        False si le successeur n'est plus vivant (deja tourne, revoque, ou entree sans
+        successeur connu) : la grace n'a alors plus d'objet, le rejeu est refuse."""
+        successeur = consomme.get("successeur")
+        vivant = next(
+            (
+                j
+                for j in etat["rafraichissements"]
+                if successeur and _empreinte(j) == successeur
+            ),
+            None,
+        )
+        if vivant is None:
+            return False
+        donnees = etat["rafraichissements"].pop(vivant)
+        etat["consommes"][successeur] = {
+            "client_id": donnees["client_id"],
+            "scopes": donnees["scopes"],
+            "famille": donnees["famille"],
+            "famille_expire_a": donnees["famille_expire_a"],
+            "consomme_a": maintenant,
+            "expire_a": donnees.get("expire_a", maintenant),
+            "remplace": True,
+        }
+        acces = consomme.get("successeur_acces")
+        for jeton in [j for j in etat["acces"] if acces and _empreinte(j) == acces]:
+            etat["acces"].pop(jeton)
+        return True
+
+    def signaler_rejeu(self, jeton: str, client_id: str, grace_s: int) -> str:
+        """Classe un jeton de rafraichissement absent des jetons vivants.
+
+        Retourne `"inconnu"`, `"grace"` (rejeu tolere) ou `"rejeu"` ; dans ce dernier
+        cas la famille ENTIERE est revoquee (RFC 9700 §4.14.2) : on ne sait pas qui,
+        du client legitime ou de l'attaquant, detient le jeton courant.
+        """
+
+        def _classer(etat: dict[str, dict[str, Any]]) -> str:
+            consomme = etat["consommes"].get(_empreinte(jeton))
+            if consomme is None or consomme.get("client_id") != client_id:
+                # Un autre client ne doit pas pouvoir faire tomber une famille.
+                return "inconnu"
+            if consomme.get("revoque"):
+                return "rejeu"
+            if _dans_la_grace(consomme, grace_s):
+                return "grace"
+            retires = self._retirer_famille(etat, consomme["famille"])
+            _journal.warning(
+                "OAuth: rejeu d'un jeton de rafraichissement consomme, famille revoquee "
+                "(client=%s famille=%s jetons_retires=%d)",
+                client_id,
+                consomme["famille"][:8],
+                retires,
+            )
+            return "rejeu"
+
+        return str(self._modifier_etat(_classer))
+
+    def lire_consomme(self, jeton: str) -> dict[str, Any] | None:
+        return self._etat()["consommes"].get(_empreinte(jeton))
+
+    def revoquer_famille_du_jeton(self, jeton: str) -> int:
+        """Revocation RFC 7009 : revoquer un jeton revoque toute sa famille (acces et
+        rafraichissement issus du meme consentement). Jeton herite sans famille :
+        seul ce jeton est retire."""
+
+        def _revoquer(etat: dict[str, dict[str, Any]]) -> int:
+            donnees = (
+                etat["acces"].get(jeton)
+                or etat["rafraichissements"].get(jeton)
+                # Refresh deja tourne : sa famille doit tomber aussi (sinon la grace
+                # le laisserait encore s'echanger).
+                or etat["consommes"].get(_empreinte(jeton))
+            )
+            if donnees is None:
+                return 0
+            famille = donnees.get("famille")
+            if not famille:
+                etat["acces"].pop(jeton, None)
+                etat["rafraichissements"].pop(jeton, None)
+                return 1
+            return self._retirer_famille(etat, famille)
+
+        return int(self._modifier_etat(_revoquer))
+
+    def revoquer_client(self, client_id: str | None = None) -> int:
+        """Revocation administrative : tous les jetons d'un client (ou de TOUS les
+        clients si `client_id` est None). Ne touche ni au registre des clients ni au
+        Bearer statique, qui se tourne a la main."""
+
+        def _revoquer(etat: dict[str, dict[str, Any]]) -> int:
+            retires = 0
+            for cle in ("acces", "rafraichissements"):
+                vivants = etat[cle]
+                cibles = [
+                    j
+                    for j, d in vivants.items()
+                    if client_id is None or d.get("client_id") == client_id
+                ]
+                for jeton in cibles:
+                    del vivants[jeton]
+                    retires += 1
+            # Ferme aussi la fenetre de grace des refresh deja consommes.
+            for marque in etat["consommes"].values():
+                if client_id is None or marque.get("client_id") == client_id:
+                    marque["revoque"] = True
+            return retires
+
+        return int(self._modifier_etat(_revoquer))
+
+    def resume(self) -> dict[str, dict[str, int]]:
+        """Nombre de jetons vivants par client, sans jamais exposer un jeton."""
+        etat = self._etat()
+        compte: dict[str, dict[str, int]] = {}
+        for cle in ("acces", "rafraichissements"):
+            for donnees in etat[cle].values():
+                ligne = compte.setdefault(
+                    donnees.get("client_id", "?"), {"acces": 0, "rafraichissements": 0}
+                )
+                ligne[cle] += 1
+        return compte
 
 
 class FournisseurOAuth(
@@ -416,13 +724,32 @@ class FournisseurOAuth(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
         donnees = self._magasin.lire_rafraichissement(refresh_token)
-        if donnees is None or donnees["client_id"] != client.client_id:
+        if donnees is not None:
+            if donnees["client_id"] != client.client_id:
+                return None
+            if donnees.get("expire_a", 0) <= int(time.time()):
+                return None
+            return RefreshToken(
+                token=refresh_token,
+                client_id=donnees["client_id"],
+                scopes=donnees["scopes"],
+                expires_at=donnees.get("expire_a"),
+            )
+        # Absent des jetons vivants : inconnu, ou deja consomme. Un jeton consomme
+        # presente hors de la fenetre de grace est un rejeu -> famille revoquee.
+        verdict = self._magasin.signaler_rejeu(
+            refresh_token, str(client.client_id), grace_rejeu_s()
+        )
+        if verdict != "grace":
+            return None
+        consomme = self._magasin.lire_consomme(refresh_token)
+        if consomme is None:
             return None
         return RefreshToken(
             token=refresh_token,
-            client_id=donnees["client_id"],
-            scopes=donnees["scopes"],
-            expires_at=donnees.get("expire_a"),
+            client_id=consomme["client_id"],
+            scopes=consomme["scopes"],
+            expires_at=consomme.get("famille_expire_a"),
         )
 
     async def exchange_refresh_token(
@@ -431,9 +758,33 @@ class FournisseurOAuth(
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Rotation : l'ancien jeton de rafraichissement est revoque a l'echange.
-        pass  # rotation stricte retiree (23/09) : un refresh deja utilise reste valide, evite les deconnexions ChatGPT
-        return self._emettre(str(client.client_id), scopes or refresh_token.scopes, None)
+        # Rotation stricte (vault-mcp#11) : l'ancien jeton est consomme et la nouvelle
+        # paire posee sous le MEME verrou. Deux echanges concurrents du meme jeton ne
+        # peuvent plus produire deux paires valides.
+        client_id = str(client.client_id)
+
+        def _emettre_dans_famille(
+            base: dict[str, Any], etat: dict[str, dict[str, Any]]
+        ) -> OAuthToken:
+            acces, rafraichissement, jeton = self._nouvelle_paire(
+                client_id,
+                scopes or base["scopes"],
+                None,
+                base["famille"],
+                base["famille_expire_a"],
+            )
+            etat["acces"][acces["jeton"]] = acces
+            etat["rafraichissements"][rafraichissement["jeton"]] = rafraichissement
+            return jeton
+
+        resultat = self._magasin.tourner(
+            refresh_token.token, client_id, grace_rejeu_s(), _emettre_dans_famille
+        )
+        if resultat is None:
+            raise TokenError(
+                error="invalid_grant", error_description="refresh token invalide ou deja utilise"
+            )
+        return resultat
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         if self._jeton_statique and hmac.compare_digest(token, self._jeton_statique):
@@ -456,31 +807,58 @@ class FournisseurOAuth(
         )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        self._magasin.revoquer(token.token)
+        # Le Bearer statique n est pas dans le magasin : il se tourne a la main.
+        self._magasin.revoquer_famille_du_jeton(token.token)
 
-    def _emettre(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+    @staticmethod
+    def _nouvelle_paire(
+        client_id: str,
+        scopes: list[str],
+        resource: str | None,
+        famille: str,
+        famille_expire_a: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], OAuthToken]:
+        """Construit une paire (acces, rafraichissement) d'une famille, sans la poser."""
         maintenant = int(time.time())
         acces = secrets.token_urlsafe(32)
         rafraichissement = secrets.token_urlsafe(32)
-        self._magasin.poser_jetons(
+        expire_rafraichissement = min(maintenant + duree_rafraichissement_s(), famille_expire_a)
+        expire_acces = min(maintenant + DUREE_ACCES_S, famille_expire_a)
+        return (
             {
                 "jeton": acces,
                 "client_id": client_id,
                 "scopes": scopes,
                 "resource": resource,
-                "expire_a": maintenant + DUREE_ACCES_S,
+                "famille": famille,
+                "expire_a": expire_acces,
             },
             {
                 "jeton": rafraichissement,
                 "client_id": client_id,
                 "scopes": scopes,
-                "expire_a": maintenant + DUREE_RAFRAICHISSEMENT_S,
+                "famille": famille,
+                "famille_expire_a": famille_expire_a,
+                "emis_a": maintenant,
+                "expire_a": expire_rafraichissement,
             },
+            OAuthToken(
+                access_token=acces,
+                token_type="Bearer",  # noqa: S106 - type de jeton OAuth, pas un secret
+                expires_in=expire_acces - maintenant,
+                scope=" ".join(scopes),
+                refresh_token=rafraichissement,
+            ),
         )
-        return OAuthToken(
-            access_token=acces,
-            token_type="Bearer",  # noqa: S106 - type de jeton OAuth, pas un secret
-            expires_in=DUREE_ACCES_S,
-            scope=" ".join(scopes),
-            refresh_token=rafraichissement,
+
+    def _emettre(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+        """Premiere emission apres consentement : ouvre une nouvelle famille."""
+        acces, rafraichissement, jeton = self._nouvelle_paire(
+            client_id,
+            scopes,
+            resource,
+            secrets.token_urlsafe(16),
+            int(time.time()) + duree_max_famille_s(),
         )
+        self._magasin.poser_jetons(acces, rafraichissement)
+        return jeton
